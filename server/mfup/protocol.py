@@ -35,11 +35,6 @@ class ChecksumKind(enum.IntEnum):
     CRC32C = 0x01
 
 
-class HashKind(enum.IntEnum):
-    NONE = 0x00
-    SHA256 = 0x01
-
-
 # ---------------------------------------------------------------------------
 # Decoded frame dataclasses
 # ---------------------------------------------------------------------------
@@ -89,8 +84,6 @@ class FileCloseFrame:
     tag: FrameTag = FrameTag.FILE_CLOSE
     node_id: int = 0
     size_sent: int = 0
-    strong_hash_kind: HashKind = HashKind.NONE
-    strong_hash: Optional[bytes] = None
 
 
 @dataclass(slots=True)
@@ -254,18 +247,7 @@ def decode_frame_payload(tag: int, payload: memoryview) -> Frame:
     elif tag == FrameTag.FILE_CLOSE:
         node_id, off = _read_u32(payload, off)
         size_sent, off = _read_u64(payload, off)
-        hash_kind_val, off = _read_u8(payload, off)
-        strong_hash = None
-        if hash_kind_val != HashKind.NONE:
-            hash_len, off = _read_u16(payload, off)
-            strong_hash = bytes(payload[off : off + hash_len])
-            off += hash_len
-        return FileCloseFrame(
-            node_id=node_id,
-            size_sent=size_sent,
-            strong_hash_kind=HashKind(hash_kind_val),
-            strong_hash=strong_hash,
-        )
+        return FileCloseFrame(node_id=node_id, size_sent=size_sent)
 
     elif tag == FrameTag.DIR_CLOSE:
         node_id, off = _read_u32(payload, off)

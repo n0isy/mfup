@@ -32,10 +32,7 @@ export const enum ChecksumKind {
   CRC32C = 0x01,
 }
 
-export const enum HashKind {
-  NONE   = 0x00,
-  SHA256 = 0x01,
-}
+// HashKind removed — CRC32C per-chunk is sufficient; SHA-256 was never verified server-side.
 
 // ---------------------------------------------------------------------------
 // Data frame types (logical, before serialisation)
@@ -81,8 +78,6 @@ export interface FileCloseFrame {
   tag: FrameTag.FILE_CLOSE;
   nodeId: number;
   sizeSent: bigint;
-  strongHashKind: HashKind;
-  strongHash: Uint8Array | null;
 }
 
 export interface DirCloseFrame {
@@ -366,18 +361,11 @@ export function encodeFileChunkFrame(f: FileChunkFrame): Uint8Array {
 }
 
 export function encodeFileCloseFrame(f: FileCloseFrame): Uint8Array {
-  // node_id(4) + size_sent(8) + hash_kind(1) + [hash(32 for sha256)]
-  const hashLen = f.strongHash ? f.strongHash.length : 0;
-  const size = 4 + 8 + 1 + (hashLen > 0 ? 2 + hashLen : 0);
-  const { buf, view } = allocFrame(FrameTag.FILE_CLOSE, size);
+  // node_id(4) + size_sent(8)
+  const { buf, view } = allocFrame(FrameTag.FILE_CLOSE, 4 + 8);
   let off = 5;
   view.setUint32(off, f.nodeId); off += 4;
-  view.setBigUint64(off, f.sizeSent); off += 8;
-  buf[off++] = f.strongHashKind;
-  if (f.strongHash && hashLen > 0) {
-    view.setUint16(off, hashLen); off += 2;
-    buf.set(f.strongHash, off);
-  }
+  view.setBigUint64(off, f.sizeSent);
   return buf;
 }
 

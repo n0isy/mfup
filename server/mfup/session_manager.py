@@ -55,16 +55,19 @@ class FileWriter:
             self._fh.seek(accepted_offset)
             self._fh.truncate()
 
-    def write(self, data: bytes, offset: int) -> int:
+    async def write(self, data: bytes, offset: int) -> int:
         """Write data at the expected offset. Returns new accepted_offset."""
         if offset != self.accepted_offset:
             raise ValueError(
                 f"bad offset: expected {self.accepted_offset}, got {offset}"
             )
-        self._fh.write(data)
-        self._fh.flush()
+        await asyncio.to_thread(self._sync_write, data)
         self.accepted_offset += len(data)
         return self.accepted_offset
+
+    def _sync_write(self, data: bytes) -> None:
+        self._fh.write(data)
+        self._fh.flush()
 
     def close(self) -> None:
         self._fh.close()
@@ -290,7 +293,7 @@ class LiveSession:
             return
 
         try:
-            new_offset = writer.write(f.payload, f.offset)
+            new_offset = await writer.write(f.payload, f.offset)
         except Exception as exc:
             logger.error("Write error for node %d: %s", f.node_id, exc)
             await self._send_nack(f.node_id, writer.accepted_offset, "server_policy")

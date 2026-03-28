@@ -36,7 +36,6 @@ export {
   FrameTag,
   NodeKind,
   ChecksumKind,
-  HashKind,
   crc32c,
   encodeFrame,
   encodeNodeFrame,
@@ -55,7 +54,7 @@ export type { ControlChannelOpts, ControlEventMap } from "./control.js";
 
 // Data channel
 export { DataChannel } from "./data-channel.js";
-export type { DataChannelOpts } from "./data-channel.js";
+export type { DataChannelOpts, DataCommitResult } from "./data-channel.js";
 
 // Ingestion adapters
 export {

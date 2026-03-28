@@ -2,7 +2,7 @@
 // ingestion, and progress into a single upload session.
 
 import {
-  FrameTag, NodeKind, ChecksumKind, HashKind,
+  FrameTag, NodeKind, ChecksumKind,
   ROOT_NODE_ID,
   crc32c,
   type NodeFrame,
@@ -88,7 +88,6 @@ interface TrackedFile {
   acceptedOffset: bigint;
   openBody: (offsetBytes?: number) => AsyncIterable<Uint8Array>;
   status: "pending" | "streaming" | "sent" | "acked" | "rejected";
-  hashParts: Uint8Array[];
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +378,6 @@ export class MfupSession {
         acceptedOffset: 0n,
         openBody: node.openBody,
         status: "pending",
-        hashParts: [],
       };
       this.trackedFiles.set(node.nodeId, tracked);
       this.fileQueue.push(tracked);
@@ -480,7 +478,6 @@ export class MfupSession {
           payload: piece,
         };
         this.safeWrite(chunkFrame);
-        file.hashParts.push(piece);
         offset += BigInt(piece.length);
 
         // Backpressure: in batch mode, flush if buffer exceeds threshold
@@ -488,28 +485,10 @@ export class MfupSession {
       }
     }
 
-    // FILE_CLOSE — compute SHA-256 if available
-    let strongHash: Uint8Array | null = null;
-    let hashKind = HashKind.NONE;
-    if (typeof crypto !== "undefined" && crypto.subtle) {
-      try {
-        const totalLen = file.hashParts.reduce((s, p) => s + p.length, 0);
-        const combined = new Uint8Array(totalLen);
-        let pos = 0;
-        for (const p of file.hashParts) { combined.set(p, pos); pos += p.length; }
-        const digest = await crypto.subtle.digest("SHA-256", combined);
-        strongHash = new Uint8Array(digest);
-        hashKind = HashKind.SHA256;
-      } catch { /* SHA-256 unavailable in some contexts */ }
-    }
-    file.hashParts = [];
-
     const closeFrame: FileCloseFrame = {
       tag: FrameTag.FILE_CLOSE,
       nodeId: file.nodeId,
       sizeSent: offset,
-      strongHashKind: hashKind,
-      strongHash,
     };
     this.safeWrite(closeFrame);
     file.status = "sent";
@@ -543,6 +522,15 @@ export class MfupSession {
     this.safeWrite(endFrame);
     this.setState("committing");
     await this.data?.close();
+
+    // In batch mode, the final POST response may already contain the commit result.
+    // Use it if COMMIT_OK hasn't arrived via WS yet.
+    if (this._state === "committing" && this.data?.commitResult) {
+      const cr = this.data.commitResult;
+      this.setState("committed");
+      this.emit("committed", { files: cr.files, bytes: cr.bytes });
+      return;
+    }
 
     // Wait for COMMIT_OK from the control channel
     return new Promise<void>((resolve, reject) => {

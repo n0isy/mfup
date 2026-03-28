@@ -326,8 +326,9 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
     )
 
     # Only attempt commit when final=1 or SESSION_END was found in frames
+    commit_result = None
     if (final == 1 or session_end_seen) and session.state == SessionState.COMMITTING:
-        await session.try_commit()
+        commit_result = await session.try_commit()
 
     if error_detail:
         return JSONResponse(
@@ -335,10 +336,10 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    return JSONResponse(
-        {"ok": True, "bytes_received": body_received, "frames": frame_count},
-        status_code=status.HTTP_200_OK,
-    )
+    resp: dict = {"ok": True, "bytes_received": body_received, "frames": frame_count}
+    if commit_result is not None:
+        resp["commit"] = {"files": commit_result["files"], "bytes": commit_result["bytes"]}
+    return JSONResponse(resp, status_code=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------

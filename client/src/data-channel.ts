@@ -35,6 +35,11 @@ const DEFAULT_FLUSH_BYTES = 2 * 1024 * 1024; // 2 MiB
  *   flushed as sequential POST requests when the buffer exceeds `flushBytes`
  *   or the channel is closed.
  */
+export interface DataCommitResult {
+  files: number;
+  bytes: number;
+}
+
 export class DataChannel {
   private _closed = false;
   private _bytesSent = 0;
@@ -42,6 +47,9 @@ export class DataChannel {
   private readonly _url: string;
   private readonly _streaming: boolean;
   private readonly _flushBytes: number;
+
+  /** Commit result parsed from the final data POST response. */
+  commitResult: DataCommitResult | null = null;
 
   // --- Streaming mode state ---
   private _streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -260,6 +268,18 @@ export class DataChannel {
           const text = await resp.text().catch(() => "");
           const err = dataHttpError(url, resp.status, resp.statusText, text);
           this._onError?.(err);
+        } else if (final) {
+          // Parse commit result from final POST response
+          try {
+            const json = await resp.json();
+            if (json.commit) {
+              this.commitResult = { files: json.commit.files, bytes: json.commit.bytes };
+            }
+            if (json.error) {
+              const err = dataHttpError(url, resp.status, "commit_error", json.error);
+              this._onError?.(err);
+            }
+          } catch { /* response parse failure — commit_ok via WS is the fallback */ }
         }
         this._bytesSent += body.byteLength;
       } catch (cause) {
