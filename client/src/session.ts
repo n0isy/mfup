@@ -52,6 +52,8 @@ import { probeStreaming } from "./probe.js";
 export interface MfupSessionConfig {
   /** Server base URL (http(s)://host) */
   serverUrl: string;
+  /** Relative target directory on the server where files will be placed */
+  targetDir?: string;
   /** Existing session_id for resume, or omit for new session */
   sessionId?: string;
   /** Existing resume_token for resume */
@@ -139,6 +141,7 @@ export class MfupSession {
 
   // Config
   private serverUrl: string;
+  private targetDir: string;
 
   // Data channel mode (detected via probe on first connect)
   private _streamingMode: boolean | null = null; // null = not yet probed
@@ -153,6 +156,7 @@ export class MfupSession {
 
   constructor(config: MfupSessionConfig) {
     this.serverUrl = config.serverUrl.replace(/\/$/, "");
+    this.targetDir = config.targetDir ?? ".";
     this.sessionId = config.sessionId ?? crypto.randomUUID();
     this.resumeToken = config.resumeToken ?? crypto.randomUUID();
     this.legId = crypto.randomUUID();
@@ -207,6 +211,7 @@ export class MfupSession {
       sessionId: this.sessionId,
       resumeToken: this.resumeToken,
       legId: this.legId,
+      targetDir: this.targetDir,
       lastKnownEpoch: isResume ? this.epoch : undefined,
     });
 

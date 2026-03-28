@@ -165,7 +165,7 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
   progressPanel.classList.add("visible");
   dropzone.classList.add("uploading");
 
-  session = new MfupSession({ serverUrl, chunkSize: 256 * 1024 });
+  session = new MfupSession({ serverUrl, targetDir: ".", chunkSize: 256 * 1024 });
   sessionLabel.textContent = `session ${session.id.slice(0, 8)}...`;
   btnAbort.disabled = false;
 
@@ -173,7 +173,21 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
 
   session.onProgress(renderProgress);
   session.on("state", (s) => { renderState(s); log(`State -> ${s}`, "info"); });
-  session.on("committed", (ev) => { log(`COMMITTED: ${ev.files} files, ${fmtBytes(ev.bytes)}`, "ok"); });
+  session.on("committed", async (ev) => {
+    log(`COMMITTED: ${ev.files} files, ${fmtBytes(ev.bytes)}`, "ok");
+    try {
+      const resp = await fetch(`${serverUrl}/mfup/sessions/${session!.id}/publish`, { method: "POST" });
+      if (resp.ok) {
+        const data = await resp.json();
+        log(`Published: ${data.published.join(", ")}`, "ok");
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        log(`Publish failed: ${data.error ?? resp.statusText}`, "warn");
+      }
+    } catch (err: any) {
+      log(`Publish error: ${err.message}`, "warn");
+    }
+  });
   session.on("error", (err) => {
     log(`[${err.layer}/${err.code}] ${err.message}`, err.fatal ? "err" : "warn");
     if (err.cause instanceof Error) {

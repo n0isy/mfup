@@ -9,45 +9,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .protocol import SessionState
-from .storage import SessionDB, staging_dir
+from .storage import DEFAULT_STAGING_PREFIX, SessionDB, staging_dir
 
 logger = logging.getLogger("mfup.publish")
 
 
-def publish_session(base_dir: Path, session_id: str, target_name: str) -> Path:
-    """Rename the staged payload directory into its final name under base_dir.
+def publish_session(base_dir: Path, session_id: str, target_dir: Path, prefix: str = DEFAULT_STAGING_PREFIX) -> list[str]:
+    """Atomically rename each payload entry into target_dir under its original name.
 
-    Uses os.rename which is atomic on the same filesystem. The target must not
-    exist (for directory rename on Linux, the destination must be absent or an
-    empty directory).
-
-    Returns the final path.
+    Uses os.rename which is atomic on the same filesystem.
+    Returns list of published entry names.
     """
-    sd = staging_dir(base_dir, session_id)
+    sd = staging_dir(base_dir, session_id, prefix)
     payload = sd / "payload"
 
     if not payload.exists():
         raise FileNotFoundError(f"no payload directory for session {session_id}")
 
-    # The payload dir may contain a single top-level entry (the uploaded root
-    # directory) or multiple entries. If single entry, rename that directly.
-    entries = list(payload.iterdir())
-    if len(entries) == 1 and entries[0].is_dir():
-        source = entries[0]
-    else:
-        # Multiple top-level entries — rename the whole payload dir
-        source = payload
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    final = base_dir / target_name
-    if final.exists():
-        raise FileExistsError(f"target {final} already exists")
-
-    os.rename(str(source), str(final))
-    logger.info("Published session %s → %s", session_id, final)
+    published: list[str] = []
+    for entry in list(payload.iterdir()):
+        dest = target_dir / entry.name
+        if dest.exists():
+            raise FileExistsError(f"target {dest} already exists")
+        os.rename(str(entry), str(dest))
+        published.append(entry.name)
+        logger.info("Published session %s: %s → %s", session_id, entry.name, dest)
 
     # Clean up remaining staging dir (state.sqlite, empty payload, etc.)
     _cleanup_staging(sd)
-    return final
+    return published
 
 
 def _cleanup_staging(sd: Path) -> None:
@@ -62,8 +54,8 @@ def _cleanup_staging(sd: Path) -> None:
 # Sweeper
 # ---------------------------------------------------------------------------
 
-def sweep(base_dir: Path) -> list[str]:
-    """Scan base_dir for .incoming.* dirs and clean up terminal sessions.
+def sweep(base_dir: Path, prefix: str = DEFAULT_STAGING_PREFIX) -> list[str]:
+    """Scan base_dir for staging dirs and clean up terminal sessions.
 
     Returns list of removed session IDs.
     """
@@ -72,12 +64,13 @@ def sweep(base_dir: Path) -> list[str]:
         return removed
 
     now = datetime.now(timezone.utc)
+    pfx = prefix + "."
 
     for entry in list(base_dir.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(".incoming."):
+        if not entry.is_dir() or not entry.name.startswith(pfx):
             continue
 
-        sid = entry.name[len(".incoming."):]
+        sid = entry.name[len(pfx):]
         db_path = entry / "state.sqlite"
 
         if not db_path.exists():

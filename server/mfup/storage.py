@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     resume_token TEXT NOT NULL,
     epoch        INTEGER NOT NULL DEFAULT 1,
     state        TEXT NOT NULL DEFAULT 'active',
+    target_dir   TEXT NOT NULL DEFAULT '.',
     expires_at   TEXT NOT NULL,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
@@ -98,13 +99,19 @@ class SessionDB:
         session_id: str,
         resume_token: str,
         expires_at: str,
+        target_dir: str = ".",
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?,?,1,?,?,?,?)",
-            (session_id, resume_token, SessionState.ACTIVE.value, expires_at, now, now),
+            "INSERT OR REPLACE INTO sessions VALUES (?,?,1,?,?,?,?,?)",
+            (session_id, resume_token, SessionState.ACTIVE.value, target_dir, expires_at, now, now),
         )
         self._conn.commit()
+
+    def get_target_dir(self) -> str:
+        cur = self._conn.execute("SELECT target_dir FROM sessions LIMIT 1")
+        row = cur.fetchone()
+        return row[0] if row else "."
 
     def get_session(self) -> Optional[sqlite3.Row]:
         self._conn.row_factory = sqlite3.Row
@@ -299,23 +306,26 @@ class SessionDB:
 # Staging directory helpers
 # ---------------------------------------------------------------------------
 
-def staging_dir(base_dir: Path, session_id: str) -> Path:
-    return base_dir / f".incoming.{session_id}"
+DEFAULT_STAGING_PREFIX = ".incoming"
 
 
-def ensure_staging(base_dir: Path, session_id: str) -> Path:
-    sd = staging_dir(base_dir, session_id)
+def staging_dir(base_dir: Path, session_id: str, prefix: str = DEFAULT_STAGING_PREFIX) -> Path:
+    return base_dir / f"{prefix}.{session_id}"
+
+
+def ensure_staging(base_dir: Path, session_id: str, prefix: str = DEFAULT_STAGING_PREFIX) -> Path:
+    sd = staging_dir(base_dir, session_id, prefix)
     sd.mkdir(parents=True, exist_ok=True)
     (sd / "payload").mkdir(exist_ok=True)
     return sd
 
 
-def open_session_db(base_dir: Path, session_id: str) -> SessionDB:
-    sd = ensure_staging(base_dir, session_id)
+def open_session_db(base_dir: Path, session_id: str, prefix: str = DEFAULT_STAGING_PREFIX) -> SessionDB:
+    sd = ensure_staging(base_dir, session_id, prefix)
     return SessionDB(sd / "state.sqlite")
 
 
-def resolve_payload_path(base_dir: Path, session_id: str, db: SessionDB, node_id: int) -> Path:
+def resolve_payload_path(base_dir: Path, session_id: str, db: SessionDB, node_id: int, prefix: str = DEFAULT_STAGING_PREFIX) -> Path:
     """Build the filesystem path for a node inside the payload directory.
 
     Walks parent_id chain in the DB to reconstruct the relative path.
@@ -329,5 +339,5 @@ def resolve_payload_path(base_dir: Path, session_id: str, db: SessionDB, node_id
         parts.append(node["name"])
         cur_id = node["parent_id"]
     parts.reverse()
-    sd = staging_dir(base_dir, session_id)
+    sd = staging_dir(base_dir, session_id, prefix)
     return sd / "payload" / Path(*parts) if parts else sd / "payload"

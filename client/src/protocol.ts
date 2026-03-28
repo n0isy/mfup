@@ -126,6 +126,7 @@ export interface HelloMsg {
   session_id: string;
   resume_token: string;
   leg_id: string;
+  target_dir: string;
 }
 
 export interface ResumeMsg {

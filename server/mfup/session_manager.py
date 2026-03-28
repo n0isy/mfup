@@ -30,7 +30,7 @@ from .protocol import (
     NodeStatus,
     crc32c,
 )
-from .storage import SessionDB, ensure_staging, open_session_db, resolve_payload_path, staging_dir
+from .storage import DEFAULT_STAGING_PREFIX, SessionDB, ensure_staging, open_session_db, resolve_payload_path, staging_dir
 
 logger = logging.getLogger("mfup.session")
 
@@ -80,6 +80,8 @@ class LiveSession:
         base_dir: Path,
         db: SessionDB,
         *,
+        target_dir: str = ".",
+        staging_prefix: str = DEFAULT_STAGING_PREFIX,
         session_resume_ttl: int = 3600,
         leg_idle_timeout: int = 60,
         publish_timeout: int = 30,
@@ -88,6 +90,8 @@ class LiveSession:
         self.resume_token = resume_token
         self.base_dir = base_dir
         self.db = db
+        self.target_dir = target_dir
+        self.staging_prefix = staging_prefix
 
         # Timers (seconds)
         self.session_resume_ttl = session_resume_ttl
@@ -193,7 +197,7 @@ class LiveSession:
         )
         if f.kind == NodeKind.DIR:
             # Create directory in payload
-            path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id)
+            path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
             path.mkdir(parents=True, exist_ok=True)
 
     async def _handle_file_open(self, f: FileOpenFrame) -> None:
@@ -439,8 +443,9 @@ class SessionRegistry:
     On startup, scans for `.incoming.*` directories and reopens their DBs.
     """
 
-    def __init__(self, base_dir: Path, **defaults: Any) -> None:
+    def __init__(self, base_dir: Path, staging_prefix: str = DEFAULT_STAGING_PREFIX, **defaults: Any) -> None:
         self.base_dir = base_dir
+        self.staging_prefix = staging_prefix
         self.defaults = defaults
         self._sessions: dict[str, LiveSession] = {}
         self._lock = asyncio.Lock()
@@ -450,9 +455,10 @@ class SessionRegistry:
         if not self.base_dir.exists():
             self.base_dir.mkdir(parents=True, exist_ok=True)
             return
+        pfx = self.staging_prefix + "."
         for entry in self.base_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith(".incoming."):
-                sid = entry.name[len(".incoming."):]
+            if entry.is_dir() and entry.name.startswith(pfx):
+                sid = entry.name[len(pfx):]
                 db_path = entry / "state.sqlite"
                 if db_path.exists():
                     try:
@@ -464,8 +470,11 @@ class SessionRegistry:
                         if state in (SessionState.COMMITTED, SessionState.ABORTED, SessionState.EXPIRED):
                             db.close()
                             continue
+                        target_dir = sess_row["target_dir"] if "target_dir" in sess_row.keys() else "."
                         session = LiveSession(
                             sid, sess_row["resume_token"], self.base_dir, db,
+                            target_dir=target_dir,
+                            staging_prefix=self.staging_prefix,
                             **self.defaults,
                         )
                         self._sessions[sid] = session
@@ -479,13 +488,14 @@ class SessionRegistry:
         resume_token: str,
         leg_id: str,
         expires_at: str,
+        target_dir: str = ".",
     ) -> LiveSession:
         async with self._lock:
             if session_id in self._sessions:
                 raise ValueError(f"session {session_id} already exists")
-            db = open_session_db(self.base_dir, session_id)
-            db.init_session(session_id, resume_token, expires_at)
-            session = LiveSession(session_id, resume_token, self.base_dir, db, **self.defaults)
+            db = open_session_db(self.base_dir, session_id, self.staging_prefix)
+            db.init_session(session_id, resume_token, expires_at, target_dir)
+            session = LiveSession(session_id, resume_token, self.base_dir, db, target_dir=target_dir, staging_prefix=self.staging_prefix, **self.defaults)
             session.attach_leg(leg_id)
             self._sessions[session_id] = session
             return session

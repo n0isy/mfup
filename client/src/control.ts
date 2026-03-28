@@ -43,6 +43,8 @@ export interface ControlChannelOpts {
   sessionId: string;
   resumeToken: string;
   legId: string;
+  /** Relative path where files should be placed on the server */
+  targetDir: string;
   /** If set, we send RESUME instead of HELLO */
   lastKnownEpoch?: number | null;
 }
@@ -152,6 +154,7 @@ export class ControlChannel {
       session_id: this.opts.sessionId,
       resume_token: this.opts.resumeToken,
       leg_id: this.opts.legId,
+      target_dir: this.opts.targetDir,
     };
     this.send(msg);
   }

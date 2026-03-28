@@ -31,6 +31,7 @@ MAX_CHUNK_BYTES = int(__import__("os").environ.get("MFUP_MAX_CHUNK_BYTES", "2621
 MAX_OPEN_FILES = int(__import__("os").environ.get("MFUP_MAX_OPEN_FILES", "1"))
 MAX_PENDING_FILES = int(__import__("os").environ.get("MFUP_MAX_PENDING_FILES", "64"))
 SWEEP_INTERVAL = int(__import__("os").environ.get("MFUP_SWEEP_INTERVAL", "300"))
+STAGING_PREFIX = __import__("os").environ.get("MFUP_STAGING_PREFIX", ".incoming")
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -53,6 +54,7 @@ async def lifespan(app: FastAPI):
 
     _registry = SessionRegistry(
         base,
+        staging_prefix=STAGING_PREFIX,
         session_resume_ttl=SESSION_RESUME_TTL,
         leg_idle_timeout=LEG_IDLE_TIMEOUT,
     )
@@ -63,7 +65,7 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(SWEEP_INTERVAL)
             try:
-                removed = sweep(base)
+                removed = sweep(base, STAGING_PREFIX)
                 if removed:
                     for sid in removed:
                         await _registry.remove(sid)
@@ -113,11 +115,13 @@ async def control_endpoint(ws: WebSocket):
             session_id = msg["session_id"]
             resume_token = msg["resume_token"]
             leg_id = msg["leg_id"]
+            target_dir = msg.get("target_dir", ".")
 
             expires = datetime.now(timezone.utc) + timedelta(seconds=SESSION_RESUME_TTL)
             try:
                 session = await registry.create(
                     session_id, resume_token, leg_id, expires.isoformat(),
+                    target_dir=target_dir,
                 )
             except ValueError:
                 # Session already exists — treat as conflict
@@ -389,8 +393,8 @@ async def get_session_status(session_id: str):
 
 
 @app.post("/mfup/sessions/{session_id}/publish")
-async def publish_endpoint(session_id: str, request: Request):
-    """Publish a committed session to its final name."""
+async def publish_endpoint(session_id: str):
+    """Publish a committed session — atomic rename payload entries to target_dir."""
     registry = get_registry()
     session = registry.get(session_id)
     if session is None:
@@ -402,30 +406,30 @@ async def publish_endpoint(session_id: str, request: Request):
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    body = await request.json()
-    target_name = body.get("target_name")
-    if not target_name:
-        return JSONResponse({"error": "target_name required"}, status_code=400)
+    # Resolve target_dir: relative paths are under base_dir
+    target = Path(session.target_dir)
+    if not target.is_absolute():
+        target = registry.base_dir / target
 
     try:
-        final_path = publish_session(registry.base_dir, session_id, target_name)
-    except FileExistsError:
+        published = publish_session(registry.base_dir, session_id, target, STAGING_PREFIX)
+    except FileExistsError as exc:
         return JSONResponse(
-            {"error": f"target {target_name} already exists"},
+            {"error": str(exc)},
             status_code=status.HTTP_409_CONFLICT,
         )
     except FileNotFoundError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
 
     await registry.remove(session_id)
-    return {"published": str(final_path)}
+    return {"published": published}
 
 
 @app.post("/mfup/sweep")
 async def sweep_endpoint():
     """Manually trigger a sweep."""
     registry = get_registry()
-    removed = sweep(registry.base_dir)
+    removed = sweep(registry.base_dir, STAGING_PREFIX)
     for sid in removed:
         await registry.remove(sid)
     return {"removed": removed}
