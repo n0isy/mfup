@@ -1,0 +1,284 @@
+// MFUP/2 data channel — dual-mode: streaming (duplex:"half") or batch (sequential POSTs)
+
+import type { DataFrame } from "./protocol.js";
+import { encodeFrame } from "./protocol.js";
+import {
+  dataOpenFailed,
+  dataWriteFailed,
+  dataHttpError,
+  dataChannelClosed,
+  type MfupError,
+} from "./errors.js";
+
+export interface DataChannelOpts {
+  /** Base URL, e.g. "https://host" */
+  baseUrl: string;
+  sessionId: string;
+  legId: string;
+  /** AbortSignal so the session can tear down the request */
+  signal?: AbortSignal;
+  /** Enable streaming mode (one long POST with duplex:"half") */
+  streaming?: boolean;
+  /** Batch flush threshold in bytes (default 2 MiB). Only used in batch mode. */
+  flushBytes?: number;
+}
+
+const DEFAULT_FLUSH_BYTES = 2 * 1024 * 1024; // 2 MiB
+
+/**
+ * DataChannel wraps data upload for a single leg.
+ *
+ * Two modes:
+ * - **Streaming** (`streaming: true`): A single long-lived POST with a
+ *   ReadableStream body (duplex:"half"). Frames are enqueued directly.
+ * - **Batch** (`streaming: false`, default): Frames are buffered in memory and
+ *   flushed as sequential POST requests when the buffer exceeds `flushBytes`
+ *   or the channel is closed.
+ */
+export class DataChannel {
+  private _closed = false;
+  private _bytesSent = 0;
+  private _onError: ((err: MfupError) => void) | null = null;
+  private readonly _url: string;
+  private readonly _streaming: boolean;
+  private readonly _flushBytes: number;
+
+  // --- Streaming mode state ---
+  private _streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  private _streamFetchPromise: Promise<Response> | null = null;
+
+  // --- Batch mode state ---
+  private _batchBuffer: Uint8Array[] = [];
+  private _batchBufferBytes = 0;
+  private _seq = 0;
+  /** Chain of in-flight POST promises — ensures serialisation. */
+  private _flushChain: Promise<void> = Promise.resolve();
+  /** Resolves when close() has flushed everything. */
+  private _doneResolve: (() => void) | null = null;
+  private _donePromise: Promise<void> | null = null;
+
+  constructor(private opts: DataChannelOpts) {
+    this._url = `${opts.baseUrl}/mfup/data/${opts.sessionId}/${opts.legId}`;
+    this._streaming = opts.streaming ?? false;
+    this._flushBytes = opts.flushBytes ?? DEFAULT_FLUSH_BYTES;
+  }
+
+  get closed(): boolean { return this._closed; }
+  get bytesSent(): number { return this._bytesSent; }
+
+  /** Register an error callback for async errors (HTTP response, network). */
+  onError(fn: (err: MfupError) => void): void { this._onError = fn; }
+
+  // -------------------------------------------------------------------------
+  // open()
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open the data channel.
+   *
+   * - Streaming: returns a promise that resolves with the fetch Response when
+   *   the upload body is fully sent or the server closes.
+   * - Batch: returns a promise that resolves when close() finishes all flushes.
+   */
+  open(): Promise<Response | void> {
+    if (this._streaming) {
+      return this._openStreaming();
+    }
+    return this._openBatch();
+  }
+
+  private _openStreaming(): Promise<Response> {
+    const stream = new ReadableStream<Uint8Array>({
+      start: (ctrl) => {
+        this._streamController = ctrl;
+      },
+    });
+
+    try {
+      this._streamFetchPromise = fetch(`${this._url}?seq=0&final=1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-mfup" },
+        body: stream,
+        // @ts-expect-error — duplex: "half" is required for streaming uploads
+        duplex: "half",
+        signal: this.opts.signal,
+      });
+    } catch (err) {
+      const mfupErr = dataOpenFailed(this._url, err);
+      this._onError?.(mfupErr);
+      throw mfupErr;
+    }
+
+    return this._streamFetchPromise;
+  }
+
+  private _openBatch(): Promise<void> {
+    this._donePromise = new Promise<void>((resolve) => {
+      this._doneResolve = resolve;
+    });
+    return this._donePromise;
+  }
+
+  // -------------------------------------------------------------------------
+  // write()
+  // -------------------------------------------------------------------------
+
+  /**
+   * Enqueue a data frame. Always synchronous.
+   *
+   * - Streaming: encodes and enqueues into the ReadableStream controller.
+   * - Batch: encodes and appends to the internal buffer.
+   */
+  write(frame: DataFrame): void {
+    if (this._closed) {
+      const err = dataChannelClosed();
+      this._onError?.(err);
+      throw err;
+    }
+
+    const encoded = encodeFrame(frame);
+
+    if (this._streaming) {
+      this._writeStreaming(encoded);
+    } else {
+      this._writeBatch(encoded);
+    }
+  }
+
+  private _writeStreaming(encoded: Uint8Array): void {
+    if (!this._streamController) {
+      const err = dataWriteFailed("DataChannel not opened yet");
+      this._onError?.(err);
+      throw err;
+    }
+    try {
+      this._streamController.enqueue(encoded);
+      this._bytesSent += encoded.byteLength;
+    } catch (cause) {
+      const err = dataWriteFailed("enqueue failed", cause);
+      this._onError?.(err);
+      throw err;
+    }
+  }
+
+  private _writeBatch(encoded: Uint8Array): void {
+    this._batchBuffer.push(encoded);
+    this._batchBufferBytes += encoded.byteLength;
+  }
+
+  // -------------------------------------------------------------------------
+  // drain()
+  // -------------------------------------------------------------------------
+
+  /**
+   * Backpressure gate.
+   *
+   * - Streaming: no-op (browser handles backpressure).
+   * - Batch: if the buffer exceeds flushBytes, flushes it as a POST.
+   */
+  async drain(): Promise<void> {
+    if (this._streaming) return;
+    if (this._batchBufferBytes >= this._flushBytes) {
+      await this._flushBatch(false);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // close()
+  // -------------------------------------------------------------------------
+
+  /**
+   * Gracefully close the data channel.
+   *
+   * - Streaming: closes the ReadableStream controller.
+   * - Batch: flushes remaining buffer with final=1, resolves when last POST completes.
+   */
+  async close(): Promise<void> {
+    if (this._closed) return;
+    this._closed = true;
+
+    if (this._streaming) {
+      this._streamController?.close();
+    } else {
+      await this._flushBatch(true);
+      this._doneResolve?.();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // abort()
+  // -------------------------------------------------------------------------
+
+  /**
+   * Abort the data channel.
+   */
+  abort(reason?: string): void {
+    if (this._closed) return;
+    this._closed = true;
+
+    if (this._streaming) {
+      this._streamController?.error(new Error(reason ?? "aborted"));
+    } else {
+      // Clear buffer; resolve done promise so open() doesn't hang.
+      this._batchBuffer = [];
+      this._batchBufferBytes = 0;
+      this._doneResolve?.();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Batch internals
+  // -------------------------------------------------------------------------
+
+  /**
+   * Concatenate the buffer and send it as a single POST.
+   * POSTs are serialised via _flushChain — never two in flight.
+   */
+  private _flushBatch(final: boolean): Promise<void> {
+    const chunks = this._batchBuffer;
+    const totalBytes = this._batchBufferBytes;
+    this._batchBuffer = [];
+    this._batchBufferBytes = 0;
+
+    // Nothing to send and not final — skip.
+    if (totalBytes === 0 && !final) return Promise.resolve();
+
+    const body = this._concatChunks(chunks, totalBytes);
+    const seq = this._seq++;
+    const finalFlag = final ? 1 : 0;
+    const url = `${this._url}?seq=${seq}&final=${finalFlag}`;
+
+    this._flushChain = this._flushChain.then(async () => {
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-mfup" },
+          body: body as unknown as BodyInit,
+          signal: this.opts.signal,
+        });
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => "");
+          const err = dataHttpError(url, resp.status, resp.statusText, text);
+          this._onError?.(err);
+        }
+        this._bytesSent += body.byteLength;
+      } catch (cause) {
+        const err = dataWriteFailed(`POST to ${url} failed`, cause);
+        this._onError?.(err);
+      }
+    });
+
+    return this._flushChain;
+  }
+
+  private _concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
+    if (chunks.length === 1) return chunks[0];
+    const out = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.byteLength;
+    }
+    return out;
+  }
+}

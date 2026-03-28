@@ -1,0 +1,13 @@
+:80 {
+    handle /mfup/* {
+        reverse_proxy backend:8070
+    }
+
+    handle /health {
+        reverse_proxy backend:8070
+    }
+
+    handle {
+        reverse_proxy frontend:3000
+    }
+}
