@@ -123,6 +123,9 @@ class LiveSession:
         # Publish action (set by client ACTION message)
         self.publish_action: Optional[str] = None
 
+        # Callback for expiry changes (set by registry for Redis updates)
+        self._on_expiry_change: Any = None  # async fn(session_id, expires_at_datetime)
+
         # Locks
         self._lock = asyncio.Lock()
 
@@ -167,6 +170,9 @@ class LiveSession:
             # Update expires_at for resume TTL
             exp = datetime.now(timezone.utc) + timedelta(seconds=self.session_resume_ttl)
             self.db.set_expires_at(exp.isoformat())
+            # Notify Redis index about new expiry
+            if self._on_expiry_change:
+                asyncio.ensure_future(self._on_expiry_change(self.session_id, exp))
         self.leg_id = None
         self.ws = None
 
@@ -495,7 +501,7 @@ class LiveSession:
 class SessionRegistry:
     """Global in-memory registry of live sessions.
 
-    On startup, scans for `.incoming.*` directories and reopens their DBs.
+    No startup scan — stale staging dirs are cleaned by the Redis-based sweeper.
     """
 
     def __init__(self, base_dir: Path, staging_prefix: str = DEFAULT_STAGING_PREFIX, **defaults: Any) -> None:
@@ -504,38 +510,6 @@ class SessionRegistry:
         self.defaults = defaults
         self._sessions: dict[str, LiveSession] = {}
         self._lock = asyncio.Lock()
-
-    async def recover(self) -> None:
-        """Scan base_dir for existing staging dirs and reopen."""
-        if not self.base_dir.exists():
-            self.base_dir.mkdir(parents=True, exist_ok=True)
-            return
-        pfx = self.staging_prefix + "."
-        for entry in self.base_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith(pfx):
-                sid = entry.name[len(pfx):]
-                db_path = entry / "state.sqlite"
-                if db_path.exists():
-                    try:
-                        db = SessionDB(db_path)
-                        sess_row = db.get_session()
-                        if sess_row is None:
-                            continue
-                        state = SessionState(sess_row["state"])
-                        if state in (SessionState.COMMITTED, SessionState.ABORTED, SessionState.EXPIRED):
-                            db.close()
-                            continue
-                        target_dir = sess_row["target_dir"] if "target_dir" in sess_row.keys() else "."
-                        session = LiveSession(
-                            sid, sess_row["resume_token"], self.base_dir, db,
-                            target_dir=target_dir,
-                            staging_prefix=self.staging_prefix,
-                            **self.defaults,
-                        )
-                        self._sessions[sid] = session
-                        logger.info("Recovered session %s in state %s", sid, state.value)
-                    except Exception:
-                        logger.exception("Failed to recover session %s", sid)
 
     async def create(
         self,
@@ -582,6 +556,73 @@ class SessionRegistry:
             if session:
                 session.detach_leg()
                 session.db.close()
+
+    async def recover_session(
+        self,
+        session_id: str,
+        staging_path: Path,
+    ) -> LiveSession | None:
+        """Recover a session from its SQLite DB on disk.
+
+        Opens the DB, reads session row, and registers a detached LiveSession
+        (no leg, no WS). Returns None if the DB is missing or unreadable.
+        """
+        db_path = staging_path / "state.sqlite"
+        if not db_path.exists():
+            logger.warning("Recovery: DB missing for session %s at %s", session_id, db_path)
+            return None
+
+        try:
+            db = SessionDB(db_path)
+        except Exception:
+            logger.exception("Recovery: failed to open DB for session %s", session_id)
+            return None
+
+        row = db.get_session()
+        if row is None:
+            logger.warning("Recovery: empty sessions table for %s", session_id)
+            db.close()
+            return None
+
+        state = SessionState(row["state"])
+        # Only recover sessions that can still accept a RESUME
+        if state not in (
+            SessionState.ACTIVE,
+            SessionState.PAUSED_BY_SERVER,
+            SessionState.WAITING_RESUME,
+            SessionState.COMMITTING,
+        ):
+            logger.info(
+                "Recovery: skipping session %s in terminal state %s",
+                session_id, state.value,
+            )
+            db.close()
+            return None
+
+        resume_token = row["resume_token"]
+        target_dir = row["target_dir"]
+
+        # Force state to WAITING_RESUME — no leg is attached after restart
+        if state in (SessionState.ACTIVE, SessionState.PAUSED_BY_SERVER):
+            db.set_state(SessionState.WAITING_RESUME)
+
+        async with self._lock:
+            if session_id in self._sessions:
+                db.close()
+                return self._sessions[session_id]
+
+            session = LiveSession(
+                session_id, resume_token, self.base_dir, db,
+                target_dir=target_dir,
+                staging_prefix=self.staging_prefix,
+                **self.defaults,
+            )
+            self._sessions[session_id] = session
+            logger.info(
+                "Recovery: restored session %s (state=%s, epoch=%d, target=%s)",
+                session_id, state.value, session.epoch, target_dir,
+            )
+            return session
 
     def all_sessions(self) -> dict[str, LiveSession]:
         return dict(self._sessions)

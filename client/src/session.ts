@@ -30,6 +30,7 @@ import {
 } from "./ingestion.js";
 import {
   MfupError,
+  MfupErrorCode,
   MfupErrorLayer,
   wsConnectFailed,
   dataOpenFailed,
@@ -62,9 +63,9 @@ export interface MfupSessionConfig {
   lastKnownEpoch?: number;
   /** Default chunk size in bytes (default 256 KiB) */
   chunkSize?: number;
-  /** Auto-reconnect attempts (default 3) */
-  maxReconnectAttempts?: number;
-  /** Reconnect delay base in ms (default 1000) */
+  /** Auto-reconnect attempts (default: unlimited). Set null/undefined for infinite retry. */
+  maxReconnectAttempts?: number | null;
+  /** Reconnect delay base in ms (default 1000, caps at 20s) */
   reconnectDelayMs?: number;
 }
 
@@ -74,6 +75,7 @@ export interface MfupSessionEvents {
   committed: { files: number; bytes: number };
   ask: void;
   error: MfupError;
+  reconnecting: { attempt: number; delay: number; maxAttempts: number | null };
 }
 
 type Listener<T> = (ev: T) => void;
@@ -135,9 +137,10 @@ export class MfupSession {
   private listeners = new Map<string, Set<Listener<any>>>();
 
   // Reconnect
-  private maxReconnectAttempts: number;
+  private maxReconnectAttempts: number | null;
   private reconnectDelayMs: number;
   private reconnectCount = 0;
+  private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Config
   private serverUrl: string;
@@ -150,6 +153,10 @@ export class MfupSession {
   private pumpDone: Promise<void> = Promise.resolve();
   private pumping = false;
 
+  // Reconnect synchronization — resolves when reconnect completes
+  private _reconnectPromise: Promise<void> | null = null;
+  private _reconnectResolve: (() => void) | null = null;
+
   // Commit synchronization — resolves when COMMIT_OK arrives
   private _commitResolve: (() => void) | null = null;
   private _commitReject: ((err: Error) => void) | null = null;
@@ -161,7 +168,7 @@ export class MfupSession {
     this.resumeToken = config.resumeToken ?? crypto.randomUUID();
     this.legId = crypto.randomUUID();
     this.chunkSize = config.chunkSize ?? 262144;
-    this.maxReconnectAttempts = config.maxReconnectAttempts ?? 3;
+    this.maxReconnectAttempts = config.maxReconnectAttempts ?? null;
     this.reconnectDelayMs = config.reconnectDelayMs ?? 1000;
 
     if (config.lastKnownEpoch != null) {
@@ -258,8 +265,13 @@ export class MfupSession {
       streaming: this._streamingMode,
     });
 
-    // Forward data channel errors
-    this.data.onError((err) => this.emitError(err));
+    // Forward data channel errors — trigger reconnect for network failures
+    this.data.onError((err) => {
+      this.emitError(err);
+      if (err.code === MfupErrorCode.DATA_WRITE_FAILED || err.code === MfupErrorCode.DATA_HTTP_ERROR) {
+        this.handleDisconnect(err);
+      }
+    });
 
     // Fire-and-forget — handle both streaming (Response) and batch (void) results
     const dataUrl = `${this.serverUrl}/mfup/data/${this.sessionId}/${this.legId}`;
@@ -343,6 +355,16 @@ export class MfupSession {
   }
 
   abort(code = "client_cancel", reason = "user cancelled"): void {
+    // Cancel pending reconnect timer
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    // Resolve reconnect promise so finalizeScan unblocks
+    this._reconnectResolve?.();
+    this._reconnectPromise = null;
+    this._reconnectResolve = null;
+
     this.control?.sendAbort(code, reason);
     const frame: ClientAbortFrame = { tag: FrameTag.CLIENT_ABORT, code, reason };
     try { this.data?.write(frame); } catch { /* expected during abort teardown */ }
@@ -408,6 +430,9 @@ export class MfupSession {
       while (this.fileQueue.length > 0 && this._state === "active") {
         await this.waitIfPaused();
 
+        // Data channel died — break and let handleDisconnect deal with it
+        if (this.data?.failed || this.data?.closed) break;
+
         const file = this.fileQueue[0];
         if (this.rejectedFiles.has(file.nodeId) || this.isNodePruned(file.nodeId)) {
           this.fileQueue.shift();
@@ -421,6 +446,11 @@ export class MfupSession {
         try {
           await this.streamFile(file);
         } catch (err) {
+          // If data channel died during streaming, don't throw — just break
+          if (this.data?.failed || this.data?.closed) {
+            this.activeFile = null;
+            break;
+          }
           const mfupErr = err instanceof MfupError ? err : ingestError(
             "stream", `node ${file.nodeId}`, err,
           );
@@ -481,7 +511,10 @@ export class MfupSession {
         offset += BigInt(piece.length);
 
         // Backpressure: in batch mode, flush if buffer exceeds threshold
-        if (this.data) await this.data.drain();
+        if (this.data) {
+          await this.data.drain();
+          if (this.data.failed) return; // channel died — bail out
+        }
       }
     }
 
@@ -502,10 +535,19 @@ export class MfupSession {
 
     // Wait for the file pump to fully drain
     await this.pumpDone;
-    // In case new files were queued after pump finished, re-kick and wait again
-    while (this.fileQueue.length > 0) {
-      this.kickPump();
-      await this.pumpDone;
+
+    // If a disconnect happened during pumping, wait for reconnect then re-drain
+    while (this._state === "waiting_resume" || this.fileQueue.length > 0) {
+      if (this._reconnectPromise) {
+        await this._reconnectPromise;
+      }
+      if (this._state === "failed" || this._state === "aborted") {
+        throw new Error(`session ended in state: ${this._state}`);
+      }
+      if (this.fileQueue.length > 0) {
+        this.kickPump();
+        await this.pumpDone;
+      }
     }
 
     // SESSION_END
@@ -587,7 +629,9 @@ export class MfupSession {
 
   /** Write to data channel with error propagation instead of silent drops */
   private safeWrite(frame: Parameters<DataChannel["write"]>[0]): void {
-    if (!this.data || this.data.closed) {
+    if (!this.data || this.data.closed || this.data.failed) {
+      // If reconnecting, silently drop — handleDisconnect will requeue files
+      if (this._state === "waiting_resume") return;
       const err = dataWriteFailed("data channel not available");
       this.emitError(err);
       return;
@@ -722,30 +766,62 @@ export class MfupSession {
 
   private async handleDisconnect(err: unknown): Promise<void> {
     if (this._state === "committed" || this._state === "aborted") return;
+    // Prevent duplicate calls (WS close + data error can both fire)
+    if (this._state === "waiting_resume") return;
 
     this.setState("waiting_resume");
     this.data?.abort("disconnected");
 
-    if (this.reconnectCount >= this.maxReconnectAttempts) {
+    if (this.maxReconnectAttempts != null && this.reconnectCount >= this.maxReconnectAttempts) {
       this.setState("failed");
       const exhaustedErr = sessionReconnectExhausted(this.reconnectCount, err);
       this.emitError(exhaustedErr);
       this._commitReject?.(exhaustedErr);
+      this._reconnectResolve?.();
       return;
     }
 
     this.reconnectCount++;
-    const delay = this.reconnectDelayMs * Math.pow(2, this.reconnectCount - 1);
+    const delay = Math.min(
+      this.reconnectDelayMs * Math.pow(2, this.reconnectCount - 1),
+      20_000,
+    );
+
+    // Emit reconnecting event BEFORE the delay so UI updates immediately
+    this.emit("reconnecting", {
+      attempt: this.reconnectCount,
+      delay,
+      maxAttempts: this.maxReconnectAttempts,
+    });
 
     this.emitError(sessionReconnectFailed(this.reconnectCount, err));
-    await new Promise((r) => setTimeout(r, delay));
+
+    // Set up reconnect promise so finalizeScan can await it
+    this._reconnectPromise = new Promise<void>((resolve) => {
+      this._reconnectResolve = resolve;
+    });
+
+    await new Promise((r) => {
+      this._reconnectTimer = setTimeout(r, delay);
+    });
+    this._reconnectTimer = null;
+
+    // Check if abort() was called during the delay
+    if ((this._state as SessionState) === "aborted") return;
 
     try {
       await this.connect();
       this.requeuePendingFiles();
       this.kickPump();
-      await this.pumpDone;
+      // Signal reconnect complete — finalizeScan can proceed
+      this._reconnectResolve?.();
+      this._reconnectPromise = null;
+      this._reconnectResolve = null;
     } catch (reconnectErr) {
+      // Clear promise before recursive call (it will create a new one)
+      this._reconnectResolve?.();
+      this._reconnectPromise = null;
+      this._reconnectResolve = null;
       await this.handleDisconnect(reconnectErr);
     }
   }

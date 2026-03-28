@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,8 +15,11 @@ from fastapi.responses import JSONResponse
 
 from .protocol import PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
 from .session_manager import SessionRegistry, LiveSession
-from .publish import publish_session, ConflictError, sweep
+from .publish import publish_session, ConflictError
+from .redis_index import SessionIndex
+from .storage import staging_dir
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("mfup.app")
 
 # ---------------------------------------------------------------------------
@@ -51,7 +55,10 @@ def _is_safe_target(base_dir: Path, target_dir: str) -> bool:
         return False
 
 
+REDIS_URL = __import__("os").environ.get("REDIS_URL", "redis://redis:6379/0")
+
 _registry: SessionRegistry | None = None
+_session_index: SessionIndex | None = None
 _sweep_task: asyncio.Task | None = None
 
 
@@ -60,11 +67,18 @@ def get_registry() -> SessionRegistry:
     return _registry
 
 
+def get_session_index() -> SessionIndex:
+    assert _session_index is not None
+    return _session_index
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _registry, _sweep_task
+    global _registry, _session_index, _sweep_task
     base = DEFAULT_BASE_DIR
     base.mkdir(parents=True, exist_ok=True)
+
+    _session_index = SessionIndex(REDIS_URL)
 
     _registry = SessionRegistry(
         base,
@@ -72,18 +86,54 @@ async def lifespan(app: FastAPI):
         session_resume_ttl=SESSION_RESUME_TTL,
         leg_idle_timeout=LEG_IDLE_TIMEOUT,
     )
-    await _registry.recover()
+    # Recover live sessions from Redis index → SQLite DBs
+    try:
+        alive_ids = await _session_index.get_not_expired()
+        expired_ids = await _session_index.get_expired()
+        logger.info(
+            "Startup: Redis has %d alive + %d expired session(s)",
+            len(alive_ids), len(expired_ids),
+        )
+        recovered = 0
+        for sid in alive_ids:
+            meta = await _session_index.get_meta(sid)
+            if not meta or not meta.staging_dir:
+                logger.warning("Startup: no meta for session %s, skipping", sid)
+                continue
+            session = await _registry.recover_session(sid, Path(meta.staging_dir))
+            if session:
+                # Wire expiry callback for Redis updates
+                idx = _session_index
+                session._on_expiry_change = lambda s, e, _idx=idx: _idx.update_expiry(s, e)
+                recovered += 1
+        logger.info("Startup: recovered %d session(s) from disk", recovered)
+    except Exception:
+        logger.exception("Startup: session recovery failed")
 
-    # Periodic sweeper
+    # Periodic sweeper — queries Redis sorted set, never iterdir
     async def sweeper():
         while True:
             await asyncio.sleep(SWEEP_INTERVAL)
             try:
-                removed = sweep(base, STAGING_PREFIX)
-                if removed:
-                    for sid in removed:
-                        await _registry.remove(sid)
-                    logger.info("Sweeper removed %d sessions", len(removed))
+                expired_ids = await _session_index.get_expired()
+                if not expired_ids:
+                    continue
+                for sid in expired_ids:
+                    # Remove from in-memory registry (if present)
+                    await _registry.remove(sid)
+                    # Get staging path from Redis meta
+                    meta = await _session_index.get_meta(sid)
+                    if meta and meta.staging_dir:
+                        sd = Path(meta.staging_dir)
+                    else:
+                        # Fallback: reconstruct from convention
+                        sd = staging_dir(base, sid, STAGING_PREFIX)
+                    if sd.exists():
+                        shutil.rmtree(str(sd), ignore_errors=True)
+                    # Remove from Redis (sorted set + meta hash)
+                    await _session_index.remove(sid)
+                    logger.info("Sweeper cleaned session %s (staging=%s)", sid, sd)
+                logger.info("Sweeper removed %d sessions", len(expired_ids))
             except Exception:
                 logger.exception("Sweeper error")
 
@@ -96,6 +146,7 @@ async def lifespan(app: FastAPI):
         await _sweep_task
     except asyncio.CancelledError:
         pass
+    await _session_index.close()
 
 
 app = FastAPI(title="MFUP/2 Server", lifespan=lifespan)
@@ -147,6 +198,11 @@ async def control_endpoint(ws: WebSocket):
                     session_id, resume_token, leg_id, expires.isoformat(),
                     target_dir=target_dir,
                 )
+                # Register in Redis index for TTL-based cleanup (with paths)
+                idx = get_session_index()
+                sd = staging_dir(registry.base_dir, session_id, STAGING_PREFIX)
+                await idx.register(session_id, expires, target_dir, str(sd))
+                session._on_expiry_change = lambda sid, exp: idx.update_expiry(sid, exp)
             except ValueError:
                 # Session already exists — treat as conflict
                 await ws.send_json({
@@ -202,6 +258,9 @@ async def control_endpoint(ws: WebSocket):
                 return
 
             session.ws = ws
+            # Ensure expiry callback is wired for resumed sessions
+            idx = get_session_index()
+            session._on_expiry_change = lambda sid, exp: idx.update_expiry(sid, exp)
             resume_ok = session.build_resume_ok()
             await ws.send_json(resume_ok)
 
@@ -467,16 +526,28 @@ async def publish_endpoint(session_id: str):
         return JSONResponse({"error": str(exc)}, status_code=404)
 
     await registry.remove(session_id)
+    await get_session_index().remove(session_id)
     return {"published": published}
 
 
 @app.post("/mfup/sweep")
 async def sweep_endpoint():
-    """Manually trigger a sweep."""
+    """Manually trigger a sweep — queries Redis, no iterdir."""
     registry = get_registry()
-    removed = sweep(registry.base_dir, STAGING_PREFIX)
-    for sid in removed:
+    idx = get_session_index()
+    expired_ids = await idx.get_expired()
+    removed = []
+    for sid in expired_ids:
         await registry.remove(sid)
+        meta = await idx.get_meta(sid)
+        if meta and meta.staging_dir:
+            sd = Path(meta.staging_dir)
+        else:
+            sd = staging_dir(registry.base_dir, sid, STAGING_PREFIX)
+        if sd.exists():
+            shutil.rmtree(str(sd), ignore_errors=True)
+        await idx.remove(sid)
+        removed.append(sid)
     return {"removed": removed}
 
 

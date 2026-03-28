@@ -155,7 +155,7 @@ function renderState(state: SessionState) {
   } else if (state === "aborted" || state === "failed") {
     bar.classList.add("error");
     btnAbort.disabled = true;
-  } else if (state === "active" || state === "paused_by_server") {
+  } else if (state === "active" || state === "paused_by_server" || state === "waiting_resume") {
     btnAbort.disabled = false;
   }
 }
@@ -239,6 +239,13 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
     } catch (err: any) {
       log(`Publish error: ${err.message}`, "warn");
     }
+  });
+  session.on("reconnecting", (ev) => {
+    const maxLabel = ev.maxAttempts != null ? String(ev.maxAttempts) : "∞";
+    log(`Reconnecting: attempt ${ev.attempt}/${maxLabel} (waiting ${(ev.delay / 1000).toFixed(1)}s)`, "warn");
+    stateBadge.textContent = `RECONNECTING ${ev.attempt}/${maxLabel}`;
+    stateBadge.className = "badge waiting_resume";
+    btnAbort.disabled = false;
   });
   session.on("error", (err) => {
     log(`[${err.layer}/${err.code}] ${err.message}`, err.fatal ? "err" : "warn");

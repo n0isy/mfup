@@ -192,8 +192,8 @@ export function dataWriteFailed(reason: string, cause?: unknown): MfupError {
     code: MfupErrorCode.DATA_WRITE_FAILED,
     layer: MfupErrorLayer.DATA,
     message: `Cannot write to data channel: ${reason}`,
-    action: "Data channel is closed or not opened. This indicates an internal state bug or a network drop.",
-    fatal: true,
+    action: "Data channel write failed. Will attempt reconnect.",
+    fatal: false,
     cause,
     detail: { reason },
   });

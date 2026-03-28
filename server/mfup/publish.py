@@ -1,15 +1,13 @@
-"""MFUP/2 publish (rename from staging) and session sweeper."""
+"""MFUP/2 publish (rename from staging to target)."""
 
 from __future__ import annotations
 
 import logging
 import os
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 
-from .protocol import SessionState
-from .storage import DEFAULT_STAGING_PREFIX, SessionDB, staging_dir
+from .storage import DEFAULT_STAGING_PREFIX, staging_dir
 
 logger = logging.getLogger("mfup.publish")
 
@@ -120,97 +118,3 @@ def _cleanup_staging(sd: Path) -> None:
         shutil.rmtree(str(sd), ignore_errors=True)
     except Exception:
         logger.exception("Failed to clean staging dir %s", sd)
-
-
-# ---------------------------------------------------------------------------
-# Sweeper
-# ---------------------------------------------------------------------------
-
-def sweep(base_dir: Path, prefix: str = DEFAULT_STAGING_PREFIX) -> list[str]:
-    """Scan base_dir for staging dirs and clean up terminal sessions.
-
-    Returns list of removed session IDs.
-    """
-    removed: list[str] = []
-    if not base_dir.exists():
-        return removed
-
-    now = datetime.now(timezone.utc)
-    pfx = prefix + "."
-
-    for entry in list(base_dir.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(pfx):
-            continue
-
-        sid = entry.name[len(pfx):]
-        db_path = entry / "state.sqlite"
-
-        if not db_path.exists():
-            # Orphaned staging dir — no valid state
-            logger.warning("Removing orphaned staging dir for session %s", sid)
-            shutil.rmtree(str(entry), ignore_errors=True)
-            removed.append(sid)
-            continue
-
-        try:
-            db = SessionDB(db_path)
-        except Exception:
-            logger.exception("Cannot open DB for session %s, removing", sid)
-            shutil.rmtree(str(entry), ignore_errors=True)
-            removed.append(sid)
-            continue
-
-        try:
-            sess = db.get_session()
-            if sess is None:
-                db.close()
-                shutil.rmtree(str(entry), ignore_errors=True)
-                removed.append(sid)
-                continue
-
-            state = SessionState(sess["state"])
-            expires_at_str = sess["expires_at"]
-
-            # Parse expiry
-            try:
-                expires_at = datetime.fromisoformat(expires_at_str)
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                expires_at = now  # treat bad dates as expired
-
-            # Delete terminal sessions
-            if state in (SessionState.COMMITTED, SessionState.ABORTED):
-                logger.info("Sweeping %s session %s", state.value, sid)
-                db.close()
-                shutil.rmtree(str(entry), ignore_errors=True)
-                removed.append(sid)
-                continue
-
-            # Delete expired sessions
-            if state in (SessionState.EXPIRED, SessionState.FAILED):
-                logger.info("Sweeping %s session %s", state.value, sid)
-                db.close()
-                shutil.rmtree(str(entry), ignore_errors=True)
-                removed.append(sid)
-                continue
-
-            # Expire waiting_resume sessions past their TTL
-            if state == SessionState.WAITING_RESUME and now >= expires_at:
-                logger.info("Expiring session %s (TTL passed)", sid)
-                db.set_state(SessionState.EXPIRED)
-                db.close()
-                shutil.rmtree(str(entry), ignore_errors=True)
-                removed.append(sid)
-                continue
-
-            db.close()
-
-        except Exception:
-            logger.exception("Error sweeping session %s", sid)
-            try:
-                db.close()
-            except Exception:
-                pass
-
-    return removed

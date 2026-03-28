@@ -1,14 +1,22 @@
 services:
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+
   backend:
     image: python:3.12-slim
     working_dir: /app
+    depends_on:
+      - redis
     expose:
       - "8070"
     command: >
-      sh -c "pip install --quiet fastapi uvicorn[standard] websockets &&
+      sh -c "pip install --quiet fastapi uvicorn[standard] websockets redis &&
              python -m uvicorn mfup.app:app --host 0.0.0.0 --port 8070 --log-level info"
     environment:
       MFUP_BASE_DIR: /data/uploads
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./server:/app
       - ./uploads:/data/uploads

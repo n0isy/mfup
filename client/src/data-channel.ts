@@ -42,6 +42,7 @@ export interface DataCommitResult {
 
 export class DataChannel {
   private _closed = false;
+  private _failed = false;
   private _bytesSent = 0;
   private _onError: ((err: MfupError) => void) | null = null;
   private readonly _url: string;
@@ -72,6 +73,7 @@ export class DataChannel {
   }
 
   get closed(): boolean { return this._closed; }
+  get failed(): boolean { return this._failed; }
   get bytesSent(): number { return this._bytesSent; }
 
   /** Register an error callback for async errors (HTTP response, network). */
@@ -265,6 +267,7 @@ export class DataChannel {
           signal: this.opts.signal,
         });
         if (!resp.ok) {
+          this._failed = true;
           const text = await resp.text().catch(() => "");
           const err = dataHttpError(url, resp.status, resp.statusText, text);
           this._onError?.(err);
@@ -283,6 +286,7 @@ export class DataChannel {
         }
         this._bytesSent += body.byteLength;
       } catch (cause) {
+        this._failed = true;
         const err = dataWriteFailed(`POST to ${url} failed`, cause);
         this._onError?.(err);
       }
