@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from .protocol import PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
 from .session_manager import SessionRegistry, LiveSession
-from .publish import publish_session, sweep
+from .publish import publish_session, ConflictError, sweep
 
 logger = logging.getLogger("mfup.app")
 
@@ -36,6 +36,20 @@ STAGING_PREFIX = __import__("os").environ.get("MFUP_STAGING_PREFIX", ".incoming"
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
+
+def _is_safe_target(base_dir: Path, target_dir: str) -> bool:
+    """Check that target_dir resolves within base_dir (no path traversal)."""
+    target = Path(target_dir)
+    if target.is_absolute():
+        resolved = target.resolve()
+    else:
+        resolved = (base_dir / target).resolve()
+    try:
+        resolved.relative_to(base_dir.resolve())
+        return True
+    except ValueError:
+        return False
+
 
 _registry: SessionRegistry | None = None
 _sweep_task: asyncio.Task | None = None
@@ -116,6 +130,16 @@ async def control_endpoint(ws: WebSocket):
             resume_token = msg["resume_token"]
             leg_id = msg["leg_id"]
             target_dir = msg.get("target_dir", ".")
+
+            # Validate target_dir stays within base_dir
+            if not _is_safe_target(registry.base_dir, target_dir):
+                await ws.send_json({
+                    "t": "SESSION_ABORT",
+                    "code": "bad_target_dir",
+                    "reason": "target_dir escapes base directory",
+                })
+                await ws.close()
+                return
 
             expires = datetime.now(timezone.utc) + timedelta(seconds=SESSION_RESUME_TTL)
             try:
@@ -200,6 +224,16 @@ async def control_endpoint(ws: WebSocket):
                     session.db.set_state(SessionState.ABORTED)
                     session.detach_leg()
                 break
+
+            if t == "ACTION":
+                action = msg.get("action")
+                if session and action in ("merge_overwrite", "cancel"):
+                    session.publish_action = action
+                    logger.info("Session %s: ACTION=%s", session.session_id, action)
+                    if action == "cancel":
+                        session.db.set_state(SessionState.ABORTED)
+                        session.detach_leg()
+                        break
 
     except WebSocketDisconnect:
         logger.info("Control WS disconnected for session %s (state=%s)",
@@ -411,11 +445,21 @@ async def publish_endpoint(session_id: str):
     if not target.is_absolute():
         target = registry.base_dir / target
 
-    try:
-        published = publish_session(registry.base_dir, session_id, target, STAGING_PREFIX)
-    except FileExistsError as exc:
+    # Defense in depth: verify target stays within base_dir
+    if not _is_safe_target(registry.base_dir, session.target_dir):
         return JSONResponse(
-            {"error": str(exc)},
+            {"error": "target_dir escapes base directory"},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    try:
+        published = publish_session(
+            registry.base_dir, session_id, target, STAGING_PREFIX,
+            action=session.publish_action,
+        )
+    except ConflictError as exc:
+        return JSONResponse(
+            {"error": "conflict_files", "conflicting_files": exc.conflicting_files},
             status_code=status.HTTP_409_CONFLICT,
         )
     except FileNotFoundError as exc:

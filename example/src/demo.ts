@@ -35,11 +35,17 @@ const logEl         = document.getElementById("log")!;
 const errorsPanel   = document.getElementById("errors")!;
 const errorList     = document.getElementById("error-list")!;
 const errorCountEl  = document.getElementById("error-count")!;
+const conflictOverlay = document.getElementById("conflict-overlay")!;
+const modalOverwrite  = document.getElementById("modal-overwrite")!;
+const modalCancel     = document.getElementById("modal-cancel")!;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 let session: MfupSession | null = null;
+let cancelled = false;
+let conflictResolve: ((action: "merge_overwrite" | "cancel") => void) | null = null;
+let conflictPromise: Promise<"merge_overwrite" | "cancel"> | null = null;
 
 // Determine server URL from current page location
 const loc = window.location;
@@ -165,6 +171,7 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
   progressPanel.classList.add("visible");
   dropzone.classList.add("uploading");
 
+  cancelled = false;
   session = new MfupSession({ serverUrl, targetDir: ".", chunkSize: 256 * 1024 });
   sessionLabel.textContent = `session ${session.id.slice(0, 8)}...`;
   btnAbort.disabled = false;
@@ -173,8 +180,53 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
 
   session.onProgress(renderProgress);
   session.on("state", (s) => { renderState(s); log(`State -> ${s}`, "info"); });
+  session.on("ask", () => {
+    log("Server: file conflicts detected in target directory", "warn");
+    conflictOverlay.classList.add("visible");
+
+    conflictPromise = new Promise((resolve) => { conflictResolve = resolve; });
+
+    const onOverwrite = () => {
+      cleanup();
+      session!.sendAction("merge_overwrite");
+      log("User chose: merge & overwrite", "info");
+      conflictResolve?.("merge_overwrite");
+    };
+    const onCancel = () => {
+      cleanup();
+      cancelled = true;
+      session!.sendAction("cancel");
+      log("User chose: cancel", "warn");
+      conflictResolve?.("cancel");
+    };
+    const cleanup = () => {
+      conflictOverlay.classList.remove("visible");
+      modalOverwrite.removeEventListener("click", onOverwrite);
+      modalCancel.removeEventListener("click", onCancel);
+    };
+
+    modalOverwrite.addEventListener("click", onOverwrite);
+    modalCancel.addEventListener("click", onCancel);
+  });
   session.on("committed", async (ev) => {
     log(`COMMITTED: ${ev.files} files, ${fmtBytes(ev.bytes)}`, "ok");
+
+    // If conflict modal is open, wait for user to respond before publishing
+    if (conflictPromise) {
+      log("Waiting for conflict resolution...", "info");
+      const action = await conflictPromise;
+      conflictPromise = null;
+      conflictResolve = null;
+      if (action === "cancel") {
+        log("Session was cancelled — skipping publish", "warn");
+        return;
+      }
+    }
+
+    if (cancelled) {
+      log("Session was cancelled — skipping publish", "warn");
+      return;
+    }
     try {
       const resp = await fetch(`${serverUrl}/mfup/sessions/${session!.id}/publish`, { method: "POST" });
       if (resp.ok) {
@@ -302,12 +354,7 @@ dropzone.addEventListener("drop", (e) => {
 // ---------------------------------------------------------------------------
 browseBtn.addEventListener("click", (e) => {
   e.stopPropagation();
-  const useFolder = confirm("Select a folder? (Cancel for individual files)");
-  if (useFolder) {
-    folderInput.click();
-  } else {
-    fileInput.click();
-  }
+  fileInput.click();
 });
 
 dropzone.addEventListener("click", () => {
@@ -349,6 +396,10 @@ btnReset.addEventListener("click", () => {
   errorCountEl.textContent = "0";
   bar.style.width = "0%";
   bar.classList.remove("done", "error");
+  cancelled = false;
+  conflictPromise = null;
+  conflictResolve = null;
+  conflictOverlay.classList.remove("visible");
   statBytes.textContent = "0 B";
   statFiles.textContent = "0";
   statScanned.textContent = "0";

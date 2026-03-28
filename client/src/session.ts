@@ -72,6 +72,7 @@ export interface MfupSessionEvents {
   progress: ProgressSnapshot;
   state: SessionState;
   committed: { files: number; bytes: number };
+  ask: void;
   error: MfupError;
 }
 
@@ -176,6 +177,10 @@ export class MfupSession {
   get token(): string { return this.resumeToken; }
   get currentEpoch(): number { return this.epoch; }
   get streamingMode(): boolean | null { return this._streamingMode; }
+
+  sendAction(action: "merge_overwrite" | "cancel"): void {
+    this.control?.sendAction(action);
+  }
 
   onProgress(fn: ProgressListener): () => void { return this.progress.on(fn); }
 
@@ -690,6 +695,10 @@ export class MfupSession {
       this.setState("committed");
       this.emit("committed", { files: msg.files, bytes: msg.bytes });
       this._commitResolve?.();
+    });
+
+    this.control.on("ask", () => {
+      this.emit("ask", undefined as any);
     });
 
     this.control.on("close", () => {

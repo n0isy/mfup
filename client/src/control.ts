@@ -32,6 +32,7 @@ export type ControlEventMap = {
   session_abort: ServerControlMsg & { t: "SESSION_ABORT" };
   commit_ok: ServerControlMsg & { t: "COMMIT_OK" };
   probe_ack: ServerControlMsg & { t: "PROBE_ACK" };
+  ask: ServerControlMsg & { t: "ASK" };
   error: MfupError;
   close: { code: number; reason: string };
 };
@@ -125,6 +126,10 @@ export class ControlChannel {
     this.send({ t: "CLIENT_ABORT", code, reason });
   }
 
+  sendAction(action: "merge_overwrite" | "cancel"): void {
+    this.send({ t: "ACTION", action });
+  }
+
   // -- event bus -------------------------------------------------------
 
   on<K extends keyof ControlEventMap>(event: K, fn: Listener<ControlEventMap[K]>): () => void {
@@ -210,6 +215,9 @@ export class ControlChannel {
         break;
       case "PROBE_ACK":
         this.emit("probe_ack", msg);
+        break;
+      case "ASK":
+        this.emit("ask", msg);
         break;
     }
   }

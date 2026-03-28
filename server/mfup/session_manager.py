@@ -114,6 +114,12 @@ class LiveSession:
         # Sequence tracking for multi-POST data legs
         self.last_data_seq: int = -1
 
+        # Conflict FSM: "clean" → "conflict_dir" → "conflict_files"
+        self.conflict_state: str = "clean"
+
+        # Publish action (set by client ACTION message)
+        self.publish_action: Optional[str] = None
+
         # Locks
         self._lock = asyncio.Lock()
 
@@ -188,6 +194,49 @@ class LiveSession:
         elif isinstance(frame, ClientAbortFrame):
             await self._handle_client_abort(frame)
 
+    def _resolve_target_path(self, node_id: int) -> Path | None:
+        """Resolve where this node would land in target_dir after publish."""
+        target = Path(self.target_dir)
+        if not target.is_absolute():
+            target = self.base_dir / target
+        # Build relative path from payload root
+        parts: list[str] = []
+        cur = node_id
+        while cur != 0:  # ROOT_NODE_ID
+            node = self.db.get_node(cur)
+            if node is None:
+                return None
+            parts.append(node["name"])
+            cur = node["parent_id"]
+        if not parts:
+            return None
+        parts.reverse()
+        result = target / Path(*parts)
+        # Guard against path traversal via crafted file names
+        try:
+            result.resolve().relative_to(self.base_dir.resolve())
+        except ValueError:
+            return None
+        return result
+
+    async def _check_conflict(self, node_id: int, is_dir: bool) -> None:
+        """Advance conflict FSM by checking if target path exists."""
+        if self.conflict_state == "conflict_files":
+            return  # already at terminal state
+        dest = self._resolve_target_path(node_id)
+        if dest is None or not dest.exists():
+            return
+        if is_dir and dest.is_dir():
+            # Dir-dir match: auto-accept, advance silently
+            if self.conflict_state == "clean":
+                self.conflict_state = "conflict_dir"
+                logger.info("Session %s: conflict_dir (dir %s exists)", self.session_id, dest.name)
+        else:
+            # File-file or type mismatch: send ASK once
+            self.conflict_state = "conflict_files"
+            logger.info("Session %s: conflict_files (file %s exists)", self.session_id, dest.name)
+            await self.send_control({"t": "ASK"})
+
     async def _handle_node(self, f: NodeFrame) -> None:
         if self.db.is_pruned(f.node_id):
             return
@@ -199,6 +248,9 @@ class LiveSession:
             # Create directory in payload
             path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
             path.mkdir(parents=True, exist_ok=True)
+            await self._check_conflict(f.node_id, is_dir=True)
+        else:
+            await self._check_conflict(f.node_id, is_dir=False)
 
     async def _handle_file_open(self, f: FileOpenFrame) -> None:
         if self.db.is_rejected(f.node_id) or self.db.is_pruned(f.node_id):

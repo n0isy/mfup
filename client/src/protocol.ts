@@ -143,7 +143,12 @@ export interface ClientAbortMsg {
   reason: string;
 }
 
-export type ClientControlMsg = HelloMsg | ResumeMsg | ClientAbortMsg;
+export interface ActionMsg {
+  t: "ACTION";
+  action: "merge_overwrite" | "cancel";
+}
+
+export type ClientControlMsg = HelloMsg | ResumeMsg | ClientAbortMsg | ActionMsg;
 
 // Server → Client
 export interface HelloOkMsg {
@@ -233,6 +238,10 @@ export interface ProbeAckMsg {
   first_chunk_bytes?: number;
 }
 
+export interface AskMsg {
+  t: "ASK";
+}
+
 export type ServerControlMsg =
   | HelloOkMsg
   | ResumeOkMsg
@@ -243,7 +252,8 @@ export type ServerControlMsg =
   | RejectFileMsg
   | SessionAbortMsg
   | CommitOkMsg
-  | ProbeAckMsg;
+  | ProbeAckMsg
+  | AskMsg;
 
 // ---------------------------------------------------------------------------
 // Session states

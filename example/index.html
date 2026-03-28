@@ -333,6 +333,45 @@
   button.primary:hover { background: #2563eb; }
   button.danger:hover { border-color: var(--red); color: var(--red); }
   button:disabled { opacity: 0.35; pointer-events: none; }
+
+  /* ---- conflict modal ---- */
+  #conflict-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #0008;
+    backdrop-filter: blur(4px);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  #conflict-overlay.visible { display: flex; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px 32px;
+    max-width: 420px;
+    width: 90%;
+    text-align: center;
+  }
+  .modal h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--orange);
+    margin-bottom: 10px;
+  }
+  .modal p {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 20px;
+    line-height: 1.5;
+  }
+  .modal .modal-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+  }
 </style>
 </head>
 <body>
@@ -388,6 +427,17 @@
 </div>
 
 <div id="log"></div>
+
+<div id="conflict-overlay">
+  <div class="modal">
+    <h2>File Conflict</h2>
+    <p>Files already exist in the target directory. Overwrite existing files?</p>
+    <div class="modal-actions">
+      <button id="modal-overwrite" class="primary">Overwrite</button>
+      <button id="modal-cancel" class="danger">Cancel</button>
+    </div>
+  </div>
+</div>
 
 <script type="module" src="/src/demo.ts"></script>
 </body>
