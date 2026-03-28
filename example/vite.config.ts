@@ -9,6 +9,14 @@ export default defineConfig({
       "@mfup/client": path.resolve("/client/src"),
     },
   },
+  build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        compare: path.resolve(__dirname, "compare.html"),
+      },
+    },
+  },
   server: {
     host: "0.0.0.0",
     port: 3000,
@@ -30,6 +38,11 @@ export default defineConfig({
       "/health": {
         target: "http://backend:8070",
         changeOrigin: true,
+      },
+      "/trivial": {
+        target: "http://trivial:8071",
+        changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/trivial/, ""),
       },
     },
   },

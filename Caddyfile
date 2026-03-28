@@ -7,6 +7,11 @@
         reverse_proxy backend:8070
     }
 
+    handle /trivial/* {
+        uri strip_prefix /trivial
+        reverse_proxy trivial:8071
+    }
+
     handle {
         reverse_proxy frontend:3000
     }
