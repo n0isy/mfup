@@ -45,11 +45,19 @@ services:
       - ./example:/app
       - ./client:/client
 
+  frontend-build:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npx vite build"
+    volumes:
+      - ./example:/app
+      - ./client:/client
+
   caddy:
     image: caddy:2-alpine
     depends_on:
       - backend
-      - frontend
+      - frontend-build
       - trivial
     ports:
       - "20060:80"

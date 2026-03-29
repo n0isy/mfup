@@ -83,7 +83,14 @@ export class ProgressTracker {
   acceptFile(): void { this._acceptedFiles++; this.notify(); }
   skipFile(): void { this._skippedFiles++; this.notify(); }
 
-  setExpiresAt(v: string | null): void { this._expiresAt = v; }
+  /** Bulk-set file counts (used during resume to restore from server state) */
+  setFileCounts(accepted: number, skipped: number): void {
+    this._acceptedFiles = accepted;
+    this._skippedFiles = skipped;
+    this.notify();
+  }
+
+  setExpiresAt(v: string | null): void { this._expiresAt = v; this.notify(); }
 
   /** Bulk-set from a RESUME_OK root_summary */
   setFromRootSummary(s: { scan_done_units: number; scan_est_units: number; body_done_bytes: number; body_est_bytes: number; sealed: boolean }): void {

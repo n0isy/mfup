@@ -5,7 +5,6 @@ from mfup.protocol import (
     FrameTag,
     NodeKind,
     ChecksumKind,
-    HashKind,
     FrameReader,
     crc32c,
     NodeFrame,

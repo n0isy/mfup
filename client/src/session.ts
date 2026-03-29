@@ -785,6 +785,9 @@ export class MfupSession {
     for (const pn of msg.pruned_nodes) this.prunedNodes.add(pn);
     for (const rn of msg.rejected_files) this.rejectedFiles.add(rn);
 
+    let acceptedCount = 0;
+    let skippedCount = msg.pruned_nodes.length;
+
     for (const fs of msg.files) {
       const file = this.trackedFiles.get(fs.node_id);
       if (file) {
@@ -792,11 +795,19 @@ export class MfupSession {
         if (fs.status === "rejected") {
           file.status = "rejected";
           this.rejectedFiles.add(fs.node_id);
+          skippedCount++;
         } else if (fs.status === "closed") {
           file.status = "acked";
+          acceptedCount++;
         }
+      } else {
+        // File not yet in trackedFiles (scan hasn't re-discovered it yet)
+        if (fs.status === "closed") acceptedCount++;
+        else if (fs.status === "rejected") skippedCount++;
       }
     }
+
+    this.progress.setFileCounts(acceptedCount, skippedCount);
   }
 
   private async handleDisconnect(err: unknown): Promise<void> {

@@ -301,6 +301,17 @@ class SessionDB:
         row = cur.fetchone()
         return (row[0], row[1])
 
+    def get_incomplete_files(self) -> list[dict]:
+        """Return files where accepted_offset != final_size (incomplete transfers)."""
+        self._conn.row_factory = sqlite3.Row
+        cur = self._conn.execute(
+            "SELECT f.node_id, f.accepted_offset, f.final_size "
+            "FROM files f JOIN nodes n ON f.node_id = n.node_id "
+            "WHERE n.status NOT IN ('rejected', 'pruned') "
+            "  AND (f.final_size IS NULL OR f.accepted_offset != f.final_size)"
+        )
+        return [dict(row) for row in cur.fetchall()]
+
 
 # ---------------------------------------------------------------------------
 # Staging directory helpers
@@ -325,10 +336,21 @@ def open_session_db(base_dir: Path, session_id: str, prefix: str = DEFAULT_STAGI
     return SessionDB(sd / "state.sqlite")
 
 
+def validate_node_name(name: str) -> None:
+    """Reject names that could escape the payload directory."""
+    if not name:
+        raise ValueError("empty node name")
+    if name in (".", ".."):
+        raise ValueError(f"illegal node name: {name!r}")
+    if "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError(f"illegal characters in node name: {name!r}")
+
+
 def resolve_payload_path(base_dir: Path, session_id: str, db: SessionDB, node_id: int, prefix: str = DEFAULT_STAGING_PREFIX) -> Path:
     """Build the filesystem path for a node inside the payload directory.
 
     Walks parent_id chain in the DB to reconstruct the relative path.
+    Validates each name component to prevent path traversal.
     """
     parts: list[str] = []
     cur_id = node_id
@@ -336,8 +358,14 @@ def resolve_payload_path(base_dir: Path, session_id: str, db: SessionDB, node_id
         node = db.get_node(cur_id)
         if node is None:
             break
+        validate_node_name(node["name"])
         parts.append(node["name"])
         cur_id = node["parent_id"]
     parts.reverse()
     sd = staging_dir(base_dir, session_id, prefix)
-    return sd / "payload" / Path(*parts) if parts else sd / "payload"
+    result = sd / "payload" / Path(*parts) if parts else sd / "payload"
+    # Defense in depth: resolved path must stay within payload dir
+    payload_root = sd / "payload"
+    if not result.resolve().is_relative_to(payload_root.resolve()):
+        raise ValueError(f"path traversal detected: {result}")
+    return result

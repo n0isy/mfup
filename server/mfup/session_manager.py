@@ -30,7 +30,7 @@ from .protocol import (
     NodeStatus,
     crc32c,
 )
-from .storage import DEFAULT_STAGING_PREFIX, SessionDB, ensure_staging, open_session_db, resolve_payload_path, staging_dir
+from .storage import DEFAULT_STAGING_PREFIX, SessionDB, ensure_staging, open_session_db, resolve_payload_path, staging_dir, validate_node_name
 
 logger = logging.getLogger("mfup.session")
 
@@ -251,6 +251,11 @@ class LiveSession:
     async def _handle_node(self, f: NodeFrame) -> None:
         if self.db.is_pruned(f.node_id):
             return
+        try:
+            validate_node_name(f.name)
+        except ValueError:
+            logger.warning("Rejected node %d with illegal name: %r", f.node_id, f.name)
+            return
         self.db.upsert_node(
             f.node_id, f.parent_id, f.kind, f.name,
             size=f.size_hint, mtime_ms=f.mtime_ms,
@@ -275,7 +280,7 @@ class LiveSession:
         file_row = self.db.get_file(f.node_id)
         accepted = file_row["accepted_offset"] if file_row else 0
 
-        path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id)
+        path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
         writer = FileWriter(path, f.node_id, accepted)
         self.writers[f.node_id] = writer
 
@@ -434,6 +439,24 @@ class LiveSession:
         """Attempt to commit: returns COMMIT_OK payload or None if not ready."""
         state = self.db.get_state()
         if state != SessionState.COMMITTING:
+            return None
+
+        # Invariant: no open writers
+        if self.writers:
+            logger.warning(
+                "Session %s: commit blocked — %d open writer(s)",
+                self.session_id, len(self.writers),
+            )
+            return None
+
+        # Invariant: all files fully received (accepted_offset == final_size)
+        incomplete = self.db.get_incomplete_files()
+        if incomplete:
+            logger.warning(
+                "Session %s: commit blocked — %d incomplete file(s): %s",
+                self.session_id, len(incomplete),
+                [(f["node_id"], f["accepted_offset"], f["final_size"]) for f in incomplete[:5]],
+            )
             return None
 
         file_count, total_bytes = self.db.count_committed_files()
