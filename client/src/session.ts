@@ -90,6 +90,8 @@ interface TrackedFile {
   acceptedOffset: bigint;
   openBody: (offsetBytes?: number) => AsyncIterable<Uint8Array>;
   status: "pending" | "streaming" | "sent" | "acked" | "rejected";
+  /** Set by NACK handler — signals streamFile to abort and requeue. */
+  nacked: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +154,11 @@ export class MfupSession {
   // Pump synchronization — resolves when pumpFiles() finishes its current run
   private pumpDone: Promise<void> = Promise.resolve();
   private pumping = false;
+
+  // Scan backpressure — pause ingestion when fileQueue grows too large
+  private static readonly SCAN_HIGH_WATER = 10_000;
+  private static readonly SCAN_LOW_WATER = 5_000;
+  private _scanGateResolve: (() => void) | null = null;
 
   // Reconnect synchronization — resolves when reconnect completes
   private _reconnectPromise: Promise<void> | null = null;
@@ -365,6 +372,10 @@ export class MfupSession {
     this._reconnectPromise = null;
     this._reconnectResolve = null;
 
+    // Unblock scan gate so ingestion doesn't hang
+    this._scanGateResolve?.();
+    this._scanGateResolve = null;
+
     this.control?.sendAbort(code, reason);
     const frame: ClientAbortFrame = { tag: FrameTag.CLIENT_ABORT, code, reason };
     try { this.data?.write(frame); } catch { /* expected during abort teardown */ }
@@ -400,6 +411,7 @@ export class MfupSession {
         acceptedOffset: 0n,
         openBody: node.openBody,
         status: "pending",
+        nacked: false,
       };
       this.trackedFiles.set(node.nodeId, tracked);
       this.fileQueue.push(tracked);
@@ -413,6 +425,13 @@ export class MfupSession {
 
     // Kick the file pump — capture the promise but don't await (scan + pump run concurrently)
     this.kickPump();
+
+    // Backpressure: pause scan when fileQueue exceeds high water mark
+    if (this.fileQueue.length >= MfupSession.SCAN_HIGH_WATER) {
+      await new Promise<void>((resolve) => {
+        this._scanGateResolve = resolve;
+      });
+    }
   }
 
   // -- file streaming pump -------------------------------------------------
@@ -442,6 +461,11 @@ export class MfupSession {
         }
 
         this.fileQueue.shift();
+        // Unblock scan when queue drains below low water mark
+        if (this._scanGateResolve && this.fileQueue.length < MfupSession.SCAN_LOW_WATER) {
+          this._scanGateResolve();
+          this._scanGateResolve = null;
+        }
         this.activeFile = file;
         try {
           await this.streamFile(file);
@@ -514,6 +538,14 @@ export class MfupSession {
         if (this.data) {
           await this.data.drain();
           if (this.data.failed) return; // channel died — bail out
+        }
+
+        // NACK recovery: server rejected a chunk — restart from its offset.
+        if (file.nacked) {
+          file.nacked = false;
+          file.status = "pending";
+          this.fileQueue.push(file);
+          return;
         }
       }
     }
@@ -686,6 +718,7 @@ export class MfupSession {
       const file = this.trackedFiles.get(msg.node_id);
       if (file && file.status === "streaming") {
         file.acceptedOffset = BigInt(msg.expected_offset);
+        file.nacked = true; // signal streamFile to abort and requeue
       }
       this.emitError(nackChunk(msg.node_id, msg.expected_offset, msg.reason));
     });

@@ -13,6 +13,8 @@
     }
 
     handle {
-        reverse_proxy frontend:3000
+        root * /srv/dist
+        try_files {path} /index.html
+        file_server
     }
 }

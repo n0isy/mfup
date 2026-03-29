@@ -6,7 +6,7 @@ export default defineConfig({
   publicDir: "public",
   resolve: {
     alias: {
-      "@mfup/client": path.resolve("/client/src"),
+      "@mfup/client": path.resolve(__dirname, "../client/src"),
     },
   },
   build: {

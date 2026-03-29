@@ -55,3 +55,4 @@ services:
       - "20060:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./example/dist:/srv/dist:ro
