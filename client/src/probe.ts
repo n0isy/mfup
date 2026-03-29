@@ -20,6 +20,7 @@ export interface ProbeResult {
 export async function probeStreaming(opts: {
   baseUrl: string;
   sessionId: string;
+  resumeToken: string;
   control: ControlChannel;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -67,6 +68,7 @@ export async function probeStreaming(opts: {
   try {
     fetchPromise = fetch(url, {
       method: "POST",
+      headers: { "X-MFUP-Token": opts.resumeToken },
       body: stream,
       // @ts-expect-error — duplex: "half" is not yet in the TS lib types
       duplex: "half",

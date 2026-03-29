@@ -253,6 +253,7 @@ export class MfupSession {
         const probe = await probeStreaming({
           baseUrl: this.serverUrl,
           sessionId: this.sessionId,
+          resumeToken: this.resumeToken,
           control: this.control,
           signal: this.abortCtrl.signal,
         });
@@ -268,6 +269,7 @@ export class MfupSession {
       baseUrl: this.serverUrl,
       sessionId: this.sessionId,
       legId: this.legId,
+      resumeToken: this.resumeToken,
       signal: this.abortCtrl.signal,
       streaming: this._streamingMode,
     });

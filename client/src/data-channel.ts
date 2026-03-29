@@ -15,6 +15,8 @@ export interface DataChannelOpts {
   baseUrl: string;
   sessionId: string;
   legId: string;
+  /** Resume token for data channel auth (sent as X-MFUP-Token header). */
+  resumeToken: string;
   /** AbortSignal so the session can tear down the request */
   signal?: AbortSignal;
   /** Enable streaming mode (one long POST with duplex:"half") */
@@ -118,7 +120,7 @@ export class DataChannel {
     try {
       this._streamFetchPromise = fetch(`${this._url}?seq=0&final=1`, {
         method: "POST",
-        headers: { "Content-Type": "application/x-mfup" },
+        headers: { "Content-Type": "application/x-mfup", "X-MFUP-Token": this.opts.resumeToken },
         body: stream,
         // @ts-expect-error — duplex: "half" is required for streaming uploads
         duplex: "half",
@@ -290,7 +292,7 @@ export class DataChannel {
       try {
         const resp = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/x-mfup" },
+          headers: { "Content-Type": "application/x-mfup", "X-MFUP-Token": this.opts.resumeToken },
           body: body as unknown as BodyInit,
           signal: this.opts.signal,
         });

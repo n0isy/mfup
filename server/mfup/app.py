@@ -343,6 +343,14 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             status_code=status.HTTP_410_GONE,
         )
 
+    # Verify data channel auth token
+    token = request.headers.get("x-mfup-token")
+    if not token or token != session.resume_token:
+        return JSONResponse(
+            {"error": "invalid token"},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
     if session.leg_id != leg_id:
         return JSONResponse(
             {"error": "stale leg", "expected": session.leg_id},
@@ -356,6 +364,17 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             status_code=status.HTTP_409_CONFLICT,
         )
 
+    # Reject POSTs after final=1 has already been received for this leg
+    if session.final_seq_seen:
+        logger.warning(
+            "Rejected POST after final for session %s leg %s seq=%d",
+            session_id, leg_id, seq,
+        )
+        return JSONResponse(
+            {"error": "data_after_final", "detail": "final POST already received"},
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
     # Validate sequence number
     if not session.validate_and_advance_seq(seq):
         logger.warning(
@@ -366,6 +385,10 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             {"error": "seq_mismatch", "got": seq, "expected": session.last_data_seq + 1},
             status_code=status.HTTP_409_CONFLICT,
         )
+
+    # Mark final seen so subsequent POSTs on this leg are rejected
+    if final == 1:
+        session.final_seq_seen = True
 
     reader = FrameReader()
     body_received = 0
@@ -428,6 +451,14 @@ async def probe_endpoint(session_id: str, request: Request):
         return JSONResponse(
             {"error": "session not found"},
             status_code=status.HTTP_410_GONE,
+        )
+
+    # Verify data channel auth token
+    token = request.headers.get("x-mfup-token")
+    if not token or token != session.resume_token:
+        return JSONResponse(
+            {"error": "invalid token"},
+            status_code=status.HTTP_403_FORBIDDEN,
         )
 
     state = session.state

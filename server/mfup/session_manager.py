@@ -116,6 +116,7 @@ class LiveSession:
 
         # Sequence tracking for multi-POST data legs
         self.last_data_seq: int = -1
+        self.final_seq_seen: bool = False
 
         # Conflict FSM: "clean" → "conflict_dir" → "conflict_files"
         self.conflict_state: str = "clean"
@@ -156,6 +157,7 @@ class LiveSession:
         self._close_all_writers()
         self.leg_id = leg_id
         self.last_data_seq = -1
+        self.final_seq_seen = False
         self.epoch = self.db.increment_epoch()
         self.db.set_state(SessionState.ACTIVE)
         self._reset_idle_timer()
