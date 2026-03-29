@@ -638,8 +638,10 @@ class SessionRegistry:
         resume_token = row["resume_token"]
         target_dir = row["target_dir"]
 
-        # Force state to WAITING_RESUME — no leg is attached after restart
-        if state in (SessionState.ACTIVE, SessionState.PAUSED_BY_SERVER):
+        # Force state to WAITING_RESUME — no leg is attached after restart.
+        # COMMITTING included: commit is client-initiated, so after server
+        # restart the client must reconnect and re-send SESSION_END.
+        if state in (SessionState.ACTIVE, SessionState.PAUSED_BY_SERVER, SessionState.COMMITTING):
             db.set_state(SessionState.WAITING_RESUME)
 
         async with self._lock:
