@@ -171,6 +171,7 @@ export class MfupSession {
   // Commit synchronization — resolves when COMMIT_OK arrives
   private _commitResolve: (() => void) | null = null;
   private _commitReject: ((err: Error) => void) | null = null;
+  private _commitRetry = false;
 
   constructor(config: MfupSessionConfig) {
     this.serverUrl = config.serverUrl.replace(/\/$/, "");
@@ -274,12 +275,16 @@ export class MfupSession {
       sessionId: this.sessionId,
       legId: this.legId,
       resumeToken: this.resumeToken,
+      epoch: this.epoch,
       signal: this.abortCtrl.signal,
       streaming: this._streamingMode,
     });
 
     // Forward data channel errors — trigger reconnect for network failures
+    // Capture reference so stale channels don't trigger reconnect on new channel
+    const dc = this.data;
     this.data.onError((err) => {
+      if (this.data !== dc) return; // stale channel — ignore
       this.emitError(err);
       if (err.code === MfupErrorCode.DATA_WRITE_FAILED || err.code === MfupErrorCode.DATA_HTTP_ERROR) {
         this.handleDisconnect(err);
@@ -288,8 +293,10 @@ export class MfupSession {
 
     // Fire-and-forget — handle both streaming (Response) and batch (void) results
     const dataUrl = `${this.serverUrl}/mfup/data/${this.sessionId}/${this.legId}`;
+    const openDc = this.data;
     this.data.open().then(
       async (result) => {
+        if (this.data !== openDc) return; // stale channel
         // Streaming mode returns a Response; batch mode returns void
         if (result && "ok" in result && !result.ok && !this.abortCtrl.signal.aborted) {
           const body = await (result as Response).text().catch(() => "");
@@ -299,6 +306,7 @@ export class MfupSession {
         }
       },
       (err) => {
+        if (this.data !== openDc) return; // stale channel
         if (!this.abortCtrl.signal.aborted) {
           const mfupErr = err instanceof MfupError ? err : dataOpenFailed(dataUrl, err);
           this.emitError(mfupErr);
@@ -588,40 +596,88 @@ export class MfupSession {
       }
     }
 
-    // SESSION_END
-    const endFrame: SessionEndFrame = {
-      tag: FrameTag.SESSION_END,
-      rootSummary: {
-        scanDoneUnits: this.scanDone,
-        scanEstUnits: this.scanEst,
-        bodyDoneBytes: this.bodyDoneTotal,
-        bodyEstBytes: this.bodyEstTotal,
-        sealed: true,
-      },
-    };
-    this.safeWrite(endFrame);
-    this.setState("committing");
-    await this.data?.close();
+    // Commit loop: send SESSION_END, wait for COMMIT_OK or COMMIT_RETRY
+    while (true) {
+      const endFrame: SessionEndFrame = {
+        tag: FrameTag.SESSION_END,
+        rootSummary: {
+          scanDoneUnits: this.scanDone,
+          scanEstUnits: this.scanEst,
+          bodyDoneBytes: this.bodyDoneTotal,
+          bodyEstBytes: this.bodyEstTotal,
+          sealed: true,
+        },
+      };
+      this.safeWrite(endFrame);
+      this.setState("committing");
+      await this.data?.close();
 
-    // In batch mode, the final POST response may already contain the commit result.
-    // Use it if COMMIT_OK hasn't arrived via WS yet.
-    if (this._state === "committing" && this.data?.commitResult) {
-      const cr = this.data.commitResult;
-      this.setState("committed");
-      this.emit("committed", { files: cr.files, bytes: cr.bytes });
-      return;
-    }
-
-    // Wait for COMMIT_OK from the control channel
-    return new Promise<void>((resolve, reject) => {
-      // If already committed (race with fast server), resolve immediately
-      if (this._state === "committed") { resolve(); return; }
-      if (this._state === "aborted" || this._state === "failed") {
-        reject(new Error(`session ended in state: ${this._state}`)); return;
+      // In batch mode, the final POST response may already contain the commit result.
+      if (this._state === "committing" && this.data?.commitResult) {
+        const cr = this.data.commitResult;
+        this.setState("committed");
+        this.emit("committed", { files: cr.files, bytes: cr.bytes });
+        return;
       }
-      this._commitResolve = resolve;
-      this._commitReject = reject;
-    });
+
+      // Wait for COMMIT_OK or COMMIT_RETRY from the control channel.
+      // _commitRetry may already be true if handleDisconnect fired before we
+      // reached this point (race: reconnect sets flag before promise exists).
+      if (!this._commitRetry) {
+        await new Promise<void>((resolve, reject) => {
+          if (this._state === "committed") { resolve(); return; }
+          if (this._state === "aborted" || this._state === "failed") {
+            reject(new Error(`session ended in state: ${this._state}`)); return;
+          }
+          this._commitResolve = resolve;
+          this._commitReject = reject;
+        });
+        // Clear resolve/reject so stale calls don't fire later
+        this._commitResolve = null;
+        this._commitReject = null;
+      }
+
+      if (!this._commitRetry) return; // COMMIT_OK — done
+      this._commitRetry = false;
+
+      // COMMIT_RETRY — server reverted to ACTIVE, requeue happened in handler.
+      // Abort old data channel, open fresh one, pump incomplete files.
+      this.data?.abort("commit_retry");
+      this.setState("active");
+      this.data = new DataChannel({
+        baseUrl: this.serverUrl,
+        sessionId: this.sessionId,
+        legId: this.legId,
+        resumeToken: this.resumeToken,
+        epoch: this.epoch,
+        signal: this.abortCtrl.signal,
+        streaming: this._streamingMode ?? false,
+      });
+      const retryDc = this.data;
+      this.data.onError((err) => {
+        if (this.data !== retryDc) return; // stale channel
+        this.emitError(err);
+        if (err.code === MfupErrorCode.DATA_WRITE_FAILED || err.code === MfupErrorCode.DATA_HTTP_ERROR) {
+          this.handleDisconnect(err);
+        }
+      });
+      this.data.open().catch(() => {});
+
+      this.kickPump();
+      await this.pumpDone;
+
+      // Drain any remaining after reconnect (state may change async after awaits)
+      while ((this._state as string) === "waiting_resume" || this.fileQueue.length > 0) {
+        if (this._reconnectPromise) await this._reconnectPromise;
+        if (this._state === "failed" || this._state === "aborted") {
+          throw new Error(`session ended in state: ${this._state}`);
+        }
+        if (this.fileQueue.length > 0) {
+          this.kickPump();
+          await this.pumpDone;
+        }
+      }
+    }
   }
 
   // -- helpers -------------------------------------------------------------
@@ -728,9 +784,15 @@ export class MfupSession {
 
     this.control.on("nack_chunk", (msg) => {
       const file = this.trackedFiles.get(msg.node_id);
-      if (file && file.status === "streaming") {
+      if (file && (file.status === "streaming" || file.status === "sent")) {
         file.acceptedOffset = BigInt(msg.expected_offset);
-        file.nacked = true; // signal streamFile to abort and requeue
+        if (file.status === "streaming") {
+          file.nacked = true; // signal streamFile to abort and requeue
+        } else {
+          // Already "sent" — requeue directly
+          file.status = "pending";
+          this.fileQueue.push(file);
+        }
       }
       this.emitError(nackChunk(msg.node_id, msg.expected_offset, msg.reason));
     });
@@ -771,6 +833,22 @@ export class MfupSession {
     this.control.on("commit_ok", (msg) => {
       this.setState("committed");
       this.emit("committed", { files: msg.files, bytes: msg.bytes });
+      this._commitResolve?.();
+    });
+
+    this.control.on("commit_retry", (msg) => {
+      // Epoch stays the same — only attach_leg() (reconnect) bumps epoch.
+      // Server says these files are incomplete — requeue them and retry
+      for (const entry of msg.incomplete) {
+        const file = this.trackedFiles.get(entry.node_id);
+        if (file && file.status !== "acked") {
+          file.acceptedOffset = BigInt(entry.accepted_offset);
+          file.status = "pending";
+          this.fileQueue.push(file);
+        }
+      }
+      // Signal finalizeScan to retry
+      this._commitRetry = true;
       this._commitResolve?.();
     });
 
@@ -824,6 +902,9 @@ export class MfupSession {
     if (this._state === "committed" || this._state === "aborted") return;
     // Prevent duplicate calls (WS close + data error can both fire)
     if (this._state === "waiting_resume") return;
+
+    // If disconnected while committing, unblock finalizeScan so it retries
+    const wasCommitting = this._state === "committing";
 
     this.setState("waiting_resume");
     this.data?.abort("disconnected");
@@ -884,6 +965,11 @@ export class MfupSession {
         this._reconnectResolve?.();
         this._reconnectPromise = null;
         this._reconnectResolve = null;
+        // If disconnect happened during committing, unblock finalizeScan to retry
+        if (wasCommitting) {
+          this._commitRetry = true;
+          this._commitResolve?.();
+        }
         return; // success
       } catch (reconnectErr) {
         // Clean up partially-opened channels from failed connect()

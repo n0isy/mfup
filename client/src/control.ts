@@ -31,6 +31,7 @@ export type ControlEventMap = {
   reject_file: ServerControlMsg & { t: "REJECT_FILE" };
   session_abort: ServerControlMsg & { t: "SESSION_ABORT" };
   commit_ok: ServerControlMsg & { t: "COMMIT_OK" };
+  commit_retry: ServerControlMsg & { t: "COMMIT_RETRY" };
   probe_ack: ServerControlMsg & { t: "PROBE_ACK" };
   ask: ServerControlMsg & { t: "ASK" };
   error: MfupError;
@@ -212,6 +213,9 @@ export class ControlChannel {
         break;
       case "COMMIT_OK":
         this.emit("commit_ok", msg);
+        break;
+      case "COMMIT_RETRY":
+        this.emit("commit_retry", msg);
         break;
       case "PROBE_ACK":
         this.emit("probe_ack", msg);

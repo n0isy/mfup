@@ -441,22 +441,33 @@ class LiveSession:
         if state != SessionState.COMMITTING:
             return None
 
-        # Invariant: no open writers
+        # Close any stale writers before checking invariants
         if self.writers:
             logger.warning(
-                "Session %s: commit blocked — %d open writer(s)",
+                "Session %s: closing %d stale writer(s) before commit",
                 self.session_id, len(self.writers),
             )
-            return None
+            self._close_all_writers()
 
         # Invariant: all files fully received (accepted_offset == final_size)
         incomplete = self.db.get_incomplete_files()
         if incomplete:
             logger.warning(
-                "Session %s: commit blocked — %d incomplete file(s): %s",
+                "Session %s: commit blocked — %d incomplete file(s), sending COMMIT_RETRY",
                 self.session_id, len(incomplete),
-                [(f["node_id"], f["accepted_offset"], f["final_size"]) for f in incomplete[:5]],
             )
+            # Tell client which files need resending, revert to ACTIVE
+            retry_files = [
+                {"node_id": f["node_id"], "accepted_offset": f["accepted_offset"]}
+                for f in incomplete
+            ]
+            self.db.set_state(SessionState.ACTIVE)
+            self.final_seq_seen = False  # allow new final POST
+            self.last_data_seq = -1  # reset seq for retry
+            await self.send_control({
+                "t": "COMMIT_RETRY",
+                "incomplete": retry_files,
+            })
             return None
 
         file_count, total_bytes = self.db.count_committed_files()

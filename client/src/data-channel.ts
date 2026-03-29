@@ -17,6 +17,8 @@ export interface DataChannelOpts {
   legId: string;
   /** Resume token for data channel auth (sent as X-MFUP-Token header). */
   resumeToken: string;
+  /** Current session epoch — used to reject stale requests server-side. */
+  epoch: number;
   /** AbortSignal so the session can tear down the request */
   signal?: AbortSignal;
   /** Enable streaming mode (one long POST with duplex:"half") */
@@ -118,7 +120,7 @@ export class DataChannel {
     }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
 
     try {
-      this._streamFetchPromise = fetch(`${this._url}?seq=0&final=1`, {
+      this._streamFetchPromise = fetch(`${this._url}?seq=0&final=1&epoch=${this.opts.epoch}`, {
         method: "POST",
         headers: { "Content-Type": "application/x-mfup", "X-MFUP-Token": this.opts.resumeToken },
         body: stream,
@@ -286,7 +288,7 @@ export class DataChannel {
     const body = this._concatChunks(chunks, totalBytes);
     const seq = this._seq++;
     const finalFlag = final ? 1 : 0;
-    const url = `${this._url}?seq=${seq}&final=${finalFlag}`;
+    const url = `${this._url}?seq=${seq}&final=${finalFlag}&epoch=${this.opts.epoch}`;
 
     this._flushChain = this._flushChain.then(async () => {
       try {

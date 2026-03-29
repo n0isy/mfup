@@ -333,7 +333,7 @@ async def control_endpoint(ws: WebSocket):
 # ---------------------------------------------------------------------------
 
 @app.post("/mfup/data/{session_id}/{leg_id}")
-async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int, final: int = 0):
+async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int, final: int = 0, epoch: int = -1):
     registry = get_registry()
     session = registry.get(session_id)
 
@@ -354,6 +354,17 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
     if session.leg_id != leg_id:
         return JSONResponse(
             {"error": "stale leg", "expected": session.leg_id},
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    # Reject requests from stale epochs (old reconnects / commit retries)
+    if epoch >= 0 and session.epoch != epoch:
+        logger.warning(
+            "Rejected stale epoch for session %s: got %d, current %d",
+            session_id, epoch, session.epoch,
+        )
+        return JSONResponse(
+            {"error": "stale_epoch", "got": epoch, "expected": session.epoch},
             status_code=status.HTTP_409_CONFLICT,
         )
 
@@ -398,8 +409,8 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
 
     try:
         async for chunk in request.stream():
-            if session.leg_id != leg_id:
-                logger.warning("Data stream for stale leg %s seq=%d, aborting read", leg_id, seq)
+            if session.leg_id != leg_id or (epoch >= 0 and session.epoch != epoch):
+                logger.warning("Data stream for stale leg/epoch %s seq=%d, aborting read", leg_id, seq)
                 break
 
             reader.feed(chunk)

@@ -237,6 +237,11 @@ export interface AskMsg {
   t: "ASK";
 }
 
+export interface CommitRetryMsg {
+  t: "COMMIT_RETRY";
+  incomplete: { node_id: number; accepted_offset: number }[];
+}
+
 export type ServerControlMsg =
   | HelloOkMsg
   | ResumeOkMsg
@@ -247,6 +252,7 @@ export type ServerControlMsg =
   | RejectFileMsg
   | SessionAbortMsg
   | CommitOkMsg
+  | CommitRetryMsg
   | ProbeAckMsg
   | AskMsg;
 
