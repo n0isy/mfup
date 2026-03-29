@@ -772,57 +772,70 @@ export class MfupSession {
     this.setState("waiting_resume");
     this.data?.abort("disconnected");
 
-    if (this.maxReconnectAttempts != null && this.reconnectCount >= this.maxReconnectAttempts) {
-      this.setState("failed");
-      const exhaustedErr = sessionReconnectExhausted(this.reconnectCount, err);
-      this.emitError(exhaustedErr);
-      this._commitReject?.(exhaustedErr);
-      this._reconnectResolve?.();
-      return;
-    }
-
-    this.reconnectCount++;
-    const delay = Math.min(
-      this.reconnectDelayMs * Math.pow(2, this.reconnectCount - 1),
-      20_000,
-    );
-
-    // Emit reconnecting event BEFORE the delay so UI updates immediately
-    this.emit("reconnecting", {
-      attempt: this.reconnectCount,
-      delay,
-      maxAttempts: this.maxReconnectAttempts,
-    });
-
-    this.emitError(sessionReconnectFailed(this.reconnectCount, err));
-
-    // Set up reconnect promise so finalizeScan can await it
+    // Single reconnect promise that stays pending until success or give-up.
+    // finalizeScan awaits this — if we resolved+nulled it between retries,
+    // finalizeScan's while loop would spin with no await (busy loop → tab freeze).
     this._reconnectPromise = new Promise<void>((resolve) => {
       this._reconnectResolve = resolve;
     });
 
-    await new Promise((r) => {
-      this._reconnectTimer = setTimeout(r, delay);
-    });
-    this._reconnectTimer = null;
+    // Retry loop (replaces recursive calls that broke the state guard)
+    while (true) {
+      if (this.maxReconnectAttempts != null && this.reconnectCount >= this.maxReconnectAttempts) {
+        this.setState("failed");
+        const exhaustedErr = sessionReconnectExhausted(this.reconnectCount, err);
+        this.emitError(exhaustedErr);
+        this._commitReject?.(exhaustedErr);
+        this._reconnectResolve?.();
+        this._reconnectPromise = null;
+        this._reconnectResolve = null;
+        return;
+      }
 
-    // Check if abort() was called during the delay
-    if ((this._state as SessionState) === "aborted") return;
+      this.reconnectCount++;
+      const delay = Math.min(
+        this.reconnectDelayMs * Math.pow(2, this.reconnectCount - 1),
+        20_000,
+      );
 
-    try {
-      await this.connect();
-      this.requeuePendingFiles();
-      this.kickPump();
-      // Signal reconnect complete — finalizeScan can proceed
-      this._reconnectResolve?.();
-      this._reconnectPromise = null;
-      this._reconnectResolve = null;
-    } catch (reconnectErr) {
-      // Clear promise before recursive call (it will create a new one)
-      this._reconnectResolve?.();
-      this._reconnectPromise = null;
-      this._reconnectResolve = null;
-      await this.handleDisconnect(reconnectErr);
+      // Emit reconnecting event BEFORE the delay so UI updates immediately
+      this.emit("reconnecting", {
+        attempt: this.reconnectCount,
+        delay,
+        maxAttempts: this.maxReconnectAttempts,
+      });
+
+      this.emitError(sessionReconnectFailed(this.reconnectCount, err));
+
+      await new Promise((r) => {
+        this._reconnectTimer = setTimeout(r, delay);
+      });
+      this._reconnectTimer = null;
+
+      // Check if abort() was called during the delay
+      if ((this._state as SessionState) === "aborted") {
+        this._reconnectResolve?.();
+        this._reconnectPromise = null;
+        this._reconnectResolve = null;
+        return;
+      }
+
+      try {
+        await this.connect();
+        this.requeuePendingFiles();
+        this.kickPump();
+        // Signal reconnect complete — finalizeScan can proceed
+        this._reconnectResolve?.();
+        this._reconnectPromise = null;
+        this._reconnectResolve = null;
+        return; // success
+      } catch (reconnectErr) {
+        // Clean up partially-opened channels from failed connect()
+        this.data?.abort("reconnect failed");
+        this.control?.close();
+        err = reconnectErr;
+        // Loop continues — next retry with backoff
+      }
     }
   }
 

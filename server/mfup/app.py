@@ -312,6 +312,20 @@ async def control_endpoint(ws: WebSocket):
                 SessionState.COMMITTED, SessionState.ABORTED,
             ):
                 session.detach_leg()
+            # Clean up aborted sessions immediately: remove staging dir + Redis entry
+            if session.state == SessionState.ABORTED:
+                sid = session.session_id
+                await registry.remove(sid)
+                idx = get_session_index()
+                meta = await idx.get_meta(sid)
+                if meta and meta.staging_dir:
+                    sd = Path(meta.staging_dir)
+                else:
+                    sd = staging_dir(registry.base_dir, sid, STAGING_PREFIX)
+                if sd.exists():
+                    shutil.rmtree(str(sd), ignore_errors=True)
+                await idx.remove(sid)
+                logger.info("Cleaned up aborted session %s (staging=%s)", sid, sd)
 
 
 # ---------------------------------------------------------------------------

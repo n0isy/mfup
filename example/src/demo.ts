@@ -54,6 +54,9 @@ const serverUrl = `${loc.protocol}//${loc.host}`;
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
+const MAX_LOG_ENTRIES = 200;
+const MAX_ERROR_CARDS = 50;
+
 function log(msg: string, cls: "info" | "ok" | "warn" | "err" = "info") {
   logEl.classList.add("visible");
   const ts = new Date().toLocaleTimeString("en-US", { hour12: false, fractionalSecondDigits: 3 });
@@ -61,6 +64,7 @@ function log(msg: string, cls: "info" | "ok" | "warn" | "err" = "info") {
   div.className = `entry ${cls}`;
   div.textContent = `${ts}  ${msg}`;
   logEl.appendChild(div);
+  while (logEl.children.length > MAX_LOG_ENTRIES) logEl.removeChild(logEl.firstChild!);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
@@ -115,6 +119,7 @@ function renderError(err: MfupError) {
   `;
 
   errorList.prepend(card);
+  while (errorList.children.length > MAX_ERROR_CARDS) errorList.removeChild(errorList.lastChild!);
 }
 
 function escapeHtml(s: string): string {
@@ -256,7 +261,7 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
       }
     }
     renderError(err);
-    if (err.fatal) {
+    if (err.fatal && session?.state !== "aborted") {
       renderState("failed");
     }
   });
@@ -283,6 +288,11 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
     }
     log("Upload complete.", "ok");
   } catch (err: any) {
+    // Don't treat abort as a fatal error
+    if (session?.state === "aborted") {
+      log("Upload aborted.", "warn");
+      return;
+    }
     const msg = err instanceof Error
       ? `${err.message}\n${(err.stack ?? "").split("\n").slice(1, 5).join("\n")}`
       : String(err);

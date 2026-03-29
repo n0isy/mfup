@@ -55,6 +55,8 @@ export class DataChannel {
   // --- Streaming mode state ---
   private _streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
   private _streamFetchPromise: Promise<Response> | null = null;
+  /** Resolves when the stream's internal buffer drains below highWaterMark. */
+  private _drainResolve: (() => void) | null = null;
 
   // --- Batch mode state ---
   private _batchBuffer: Uint8Array[] = [];
@@ -98,11 +100,20 @@ export class DataChannel {
   }
 
   private _openStreaming(): Promise<Response> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
     const stream = new ReadableStream<Uint8Array>({
-      start: (ctrl) => {
-        this._streamController = ctrl;
+      start(ctrl) {
+        self._streamController = ctrl;
       },
-    });
+      pull() {
+        // Consumer (fetch/network) is ready for more data — unblock drain().
+        if (self._drainResolve) {
+          self._drainResolve();
+          self._drainResolve = null;
+        }
+      },
+    }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
 
     try {
       this._streamFetchPromise = fetch(`${this._url}?seq=0&final=1`, {
@@ -183,11 +194,22 @@ export class DataChannel {
   /**
    * Backpressure gate.
    *
-   * - Streaming: no-op (browser handles backpressure).
+   * - Streaming: waits when the ReadableStream's internal buffer exceeds its
+   *   highWaterMark (desiredSize <= 0). Resumes when the pull() callback fires,
+   *   meaning the network has consumed enough data. This prevents memory from
+   *   growing unboundedly when the disk is faster than the network.
    * - Batch: if the buffer exceeds flushBytes, flushes it as a POST.
    */
   async drain(): Promise<void> {
-    if (this._streaming) return;
+    if (this._streaming) {
+      const ctrl = this._streamController;
+      if (ctrl && ctrl.desiredSize !== null && ctrl.desiredSize <= 0) {
+        await new Promise<void>((resolve) => {
+          this._drainResolve = resolve;
+        });
+      }
+      return;
+    }
     if (this._batchBufferBytes >= this._flushBytes) {
       await this._flushBatch(false);
     }
@@ -206,6 +228,9 @@ export class DataChannel {
   async close(): Promise<void> {
     if (this._closed) return;
     this._closed = true;
+    // Unblock any pending drain() so pump loop can finish
+    this._drainResolve?.();
+    this._drainResolve = null;
 
     if (this._streaming) {
       this._streamController?.close();
@@ -225,6 +250,9 @@ export class DataChannel {
   abort(reason?: string): void {
     if (this._closed) return;
     this._closed = true;
+    // Unblock any pending drain()
+    this._drainResolve?.();
+    this._drainResolve = null;
 
     if (this._streaming) {
       this._streamController?.error(new Error(reason ?? "aborted"));
