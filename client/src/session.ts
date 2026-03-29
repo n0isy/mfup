@@ -12,6 +12,7 @@ import {
   type FileCloseFrame,
   type SessionEndFrame,
   type ClientAbortFrame,
+  type DataFrame,
   type ResumeOkMsg,
   type SessionState,
   type ServerLimits,
@@ -159,6 +160,9 @@ export class MfupSession {
   private static readonly SCAN_HIGH_WATER = 10_000;
   private static readonly SCAN_LOW_WATER = 5_000;
   private _scanGateResolve: (() => void) | null = null;
+
+  // Metadata frames buffered during disconnect (NODE, SUMMARY, DIR_CLOSE)
+  private _pendingMeta: DataFrame[] = [];
 
   // Reconnect synchronization — resolves when reconnect completes
   private _reconnectPromise: Promise<void> | null = null;
@@ -664,8 +668,14 @@ export class MfupSession {
   /** Write to data channel with error propagation instead of silent drops */
   private safeWrite(frame: Parameters<DataChannel["write"]>[0]): void {
     if (!this.data || this.data.closed || this.data.failed) {
-      // If reconnecting, silently drop — handleDisconnect will requeue files
-      if (this._state === "waiting_resume") return;
+      // If reconnecting, buffer metadata for replay; file frames are requeued separately
+      if (this._state === "waiting_resume") {
+        const t = frame.tag;
+        if (t === FrameTag.NODE || t === FrameTag.SUMMARY || t === FrameTag.DIR_CLOSE) {
+          this._pendingMeta.push(frame);
+        }
+        return;
+      }
       const err = dataWriteFailed("data channel not available");
       this.emitError(err);
       return;
@@ -886,6 +896,12 @@ export class MfupSession {
   }
 
   private requeuePendingFiles(): void {
+    // Replay buffered metadata frames (NODE, SUMMARY, DIR_CLOSE) first
+    for (const frame of this._pendingMeta) {
+      this.safeWrite(frame);
+    }
+    this._pendingMeta = [];
+
     for (const file of this.trackedFiles.values()) {
       if (file.status === "pending" || file.status === "streaming" || file.status === "sent") {
         if (!this.rejectedFiles.has(file.nodeId) && !this.prunedNodes.has(file.nodeId)) {
