@@ -290,7 +290,34 @@ export class DataChannel {
     const finalFlag = final ? 1 : 0;
     const url = `${this._url}?seq=${seq}&final=${finalFlag}&epoch=${this.opts.epoch}`;
 
-    this._flushChain = this._flushChain.then(async () => {
+    this._flushChain = this._flushChain.then(() => this._postWithRetry(url, body, seq, final));
+
+    return this._flushChain;
+  }
+
+  /**
+   * POST one batch with transport-level retries.
+   *
+   * The server processes buffered batch POSTs atomically and advances its
+   * seq counter only after full processing, so retrying a failed POST with
+   * the SAME seq is safe. Retry on network errors and 5xx; a 409
+   * seq_mismatch with expected == seq + 1 means the previous attempt was in
+   * fact fully delivered — treat as success. Without this, frames inside a
+   * failed POST (e.g. NODE metadata killed by a flaky proxy) were silently
+   * lost, which is exactly the hole that produced COMMIT_OK on an
+   * incomplete tree.
+   */
+  private async _postWithRetry(url: string, body: Uint8Array, seq: number, final: boolean): Promise<void> {
+    const MAX_ATTEMPTS = 4;
+    const RETRY_DELAYS = [500, 1000, 2000];
+    let lastErr: MfupError | null = null;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (this.opts.signal?.aborted) break;
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt - 1] ?? 2000));
+        if (this.opts.signal?.aborted) break;
+      }
       try {
         const resp = await fetch(url, {
           method: "POST",
@@ -298,33 +325,49 @@ export class DataChannel {
           body: body as unknown as BodyInit,
           signal: this.opts.signal,
         });
-        if (!resp.ok) {
-          this._failed = true;
-          const text = await resp.text().catch(() => "");
-          const err = dataHttpError(url, resp.status, resp.statusText, text);
-          this._onError?.(err);
-        } else if (final) {
-          // Parse commit result from final POST response
-          try {
-            const json = await resp.json();
-            if (json.commit) {
-              this.commitResult = { files: json.commit.files, bytes: json.commit.bytes };
-            }
-            if (json.error) {
-              const err = dataHttpError(url, resp.status, "commit_error", json.error);
-              this._onError?.(err);
-            }
-          } catch { /* response parse failure — commit_ok via WS is the fallback */ }
-        }
-        this._bytesSent += body.byteLength;
-      } catch (cause) {
-        this._failed = true;
-        const err = dataWriteFailed(`POST to ${url} failed`, cause);
-        this._onError?.(err);
-      }
-    });
 
-    return this._flushChain;
+        if (resp.ok) {
+          if (final) {
+            // Parse commit result from final POST response
+            try {
+              const json = await resp.json();
+              if (json.commit) {
+                this.commitResult = { files: json.commit.files, bytes: json.commit.bytes };
+              }
+              if (json.error) {
+                this._onError?.(dataHttpError(url, resp.status, "commit_error", json.error));
+              }
+            } catch { /* response parse failure — commit_ok via WS is the fallback */ }
+          }
+          this._bytesSent += body.byteLength;
+          return;
+        }
+
+        const text = await resp.text().catch(() => "");
+        if (resp.status === 409 && attempt > 0) {
+          // Did our previous (failed-looking) attempt actually land?
+          try {
+            const json = JSON.parse(text);
+            if (json.error === "seq_mismatch" && json.expected === seq + 1) {
+              this._bytesSent += body.byteLength;
+              return; // already delivered
+            }
+          } catch { /* not JSON — fall through */ }
+        }
+
+        lastErr = dataHttpError(url, resp.status, resp.statusText, text);
+        if (resp.status >= 500 && attempt < MAX_ATTEMPTS - 1) {
+          continue; // transient server/proxy error — retry same seq
+        }
+        break; // 4xx/409 — not retryable
+      } catch (cause) {
+        lastErr = dataWriteFailed(`POST to ${url} failed`, cause);
+        // network error — retry
+      }
+    }
+
+    this._failed = true;
+    if (lastErr) this._onError?.(lastErr);
   }
 
   private _concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {

@@ -280,10 +280,19 @@ class FrameReader:
     """Incremental frame reader that buffers partial data from a streaming body.
 
     Feed chunks via `feed(data)` and iterate decoded frames via `drain()`.
+
+    `max_frame_len` bounds the declared frame length: without it a corrupt or
+    malicious 4-byte prefix claiming a multi-gigabyte frame would grow the
+    buffer without limit while the reader waits for it to "complete".
     """
 
-    def __init__(self) -> None:
+    # 1 MiB default: comfortably above MAX_CHUNK_BYTES (256 KiB) + headers
+    # and any NODE frame with a long UTF-8 name.
+    DEFAULT_MAX_FRAME_LEN = 1024 * 1024
+
+    def __init__(self, max_frame_len: int = DEFAULT_MAX_FRAME_LEN) -> None:
         self._buf = bytearray()
+        self._max_frame_len = max_frame_len
 
     def feed(self, data: bytes) -> None:
         self._buf.extend(data)
@@ -295,6 +304,10 @@ class FrameReader:
 
         while pos + 4 <= total:
             frame_len = struct.unpack_from("!I", self._buf, pos)[0]
+            if frame_len > self._max_frame_len:
+                raise ValueError(
+                    f"frame length {frame_len} exceeds limit {self._max_frame_len}"
+                )
             if pos + 4 + frame_len > total:
                 break  # incomplete frame
             tag = self._buf[pos + 4]
@@ -311,27 +324,24 @@ class FrameReader:
 
 # ---------------------------------------------------------------------------
 # CRC-32C (Castagnoli) for checksum verification
+#
+# The C implementation from the `crc32c` package (SSE4.2/ARMv8 accelerated,
+# ~GB/s) is a HARD dependency. A pure-Python fallback used to exist and was
+# removed deliberately: it measured ~6 MB/s and blocked the event loop
+# ~10 ms per 64 KiB chunk, silently throttling the whole server. Failing
+# loudly at import beats degrading quietly in production.
 # ---------------------------------------------------------------------------
 
-_CRC32C_TABLE: list[int] = []
-
-
-def _init_crc32c_table() -> None:
-    for i in range(256):
-        crc = i
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0x82F63B78
-            else:
-                crc >>= 1
-        _CRC32C_TABLE.append(crc & 0xFFFFFFFF)
-
-
-_init_crc32c_table()
+try:
+    import crc32c as _crc32c_native  # type: ignore
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "MFUP/2 requires the C-accelerated 'crc32c' package: pip install crc32c"
+    ) from exc
 
 
 def crc32c(data: bytes | memoryview, initial: int = 0) -> int:
-    crc = (initial ^ 0xFFFFFFFF) & 0xFFFFFFFF
-    for b in data:
-        crc = (crc >> 8) ^ _CRC32C_TABLE[(crc ^ b) & 0xFF]
-    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+    return _crc32c_native.crc32c(data, initial)
+
+
+CRC32C_IMPL = "native"

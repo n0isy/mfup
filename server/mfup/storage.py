@@ -74,10 +74,18 @@ INSERT OR IGNORE INTO root_summary (id) VALUES (1);
 
 
 class SessionDB:
-    """Thin wrapper around a per-session SQLite database."""
+    """Thin wrapper around a per-session SQLite database.
+
+    By default every mutating method commits immediately. For hot paths
+    (a data POST carrying thousands of frames) wrap the work in
+    begin_batch()/end_batch() — mutations then accumulate in one SQLite
+    transaction and commit at the batch boundary, which is 10–100× cheaper
+    for many-small-files uploads (think node_modules).
+    """
 
     def __init__(self, db_path: Path) -> None:
         self.path = db_path
+        self._batch = False
         self._conn = sqlite3.connect(str(db_path), timeout=5.0)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=3000")
@@ -91,6 +99,25 @@ class SessionDB:
 
     def close(self) -> None:
         self._conn.close()
+
+    # -- batching -------------------------------------------------------------
+
+    def begin_batch(self) -> None:
+        """Enter deferred-commit mode (idempotent)."""
+        self._batch = True
+
+    def end_batch(self) -> None:
+        """Commit accumulated work and leave deferred-commit mode."""
+        self._batch = False
+        self._conn.commit()
+
+    def flush(self) -> None:
+        """Commit accumulated work but stay in the current mode."""
+        self._conn.commit()
+
+    def _maybe_commit(self) -> None:
+        if not self._batch:
+            self._conn.commit()
 
     # -- session ------------------------------------------------------------
 
@@ -106,7 +133,7 @@ class SessionDB:
             "INSERT OR REPLACE INTO sessions VALUES (?,?,1,?,?,?,?,?)",
             (session_id, resume_token, SessionState.ACTIVE.value, target_dir, expires_at, now, now),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_target_dir(self) -> str:
         cur = self._conn.execute("SELECT target_dir FROM sessions LIMIT 1")
@@ -123,12 +150,12 @@ class SessionDB:
         self._conn.execute(
             "UPDATE sessions SET state=?, updated_at=?", (state.value, now)
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def increment_epoch(self) -> int:
         self._conn.execute("UPDATE sessions SET epoch = epoch + 1, updated_at = ?",
                            (datetime.now(timezone.utc).isoformat(),))
-        self._conn.commit()
+        self._maybe_commit()
         cur = self._conn.execute("SELECT epoch FROM sessions LIMIT 1")
         return cur.fetchone()[0]
 
@@ -151,7 +178,7 @@ class SessionDB:
             "UPDATE sessions SET expires_at=?, updated_at=?",
             (expires_at, datetime.now(timezone.utc).isoformat()),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     # -- nodes --------------------------------------------------------------
 
@@ -174,7 +201,7 @@ class SessionDB:
                 "INSERT OR IGNORE INTO files (node_id, accepted_offset) VALUES (?, 0)",
                 (node_id,),
             )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_node(self, node_id: int) -> Optional[sqlite3.Row]:
         self._conn.row_factory = sqlite3.Row
@@ -185,7 +212,7 @@ class SessionDB:
         self._conn.execute(
             "UPDATE nodes SET status=? WHERE node_id=?", (status.value, node_id)
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     # -- files --------------------------------------------------------------
 
@@ -198,14 +225,14 @@ class SessionDB:
         self._conn.execute(
             "UPDATE files SET accepted_offset=? WHERE node_id=?", (offset, node_id)
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def set_file_final(self, node_id: int, final_size: int, local_path: str) -> None:
         self._conn.execute(
             "UPDATE files SET final_size=?, local_tmp_path=? WHERE node_id=?",
             (final_size, local_path, node_id),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_open_files(self) -> list[sqlite3.Row]:
         self._conn.row_factory = sqlite3.Row
@@ -227,7 +254,7 @@ class SessionDB:
 
     def add_pruned(self, node_id: int) -> None:
         self._conn.execute("INSERT OR IGNORE INTO pruned VALUES (?)", (node_id,))
-        self._conn.commit()
+        self._maybe_commit()
 
     def is_pruned(self, node_id: int) -> bool:
         cur = self._conn.execute("SELECT 1 FROM pruned WHERE node_id=?", (node_id,))
@@ -242,7 +269,7 @@ class SessionDB:
             "INSERT OR IGNORE INTO rejected VALUES (?,?,?)", (node_id, code, reason)
         )
         self.set_node_status(node_id, NodeStatus.REJECTED)
-        self._conn.commit()
+        self._maybe_commit()
 
     def is_rejected(self, node_id: int) -> bool:
         cur = self._conn.execute("SELECT 1 FROM rejected WHERE node_id=?", (node_id,))
@@ -267,7 +294,7 @@ class SessionDB:
             "body_done_bytes=?, body_est_bytes=?, sealed=? WHERE id=1",
             (scan_done, scan_est, body_done, body_est, int(sealed)),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_root_summary(self) -> dict:
         self._conn.row_factory = sqlite3.Row
@@ -290,6 +317,11 @@ class SessionDB:
         }
 
     # -- aggregate stats for COMMIT_OK --------------------------------------
+
+    def count_nodes(self) -> int:
+        """Total nodes seen (dirs + files) — commit node-count invariant."""
+        cur = self._conn.execute("SELECT COUNT(*) FROM nodes")
+        return cur.fetchone()[0]
 
     def count_committed_files(self) -> tuple[int, int]:
         """Return (file_count, total_bytes) for all non-rejected files."""
@@ -354,10 +386,16 @@ def resolve_payload_path(base_dir: Path, session_id: str, db: SessionDB, node_id
     """
     parts: list[str] = []
     cur_id = node_id
+    seen: set[int] = set()
     while cur_id != ROOT_NODE_ID:
+        if cur_id in seen:
+            raise ValueError(f"parent cycle detected at node {cur_id}")
+        seen.add(cur_id)
         node = db.get_node(cur_id)
         if node is None:
-            break
+            # A silent `break` here would resolve a SHORTENED path and write
+            # the file into the wrong directory. Broken chains are an error.
+            raise ValueError(f"broken parent chain: node {cur_id} unknown")
         validate_node_name(node["name"])
         parts.append(node["name"])
         cur_id = node["parent_id"]

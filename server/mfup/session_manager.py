@@ -121,6 +121,14 @@ class LiveSession:
         # Conflict FSM: "clean" → "conflict_dir" → "conflict_files"
         self.conflict_state: str = "clean"
 
+        # Node ids dropped at ingest (illegal name / unknown parent).
+        # Counted in the commit node-count invariant so a session with a few
+        # bad names can still commit; repopulated on retry streams.
+        self.dropped_nodes: set[int] = set()
+
+        # COMMIT_RETRY loop guard (in-memory; reset on attach_leg)
+        self.commit_retries: int = 0
+
         # Publish action (set by client ACTION message)
         self.publish_action: Optional[str] = None
 
@@ -140,14 +148,20 @@ class LiveSession:
 
     # -- leg management -----------------------------------------------------
 
-    def validate_and_advance_seq(self, seq: int) -> bool:
-        """Validate that seq == last_data_seq + 1 and advance on success.
+    def validate_seq(self, seq: int) -> bool:
+        """True iff seq is the next expected sequence number."""
+        return seq == self.last_data_seq + 1
 
-        Returns True if the sequence number is valid (next expected),
-        False on gap or duplicate.
-        """
-        if seq == self.last_data_seq + 1:
-            self.last_data_seq = seq
+    def advance_seq(self, seq: int) -> None:
+        """Mark seq as processed. Call only after the POST body was fully
+        handled, so a client may safely retry a failed POST with the same seq
+        (a duplicate is then rejected with seq_mismatch = 'already delivered')."""
+        self.last_data_seq = seq
+
+    def validate_and_advance_seq(self, seq: int) -> bool:
+        """Validate that seq == last_data_seq + 1 and advance on success."""
+        if self.validate_seq(seq):
+            self.advance_seq(seq)
             return True
         return False
 
@@ -158,16 +172,23 @@ class LiveSession:
         self.leg_id = leg_id
         self.last_data_seq = -1
         self.final_seq_seen = False
+        self.commit_retries = 0
         self.epoch = self.db.increment_epoch()
         self.db.set_state(SessionState.ACTIVE)
         self._reset_idle_timer()
         return self.epoch
 
     def detach_leg(self) -> None:
-        """Detach the current leg (disconnect)."""
+        """Detach the current leg (disconnect).
+
+        COMMITTING is included in the WAITING_RESUME transition: commit is
+        client-initiated, so a session whose leg went idle mid-commit must be
+        resumable (resume() rejects COMMITTING) — the client re-sends
+        SESSION_END after RESUME, mirroring recover_session() semantics.
+        """
         self._close_all_writers()
         self._cancel_idle_timer()
-        if self.state in (SessionState.ACTIVE, SessionState.PAUSED_BY_SERVER):
+        if self.state in (SessionState.ACTIVE, SessionState.PAUSED_BY_SERVER, SessionState.COMMITTING):
             self.db.set_state(SessionState.WAITING_RESUME)
             # Update expires_at for resume TTL
             exp = datetime.now(timezone.utc) + timedelta(seconds=self.session_resume_ttl)
@@ -255,6 +276,14 @@ class LiveSession:
             validate_node_name(f.name)
         except ValueError:
             logger.warning("Rejected node %d with illegal name: %r", f.node_id, f.name)
+            self.dropped_nodes.add(f.node_id)
+            return
+        # A node whose parent chain is unknown must not be stored: its payload
+        # path could not be resolved (or worse, would silently resolve short).
+        # NACK with unknown_node so the client re-sends the parent chain.
+        if f.parent_id != 0 and self.db.get_node(f.parent_id) is None:
+            logger.warning("Node %d references unknown parent %d", f.node_id, f.parent_id)
+            await self._send_nack(f.node_id, 0, "unknown_node")
             return
         self.db.upsert_node(
             f.node_id, f.parent_id, f.kind, f.name,
@@ -274,13 +303,25 @@ class LiveSession:
 
         node = self.db.get_node(f.node_id)
         if node is None:
-            await self._send_nack(f.node_id, 0, "bad_offset")
+            # The NODE frame for this file never reached us (e.g. lost with a
+            # failed data POST). Tell the client to re-send the node chain.
+            await self._send_nack(f.node_id, 0, "unknown_node")
             return
 
         file_row = self.db.get_file(f.node_id)
         accepted = file_row["accepted_offset"] if file_row else 0
 
-        path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
+        try:
+            path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
+        except ValueError as exc:
+            # Broken parent chain or traversal attempt — never write blindly.
+            logger.warning("FILE_OPEN node %d: %s", f.node_id, exc)
+            await self._send_nack(f.node_id, 0, "unknown_node")
+            return
+        # Duplicate FILE_OPEN must not leak the previous file handle.
+        prev = self.writers.pop(f.node_id, None)
+        if prev is not None:
+            prev.close()
         writer = FileWriter(path, f.node_id, accepted)
         self.writers[f.node_id] = writer
 
@@ -290,7 +331,12 @@ class LiveSession:
 
         writer = self.writers.get(f.node_id)
         if writer is None:
-            await self._send_nack(f.node_id, 0, "bad_offset")
+            # No FILE_OPEN succeeded for this node on this leg. If the node
+            # itself is unknown, the client must re-send its NODE chain.
+            reason = "unknown_node" if self.db.get_node(f.node_id) is None else "bad_offset"
+            file_row = self.db.get_file(f.node_id)
+            expected = file_row["accepted_offset"] if file_row else 0
+            await self._send_nack(f.node_id, expected, reason)
             return
 
         # Verify checksum
@@ -449,7 +495,39 @@ class LiveSession:
             )
             self._close_all_writers()
 
-        # Invariant: all files fully received (accepted_offset == final_size)
+        # Invariant 1: the server saw every node the client scanned.
+        # SESSION_END carries the client's final scan_done_units; if NODE
+        # frames were lost in transit (e.g. a failed data POST), files the
+        # server never heard about would be invisible to the completeness
+        # check below — this guards exactly that hole.
+        expected_nodes = self.db.get_root_summary()["scan_done_units"]
+        seen_nodes = self.db.count_nodes() + len(self.dropped_nodes)
+        if expected_nodes and seen_nodes != expected_nodes:
+            self.commit_retries += 1
+            logger.warning(
+                "Session %s: commit blocked — node count mismatch "
+                "(expected %d, seen %d, attempt %d)",
+                self.session_id, expected_nodes, seen_nodes, self.commit_retries,
+            )
+            if self.commit_retries > 5:
+                self.db.set_state(SessionState.FAILED)
+                await self.send_control({
+                    "t": "SESSION_ABORT", "code": "commit_failed",
+                    "reason": f"node count mismatch after retries: expected {expected_nodes}, seen {seen_nodes}",
+                })
+                return None
+            self.db.set_state(SessionState.ACTIVE)
+            self.final_seq_seen = False
+            self.last_data_seq = -1
+            await self.send_control({
+                "t": "COMMIT_RETRY",
+                "incomplete": [],
+                "nodes_expected": expected_nodes,
+                "nodes_seen": seen_nodes,
+            })
+            return None
+
+        # Invariant 2: all known files fully received (accepted_offset == final_size)
         incomplete = self.db.get_incomplete_files()
         if incomplete:
             logger.warning(

@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "websockets>=13.0",
     "redis>=5.0.0",
+    "crc32c>=2.7",
 ]
 
 [project.optional-dependencies]

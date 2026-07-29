@@ -209,7 +209,10 @@ export class ControlChannel {
       case "SESSION_ABORT":
         this.emit("session_abort", msg);
         this.emit("error", wsHandshakeFailed(msg.code, msg.reason));
-        this.settleReady(new Error(`Session aborted: ${msg.code}`));
+        // Reject ready() with the typed FATAL error so the reconnect loop
+        // can distinguish "server refused this session forever" (not_found,
+        // auth_failed, bad_version) from a transient network failure.
+        this.settleReady(wsHandshakeFailed(msg.code, msg.reason));
         break;
       case "COMMIT_OK":
         this.emit("commit_ok", msg);

@@ -93,7 +93,12 @@ interface TrackedFile {
   status: "pending" | "streaming" | "sent" | "acked" | "rejected";
   /** Set by NACK handler — signals streamFile to abort and requeue. */
   nacked: boolean;
+  /** NACKs received for this file — guards against endless requeue storms. */
+  nackCount: number;
 }
+
+/** Give up on a single file after this many NACKs. */
+const MAX_FILE_NACKS = 8;
 
 // ---------------------------------------------------------------------------
 // Session
@@ -125,6 +130,15 @@ export class MfupSession {
   private trackedFiles = new Map<number, TrackedFile>();
   private fileQueue: TrackedFile[] = [];
   private activeFile: TrackedFile | null = null;
+
+  // NODE frames by node id, in discovery order (parents before children).
+  // Needed to re-send metadata the server never received: a data POST that
+  // died in transit takes its NODE frames with it, and files unknown to the
+  // server are invisible to its commit invariant. Dir entries are kept for
+  // the session lifetime; file entries are dropped once the file is acked.
+  private nodeMeta = new Map<number, NodeFrame>();
+  // Set by COMMIT_RETRY carrying a node-count mismatch: re-send all metadata.
+  private _resendAllMeta = false;
 
   // Scan tracking
   private scanDone = 0n;
@@ -198,6 +212,13 @@ export class MfupSession {
 
   sendAction(action: "merge_overwrite" | "cancel"): void {
     this.control?.sendAction(action);
+    if (action === "cancel") {
+      // A conflict cancel is terminal: the server aborts the session and
+      // deletes its staging immediately, so any reconnect would only find
+      // not_found. Tear down locally instead of reconnecting into the void.
+      // (WebSocket delivery is ordered — ACTION is flushed before close.)
+      this.abort("client_cancel", "user rejected overwrite");
+    }
   }
 
   onProgress(fn: ProgressListener): () => void { return this.progress.on(fn); }
@@ -244,7 +265,9 @@ export class MfupSession {
     try {
       await this.control.ready();
     } catch (err) {
-      const mfupErr = wsConnectFailed(wsUrl, err);
+      // Preserve typed fatal rejections (SESSION_ABORT: not_found /
+      // auth_failed / bad_version) — the reconnect loop keys on `fatal`.
+      const mfupErr = err instanceof MfupError ? err : wsConnectFailed(wsUrl, err);
       this.emitError(mfupErr);
       throw mfupErr;
     }
@@ -252,7 +275,12 @@ export class MfupSession {
     // Reset abort controller for this leg
     this.abortCtrl = new AbortController();
 
-    // Probe streaming support on first connect (cached for session lifetime)
+    // Probe streaming support on first connect (cached for session lifetime,
+    // and across sessions per origin via localStorage — the verdict depends
+    // on browser + transport path, neither of which changes between visits).
+    if (this._streamingMode === null) {
+      this._streamingMode = this.readProbeCache();
+    }
     if (this._streamingMode === null) {
       try {
         const probe = await probeStreaming({
@@ -263,6 +291,7 @@ export class MfupSession {
           signal: this.abortCtrl.signal,
         });
         this._streamingMode = probe.streaming;
+        this.writeProbeCache(probe.streaming);
       } catch (err) {
         this._streamingMode = false;
         this.emitError(probeError(err));
@@ -413,6 +442,7 @@ export class MfupSession {
       sizeHint: node.size,
       mtimeMs: node.mtimeMs,
     };
+    this.nodeMeta.set(node.nodeId, nodeFrame);
     this.safeWrite(nodeFrame);
 
     this.scanDone++;
@@ -426,6 +456,7 @@ export class MfupSession {
         openBody: node.openBody,
         status: "pending",
         nacked: false,
+        nackCount: 0,
       };
       this.trackedFiles.set(node.nodeId, tracked);
       this.fileQueue.push(tracked);
@@ -663,6 +694,15 @@ export class MfupSession {
       });
       this.data.open().catch(() => {});
 
+      // Node-count mismatch retry: replay all node metadata we still hold
+      // (dirs for the whole session + files not yet acked) before bodies.
+      if (this._resendAllMeta) {
+        this._resendAllMeta = false;
+        for (const frame of this.nodeMeta.values()) {
+          this.safeWrite(frame);
+        }
+      }
+
       this.kickPump();
       await this.pumpDone;
 
@@ -777,6 +817,8 @@ export class MfupSession {
         }
         if (file.status === "sent" && file.acceptedOffset >= file.size) {
           file.status = "acked";
+          // Fully accepted — the server durably knows this node.
+          this.nodeMeta.delete(msg.node_id);
           this.progress.acceptFile();
         }
       }
@@ -784,6 +826,26 @@ export class MfupSession {
 
     this.control.on("nack_chunk", (msg) => {
       const file = this.trackedFiles.get(msg.node_id);
+      if (file) {
+        file.nackCount++;
+        if (file.nackCount > MAX_FILE_NACKS) {
+          // Endless NACK/requeue loops must not spin forever — give up on
+          // this one file, keep the session alive.
+          this.rejectedFiles.add(msg.node_id);
+          if (file.status !== "rejected") {
+            file.status = "rejected";
+            this.progress.skipFile();
+          }
+          this.emitError(nackChunk(msg.node_id, msg.expected_offset, msg.reason));
+          return;
+        }
+      }
+      // unknown_node: the server never saw this node's NODE frame (lost with
+      // a dead POST). Re-send the parent chain + node before the re-stream;
+      // frames are ordered within the channel, so NODEs land first.
+      if (msg.reason === "unknown_node") {
+        this.resendNodeChain(msg.node_id);
+      }
       if (file && (file.status === "streaming" || file.status === "sent")) {
         file.acceptedOffset = BigInt(msg.expected_offset);
         if (file.status === "streaming") {
@@ -792,6 +854,7 @@ export class MfupSession {
           // Already "sent" — requeue directly
           file.status = "pending";
           this.fileQueue.push(file);
+          this.kickPump();
         }
       }
       this.emitError(nackChunk(msg.node_id, msg.expected_offset, msg.reason));
@@ -845,6 +908,19 @@ export class MfupSession {
           file.acceptedOffset = BigInt(entry.accepted_offset);
           file.status = "pending";
           this.fileQueue.push(file);
+        }
+      }
+      // Node-count mismatch: NODE frames were lost — re-send all metadata
+      // we still hold, and requeue every not-yet-acked file body.
+      if (msg.nodes_expected != null && msg.nodes_seen != null
+          && msg.nodes_expected !== msg.nodes_seen) {
+        this._resendAllMeta = true;
+        for (const file of this.trackedFiles.values()) {
+          if (file.status !== "acked" && file.status !== "rejected"
+              && !this.fileQueue.includes(file)) {
+            file.status = "pending";
+            this.fileQueue.push(file);
+          }
         }
       }
       // Signal finalizeScan to retry
@@ -975,9 +1051,41 @@ export class MfupSession {
         // Clean up partially-opened channels from failed connect()
         this.data?.abort("reconnect failed");
         this.control?.close();
+        // A fatal handshake rejection can never be retried into success —
+        // e.g. the server aborted+cleaned the session (cancel path) and
+        // RESUME now yields not_found. Without this check the client would
+        // reconnect forever into the void.
+        if (reconnectErr instanceof MfupError && reconnectErr.fatal) {
+          this.setState("failed");
+          this._commitReject?.(reconnectErr);
+          this._reconnectResolve?.();
+          this._reconnectPromise = null;
+          this._reconnectResolve = null;
+          return;
+        }
         err = reconnectErr;
         // Loop continues — next retry with backoff
       }
+    }
+  }
+
+  /**
+   * Re-send the NODE frames for a node's parent chain (root→leaf order).
+   * Used when the server reports unknown_node — its copy of the metadata
+   * was lost with a failed data POST.
+   */
+  private resendNodeChain(nodeId: number): void {
+    const chain: NodeFrame[] = [];
+    let cur = this.nodeMeta.get(nodeId);
+    const seen = new Set<number>();
+    while (cur && !seen.has(cur.nodeId)) {
+      seen.add(cur.nodeId);
+      chain.push(cur);
+      if (cur.parentId === ROOT_NODE_ID) break;
+      cur = this.nodeMeta.get(cur.parentId);
+    }
+    for (let i = chain.length - 1; i >= 0; i--) {
+      this.safeWrite(chain[i]);
     }
   }
 
@@ -988,15 +1096,61 @@ export class MfupSession {
     }
     this._pendingMeta = [];
 
+    const requeued: TrackedFile[] = [];
     for (const file of this.trackedFiles.values()) {
       if (file.status === "pending" || file.status === "streaming" || file.status === "sent") {
         if (!this.rejectedFiles.has(file.nodeId) && !this.prunedNodes.has(file.nodeId)) {
           if (file.acceptedOffset < file.size) {
             file.status = "pending";
             this.fileQueue.push(file);
+            requeued.push(file);
           }
         }
       }
     }
+
+    // Re-send NODE chains for everything requeued: frames already handed to
+    // the dead channel (buffered but never delivered) are gone, and RESUME_OK
+    // only describes what the server DID receive. Re-sending is cheap and
+    // idempotent server-side (INSERT OR REPLACE / OR IGNORE).
+    const toSend = new Set<number>();
+    for (const file of requeued) {
+      let cur = this.nodeMeta.get(file.nodeId);
+      while (cur && !toSend.has(cur.nodeId)) {
+        toSend.add(cur.nodeId);
+        if (cur.parentId === ROOT_NODE_ID) break;
+        cur = this.nodeMeta.get(cur.parentId);
+      }
+    }
+    // nodeMeta iterates in discovery order → parents always precede children.
+    for (const frame of this.nodeMeta.values()) {
+      if (toSend.has(frame.nodeId)) {
+        this.safeWrite(frame);
+      }
+    }
+  }
+
+  // -- probe verdict cache ---------------------------------------------------
+
+  private probeCacheKey(): string {
+    return `mfup:streaming-probe:${this.serverUrl}`;
+  }
+
+  private readProbeCache(): boolean | null {
+    try {
+      const raw = localStorage.getItem(this.probeCacheKey());
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { v: boolean; ts: number };
+      if (Date.now() - parsed.ts > 24 * 3600 * 1000) return null; // stale
+      return parsed.v;
+    } catch {
+      return null; // no localStorage (private mode, workers) — just probe
+    }
+  }
+
+  private writeProbeCache(v: boolean): void {
+    try {
+      localStorage.setItem(this.probeCacheKey(), JSON.stringify({ v, ts: Date.now() }));
+    } catch { /* best effort */ }
   }
 }

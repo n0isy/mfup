@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, status
 from fastapi.responses import JSONResponse
 
-from .protocol import PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
+from .protocol import CRC32C_IMPL, PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
 from .session_manager import SessionRegistry, LiveSession
 from .publish import publish_session, ConflictError
 from .redis_index import SessionIndex
@@ -36,6 +36,11 @@ MAX_OPEN_FILES = int(__import__("os").environ.get("MFUP_MAX_OPEN_FILES", "1"))
 MAX_PENDING_FILES = int(__import__("os").environ.get("MFUP_MAX_PENDING_FILES", "64"))
 SWEEP_INTERVAL = int(__import__("os").environ.get("MFUP_SWEEP_INTERVAL", "300"))
 STAGING_PREFIX = __import__("os").environ.get("MFUP_STAGING_PREFIX", ".incoming")
+# Buffered-body threshold for atomic batch POSTs (see data_endpoint).
+MAX_BUFFERED_BODY = int(__import__("os").environ.get("MFUP_MAX_BUFFERED_BODY", str(16 * 1024 * 1024)))
+# Bearer token for admin/debug routes (/mfup/sessions*, /mfup/sweep).
+# Unset (default) → those routes are disabled.
+ADMIN_TOKEN = __import__("os").environ.get("MFUP_ADMIN_TOKEN", "")
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -198,17 +203,36 @@ async def control_endpoint(ws: WebSocket):
                     session_id, resume_token, leg_id, expires.isoformat(),
                     target_dir=target_dir,
                 )
-                # Register in Redis index for TTL-based cleanup (with paths)
-                idx = get_session_index()
-                sd = staging_dir(registry.base_dir, session_id, STAGING_PREFIX)
-                await idx.register(session_id, expires, target_dir, str(sd))
-                session._on_expiry_change = lambda sid, exp: idx.update_expiry(sid, exp)
             except ValueError:
                 # Session already exists — treat as conflict
                 await ws.send_json({
                     "t": "SESSION_ABORT",
                     "code": "conflict",
                     "reason": "session already exists",
+                })
+                await ws.close()
+                return
+
+            # Register in Redis index for TTL-based cleanup (with paths).
+            # A Redis failure here must not leave an orphaned in-memory
+            # session behind (a retried HELLO would then hit "conflict"),
+            # so roll back the registry entry and abort explicitly.
+            try:
+                idx = get_session_index()
+                sd = staging_dir(registry.base_dir, session_id, STAGING_PREFIX)
+                await idx.register(session_id, expires, target_dir, str(sd))
+                session._on_expiry_change = lambda sid, exp: idx.update_expiry(sid, exp)
+            except Exception:
+                logger.exception("Redis register failed for session %s — rolling back", session_id)
+                await registry.remove(session_id)
+                # Without a Redis entry the sweeper would never find this
+                # staging dir — remove it now.
+                shutil.rmtree(str(sd), ignore_errors=True)
+                session = None
+                await ws.send_json({
+                    "t": "SESSION_ABORT",
+                    "code": "server_error",
+                    "reason": "session index unavailable, retry later",
                 })
                 await ws.close()
                 return
@@ -357,8 +381,16 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             status_code=status.HTTP_409_CONFLICT,
         )
 
+    # Epoch is mandatory: an old client omitting ?epoch= must not silently
+    # bypass stale-POST fencing.
+    if epoch < 0:
+        return JSONResponse(
+            {"error": "epoch_required"},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
     # Reject requests from stale epochs (old reconnects / commit retries)
-    if epoch >= 0 and session.epoch != epoch:
+    if session.epoch != epoch:
         logger.warning(
             "Rejected stale epoch for session %s: got %d, current %d",
             session_id, epoch, session.epoch,
@@ -386,8 +418,12 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    # Validate sequence number
-    if not session.validate_and_advance_seq(seq):
+    # Validate sequence number. Advancing is deferred: for buffered (batch)
+    # POSTs seq only advances after the body was FULLY processed, so a client
+    # may retry a failed POST with the same seq. A duplicate of an already
+    # processed POST then gets seq_mismatch with expected == seq + 1, which
+    # the client interprets as "already delivered".
+    if not session.validate_seq(seq):
         logger.warning(
             "Seq gap/duplicate for session %s leg %s: got seq=%d, expected=%d",
             session_id, leg_id, seq, session.last_data_seq + 1,
@@ -397,9 +433,17 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    # Mark final seen so subsequent POSTs on this leg are rejected
-    if final == 1:
-        session.final_seq_seen = True
+    # Two body-handling strategies:
+    #  - Buffered (atomic): Content-Length known and small enough — read the
+    #    whole body first, process after. Either the entire POST is applied
+    #    (and seq advances) or none of it is. This is what makes transport-
+    #    level retries of batch POSTs safe: a POST that died mid-body left no
+    #    partial frame effects behind.
+    #  - Streaming: chunked/oversized body (the duplex:"half" long POST).
+    #    Frames apply as they arrive; a broken stream is recovered through
+    #    the RESUME path (new leg, new epoch), never retried by seq.
+    content_length = request.headers.get("content-length")
+    buffered = content_length is not None and int(content_length) <= MAX_BUFFERED_BODY
 
     reader = FrameReader()
     body_received = 0
@@ -407,24 +451,87 @@ async def data_endpoint(session_id: str, leg_id: str, request: Request, seq: int
     session_end_seen = False
     error_detail: str | None = None
 
-    try:
-        async for chunk in request.stream():
-            if session.leg_id != leg_id or (epoch >= 0 and session.epoch != epoch):
-                logger.warning("Data stream for stale leg/epoch %s seq=%d, aborting read", leg_id, seq)
-                break
+    if buffered:
+        body = bytearray()
+        try:
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > MAX_BUFFERED_BODY:
+                    return JSONResponse(
+                        {"error": "body_too_large"},
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    )
+        except Exception as exc:
+            # Body never fully arrived — nothing was applied, seq not advanced,
+            # the client may retry this POST verbatim.
+            logger.warning(
+                "Buffered body read failed for session %s leg %s seq=%d: %s",
+                session_id, leg_id, seq, exc,
+            )
+            return JSONResponse(
+                {"error": "body_read_failed"},
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
-            reader.feed(chunk)
+        # Re-check freshness after the (awaited) body read.
+        if session.leg_id != leg_id or session.epoch != epoch:
+            return JSONResponse(
+                {"error": "stale_epoch", "got": epoch, "expected": session.epoch},
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
+        session.db.begin_batch()
+        try:
+            reader.feed(bytes(body))
             frames = reader.drain()
             for frame in frames:
                 await session.process_frame(frame, leg_id)
                 frame_count += 1
                 if isinstance(frame, SessionEndFrame):
                     session_end_seen = True
-            body_received += len(chunk)
+            body_received = len(body)
+        except Exception as exc:
+            error_detail = f"{type(exc).__name__}: {exc}"
+            logger.exception("Frame processing error for session %s leg %s seq=%d", session_id, leg_id, seq)
+        finally:
+            session.db.end_batch()
 
-    except Exception as exc:
-        error_detail = f"{type(exc).__name__}: {exc}"
-        logger.exception("Data stream error for session %s leg %s seq=%d", session_id, leg_id, seq)
+        if error_detail is None:
+            session.advance_seq(seq)
+            if final == 1:
+                session.final_seq_seen = True
+    else:
+        # Streaming path: advance immediately (retry-by-seq is not used here).
+        session.advance_seq(seq)
+        if final == 1:
+            session.final_seq_seen = True
+
+        session.db.begin_batch()
+        frames_since_flush = 0
+        try:
+            async for chunk in request.stream():
+                if session.leg_id != leg_id or session.epoch != epoch:
+                    logger.warning("Data stream for stale leg/epoch %s seq=%d, aborting read", leg_id, seq)
+                    break
+
+                reader.feed(chunk)
+                frames = reader.drain()
+                for frame in frames:
+                    await session.process_frame(frame, leg_id)
+                    frame_count += 1
+                    frames_since_flush += 1
+                    if isinstance(frame, SessionEndFrame):
+                        session_end_seen = True
+                if frames_since_flush >= 500:
+                    session.db.flush()
+                    frames_since_flush = 0
+                body_received += len(chunk)
+
+        except Exception as exc:
+            error_detail = f"{type(exc).__name__}: {exc}"
+            logger.exception("Data stream error for session %s leg %s seq=%d", session_id, leg_id, seq)
+        finally:
+            session.db.end_batch()
 
     logger.info(
         "Data stream ended for session %s leg %s seq=%d: %d bytes, %d frames, final=%d%s",
@@ -507,9 +614,21 @@ async def probe_endpoint(session_id: str, request: Request):
 # Admin / status endpoints
 # ---------------------------------------------------------------------------
 
+def _admin_denied(request: Request) -> JSONResponse | None:
+    """Admin routes require MFUP_ADMIN_TOKEN to be configured AND presented."""
+    if not ADMIN_TOKEN:
+        return JSONResponse({"error": "admin routes disabled"}, status_code=status.HTTP_403_FORBIDDEN)
+    if request.headers.get("x-mfup-admin-token") != ADMIN_TOKEN:
+        return JSONResponse({"error": "forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+    return None
+
+
 @app.get("/mfup/sessions")
-async def list_sessions():
+async def list_sessions(request: Request):
     """List all active sessions (admin/debug)."""
+    denied = _admin_denied(request)
+    if denied:
+        return denied
     registry = get_registry()
     result = []
     for sid, session in registry.all_sessions().items():
@@ -524,8 +643,11 @@ async def list_sessions():
 
 
 @app.get("/mfup/sessions/{session_id}")
-async def get_session_status(session_id: str):
+async def get_session_status(session_id: str, request: Request):
     """Get detailed status for a single session."""
+    denied = _admin_denied(request)
+    if denied:
+        return denied
     registry = get_registry()
     session = registry.get(session_id)
     if session is None:
@@ -543,12 +665,18 @@ async def get_session_status(session_id: str):
 
 
 @app.post("/mfup/sessions/{session_id}/publish")
-async def publish_endpoint(session_id: str):
+async def publish_endpoint(session_id: str, request: Request):
     """Publish a committed session — atomic rename payload entries to target_dir."""
     registry = get_registry()
     session = registry.get(session_id)
     if session is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Publish moves files and destroys staging — same bearer auth as the
+    # data plane: the session's resume token.
+    token = request.headers.get("x-mfup-token")
+    if not token or token != session.resume_token:
+        return JSONResponse({"error": "invalid token"}, status_code=status.HTTP_403_FORBIDDEN)
 
     if session.state != SessionState.COMMITTED:
         return JSONResponse(
@@ -569,9 +697,12 @@ async def publish_endpoint(session_id: str):
         )
 
     try:
-        published = publish_session(
+        # publish_session is synchronous filesystem work (renames / merge
+        # walks) — keep it off the event loop.
+        published = await asyncio.to_thread(
+            publish_session,
             registry.base_dir, session_id, target, STAGING_PREFIX,
-            action=session.publish_action,
+            session.publish_action,
         )
     except ConflictError as exc:
         return JSONResponse(
@@ -587,8 +718,11 @@ async def publish_endpoint(session_id: str):
 
 
 @app.post("/mfup/sweep")
-async def sweep_endpoint():
+async def sweep_endpoint(request: Request):
     """Manually trigger a sweep — queries Redis, no iterdir."""
+    denied = _admin_denied(request)
+    if denied:
+        return denied
     registry = get_registry()
     idx = get_session_index()
     expired_ids = await idx.get_expired()
@@ -613,4 +747,4 @@ async def sweep_endpoint():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "protocol": PROTOCOL_VERSION}
+    return {"status": "ok", "protocol": PROTOCOL_VERSION, "crc32c": CRC32C_IMPL}

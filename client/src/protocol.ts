@@ -193,7 +193,7 @@ export interface NackChunkMsg {
   t: "NACK_CHUNK";
   node_id: number;
   expected_offset: number;
-  reason: "bad_checksum" | "bad_offset" | "stale_epoch" | "server_policy";
+  reason: "bad_checksum" | "bad_offset" | "stale_epoch" | "server_policy" | "unknown_node";
 }
 
 export interface FlowMsg {
@@ -240,6 +240,10 @@ export interface AskMsg {
 export interface CommitRetryMsg {
   t: "COMMIT_RETRY";
   incomplete: { node_id: number; accepted_offset: number }[];
+  /** Present when the server's node-count invariant failed: NODE frames were
+   * lost in transit and the client must re-send all node metadata. */
+  nodes_expected?: number;
+  nodes_seen?: number;
 }
 
 export type ServerControlMsg =
