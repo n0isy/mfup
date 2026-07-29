@@ -5,6 +5,92 @@
 **Frameworks:** FastAPI + uvicorn (server) · zero runtime dependencies (client) · Vite 6 (demo)
 **Protocol version:** `MFUP/2`
 **Stores:** SQLite (one DB per session) · Redis (session expiry index) · POSIX filesystem
+**Server runtime dependency:** the C-accelerated `crc32c` package (hard requirement — see §3.3)
+
+---
+
+## 0. Revision — post-hardening changes
+
+This document was first written as an audit of the initial experiment. The
+protocol was then hardened for production. This section is the authoritative
+list of what changed; the per-module sections and §7 have been updated to
+match. Where a subsection below still describes old behaviour, §0 wins.
+
+**Correctness**
+- **False `COMMIT_OK` on an incomplete tree — fixed.** A data POST that died in
+  transit took its `NODE` frames with it, leaving files the server never heard
+  of; `get_incomplete_files()` couldn't see them, so the session committed
+  short. Now closed by four layers: atomic buffered batch POSTs (seq advances
+  only after the whole body is processed), client-side transport retry of a
+  failed batch POST on the same seq, client re-send of `NODE` chains on
+  reconnect and on the new `unknown_node` NACK, and a server **node-count
+  commit invariant** (`SESSION_END.scan_done_units` vs `COUNT(nodes)`) that
+  emits `COMMIT_RETRY` / aborts rather than committing short (§3.1, §3.2, §4.2).
+- `resolve_payload_path` now **raises** on a broken parent chain or a cycle;
+  previously it `break`-ed and silently resolved a *shortened* path, writing the
+  file into the wrong directory (§3.4).
+- `MAX_COMMIT_RETRIES` caps **both** COMMIT_RETRY branches; a file that can
+  never complete aborts the session instead of ping-ponging forever (§3.2).
+- Duplicate `FILE_OPEN` closes the previous writer (was an fd leak); a session
+  that reaches `COMMITTING` and then goes idle is reverted to `WAITING_RESUME`
+  (was stuck until TTL) (§3.2).
+
+**Retention (clean exit — no disk/Redis garbage)**
+- **Filesystem orphan reconciliation** (`reconcile_orphans`, at startup and
+  every Nth sweep) reclaims staging dirs the Redis-zset-driven sweeper can
+  never see — orphaned by a crash between `rmtree` and `ZREM`, a silently
+  failed `rmtree`, or a Redis flush. Backed by `SessionIndex.is_registered`
+  (§3.1, §3.5). This retires the §7.1 "orphan is unreclaimable" gap.
+- Redis-registration failure during `HELLO` now rolls back the in-memory
+  session **and** its staging dir instead of orphaning them (§3.5).
+- The client makes `cancel` terminal locally and stops reconnecting on a fatal
+  handshake rejection, so a cancelled/aborted session's WS closes promptly and
+  the server reclaims its staging + Redis entry (§4.2).
+
+**Storage / adversarial-input robustness (one bad node never 500s the upload)**
+- `ENOSPC`/`EDQUOT`/`EROFS`/`EFBIG` on write or open → `SESSION_ABORT`
+  `storage_full`, not an infinite retry (§3.2).
+- `dir`-on-`file` / `file`-on-`dir` payload collisions → `REJECT_FILE`, not an
+  uncaught exception → 500. This **wires the previously-dead `REJECT_FILE`
+  path** (§3.2, §7.2).
+- Illegal / traversal node names → counted in the commit invariant and
+  `REJECT_FILE`d (no `unknown_node` NACK storm) (§3.4).
+
+**Security**
+- `POST …/publish` now requires the session's `X-MFUP-Token`; the four admin
+  routes require `MFUP_ADMIN_TOKEN` (unset ⇒ disabled) (§3.1, §7.5).
+- `?epoch=` is **mandatory** on data POSTs (missing ⇒ `400`); the old `-1`
+  opt-out that bypassed epoch fencing is gone (§3.1).
+- `FrameReader` caps declared `frame_len` (default 1 MiB); an oversized prefix
+  can no longer grow the buffer without bound (§3.3, §7.3).
+
+**Performance**
+- **CRC-32C is now a hard C dependency** (the `crc32c` package, ~GB/s). The
+  pure-Python fallback (~6 MB/s, ~10 ms/64 KiB blocking the event loop) was
+  removed deliberately — fail loudly at import rather than degrade silently
+  (§3.3). `/health` reports `"crc32c":"native"`.
+- `SessionDB` supports **deferred-commit batching**; a data POST wraps its
+  frames in one SQLite transaction instead of ≥2 commits per chunk (§3.4).
+- `publish_session` runs in a thread (`asyncio.to_thread`), off the event loop
+  (§3.6). Progress rendering in the demo is coalesced to one paint per frame.
+
+**Tests & CI**
+- 23 new server edge-case tests (names, collisions, ENOSPC, retry cap,
+  traversal, dup `FILE_OPEN`); `asyncio_mode=auto` (§3.9).
+- A Playwright e2e suite (`e2e/`, 3 engines) with byte-exact on-disk
+  verification, resume/meta-loss chaos tests (`docker compose kill`
+  mid-transfer), a 4-case conflict matrix, and a retention suite (§6.7).
+- GitHub Actions CI (`.github/workflows/e2e.yml`): `server-unit`, `linux-e2e`
+  (full compose stack), `macos-webkit` (native-Safari proxy on `macos-15`).
+  The demo build is deterministic (`npm ci` + committed lockfile + `npm run`,
+  never `npx vite`) (§6.7).
+
+**Client**
+- `nodeMeta` registry + NODE-chain resend; batch transport retry; NACK-storm
+  guard (`MAX_FILE_NACKS`); probe verdict cached in `localStorage` (§4.2, §4.4).
+- Demo: the folder picker is now wired (the `uploadFileList` path had no UI
+  entry point), Reset aborts a live session instead of orphaning it, publish
+  carries the token (§5.1).
 
 ---
 
@@ -534,13 +620,13 @@ Supporting enums: `NodeKind` (`DIR = 0x00`, `FILE = 0x01`), `ChecksumKind` (`CRC
 |---|---|---|
 | `decode_frame_payload` | `(tag: int, payload: memoryview) -> Frame` | Raises `ValueError(f"unknown frame tag: {tag:#04x}")` on an unrecognised tag |
 | `FrameReader` | `class` | `feed(data: bytes) -> None` appends to an internal `bytearray`; `drain() -> list[Frame]` decodes every complete frame and deletes consumed bytes from the front |
-| `crc32c` | `(data: bytes \| memoryview, initial: int = 0) -> int` | Pure-Python Castagnoli implementation, polynomial `0x82F63B78`, table built once at import by `_init_crc32c_table()`; standard init/final XOR with `0xFFFFFFFF` |
+| `crc32c` | `(data: bytes \| memoryview, initial: int = 0) -> int` | Thin wrapper over the C-accelerated `crc32c` package (Castagnoli, `0x82F63B78`). **Hard dependency:** if the package is missing, import raises `ImportError("… pip install crc32c")` — the ~6 MB/s pure-Python fallback was removed deliberately (fail loud, not slow). `CRC32C_IMPL == "native"`, surfaced in `/health` |
 
 `FrameReader.drain()` breaks on the first incomplete frame and leaves the partial bytes buffered, so frames may be split arbitrarily across HTTP chunks. It deliberately copies each payload into a fresh `bytes` object before wrapping it in a `memoryview` — the comment notes this is so no memoryview keeps a reference into the mutable buffer that `del self._buf[:pos]` would then invalidate.
 
-The reader applies **no bound on `frame_len`**. A malicious or corrupt 4-byte prefix declaring a multi-gigabyte frame causes the buffer to grow until the declared length is satisfied, with no cap and no error. `MAX_CHUNK_BYTES` is never consulted here.
+`FrameReader(max_frame_len=DEFAULT_MAX_FRAME_LEN)` **caps the declared frame length** (default 1 MiB, above `MAX_CHUNK_BYTES` + headers): `drain()` raises `ValueError` when a prefix exceeds it, so a corrupt/malicious multi-gigabyte length can no longer grow the buffer unbounded. The exception propagates to `data_endpoint`, which returns `500 data_stream_error`.
 
-The pure-Python `crc32c` runs a per-byte loop over every chunk payload on the event loop thread — for a 256 KiB chunk that is 262,144 Python-level iterations, synchronously, blocking all other sessions. (Observation from reading the loop; not benchmarked.)
+CRC-32C now runs in C (`crc32c` package) — the old pure-Python per-byte loop that blocked the event loop ~10 ms per 64 KiB chunk is gone.
 
 #### Control messages
 
@@ -1797,102 +1883,115 @@ Everything below follows directly from the config files; no scripts or Makefiles
 - **First run is slow by design.** Every container installs dependencies at startup, so the first `up` includes network installs. Because `depends_on` does not wait for readiness, Caddy may briefly return 502 on `/mfup/*` or serve an empty `/srv/dist` while `backend` and `frontend-build` are still installing (inferred from the absence of healthchecks).
 - **Rebuilding the demo after a client or example change:** `docker compose up frontend-build` re-runs `vite build` into `example/dist`; Caddy picks up the new files from the read-only mount without a restart, since it reads from disk per request.
 - **Restarting the server after a Python change:** `docker compose restart backend`. The source is bind-mounted, so no rebuild is needed, but uvicorn is started without `--reload`, so the process must be restarted to pick up edits.
-- **Vite dev mode caveat:** `docker compose up frontend` starts Vite on container port 3000 with its own proxy rules, but that port is only `expose`d, never published. Reaching the dev server from a host browser requires publishing the port; that mapping is not present in `docker-compose.yaml`.
+- **Vite dev mode caveat:** the `frontend` (Vite dev) service is behind the `dev` compose profile, so `docker compose up` does **not** start it; `docker compose --profile dev up frontend` does. This is deliberate — without it, `frontend` and `frontend-build` would both `npm ci` into the same bind-mounted `./example` concurrently, clobber each other's `node_modules`, and the build would fail. Both services keep `node_modules` in a per-container anonymous volume rather than the bind mount.
 - **Uploaded data:** lands in `/workspace/uploads` on the host — MFUP output at the root, trivial-server output under `trivial-target/`. Deleting that directory resets all upload state on disk; Redis state is separate and disappears when the `redis` container is removed.
+
+### 6.7 Tests and CI
+
+Two test surfaces, plus GitHub Actions.
+
+**Server unit tests** (`server/tests/`, `pytest`, `asyncio_mode=auto`): `test_protocol.py` (8 decoder tests) + `test_edge_cases.py` (23 tests — see §3.9).
+
+**End-to-end** (`e2e/`, Playwright, projects `chromium`/`firefox`/`webkit`). A harness page `example/e2e.html` exposes `window.mfupE2E` (build deterministic OPFS trees, run a real `MfupSession`, publish, report). `e2e/lib/gen.ts` regenerates the same bytes on the Node side for **byte-exact on-disk verification** against `uploads/`. Coverage:
+
+| Spec | What it proves |
+|---|---|
+| `opfs-upload` / `folder-input` | Upload via `uploadHandles` (OPFS `FileSystemDirectoryHandle`) and `<input webkitdirectory>`; every byte verified on disk (all engines) |
+| `resume` | `docker compose kill backend` mid-transfer → reconnect → RESUME → byte-exact continuation → `COMMIT_OK` |
+| `meta-loss` | kill mid-scan of hundreds of small files → the NODE-loss regression: full tree still commits (files count matches) |
+| `conflict` / `conflict-matrix` | `{merge_overwrite, cancel} × {answered before, after commit}` — overwrite lands new bytes; cancel leaves the target at v1 and cleans staging |
+| `retention` | client abort leaves no staging dir, no Redis zset member, no meta hash; a planted orphan is reclaimed by reconciliation |
+
+Chaos/conflict/retention specs are tagged `@chromium-only` and `grepInvert`-ed out of the firefox/webkit projects at collection time (they exercise the engine-independent protocol path; running them once on chromium is enough). The global test timeout is 60 s so a hang fails fast; chaos specs raise their own.
+
+**`.github/workflows/e2e.yml`** — three jobs:
+
+| Job | Runner | What it does |
+|---|---|---|
+| `server-unit` | ubuntu | `pip install "./server[dev]"`, `pytest` |
+| `linux-e2e` | ubuntu | brings up the **full `docker compose` stack** in the runner, runs all three Playwright engines (incl. the kill/resume chaos specs) |
+| `macos-webkit` | **macos-15** | native-Safari-proxy: brew redis + `pip install ./server` + `vite build` served by `vite preview`, runs the webkit project. `macos-14` is avoided — its frozen webkit rejects Playwright's `Page.overrideSetting(PushAPIEnabled)` |
+
+The demo build is **deterministic**: a committed `example/package-lock.json`, `npm ci` (not `npm install`), and `npm run build|dev|preview` (local vite `6.4.1`) — never `npx vite`, which fetches the latest vite (v8/rolldown) and breaks the build.
 
 ---
 ## 7. Known Gaps & Divergences
 
-This section synthesizes findings that span module boundaries. Each item was read from source; where an item is an inference about consequences rather than a direct reading, it says so.
+This section synthesizes findings that span module boundaries. Items resolved
+by the post-hardening work (§0) are marked **[fixed]** with a pointer; the rest
+remain open. Each item was read from source; inferences say so.
 
 ### 7.1 Design doc vs implementation
 
-`docs/MFUP_RU.md` is the project's design note. Three of its claims no longer match the code:
+`docs/MFUP_RU.md` is the project's design note. Its claims vs the code:
 
 | Claim in `docs/MFUP_RU.md` | Actual implementation |
 |---|---|
-| Frame envelope is `[tag:1][length:4][payload:N]` | It is `[length:4][tag:1][payload]` — length first. Both implementations agree (`client/src/protocol.ts:290`, `server/mfup/protocol.py:296`) |
-| "At restart the server scans `.incoming.*` directories and recovers sessions" | There is **no filesystem scan**. `SessionRegistry`'s docstring states "No startup scan"; recovery iterates `SessionIndex.get_not_expired()` from Redis. A session absent from Redis is never recovered, even though its staging dir and SQLite state are intact on disk |
-| "Either all files are published, or none" | Publish is atomic **per top-level entry**, not as a whole. `publish_session` loops `os.rename` with no transaction and no rollback; a failure partway leaves some entries published and the rest staged |
+| Frame envelope is `[tag:1][length:4][payload:N]` | It is `[length:4][tag:1][payload]` — length first. Both implementations agree |
+| "At restart the server scans `.incoming.*` directories and recovers sessions" | Recovery is Redis-driven (`get_not_expired()`), not a scan. **[partly addressed]** A session absent from Redis is still not *recovered*, but it is no longer *leaked*: `reconcile_orphans` now removes staging dirs that no live session and no Redis entry reference (§3.5, retires the old 7.1 leak) |
+| "Either all files are published, or none" | Still true only **per top-level entry**: `publish_session` loops `os.rename`/`os.replace` with no cross-entry transaction and no rollback (§3.6). Open. |
 
-The doc's architectural narrative (two channels, interleaved scan/transfer, staging→publish, blended progress) is otherwise accurate and remains the best statement of intent.
+The doc's architectural narrative (two channels, interleaved scan/transfer, staging→publish, blended progress) remains the best statement of intent.
 
 ### 7.2 Implemented but unwired
 
-Three protocol features are fully built on both sides — frame types, DB tables, client handlers, guards on every server frame handler — but **no server code path ever triggers them**:
+| Feature | Server method | Status |
+|---|---|---|
+| File rejection (`REJECT_FILE`) | `LiveSession.reject_file()` | **[fixed]** now wired: illegal names and `fs_conflict` (dir-on-file / file-on-dir) reject the offending node (§3.2, §3.4) |
+| Server-initiated backpressure (`FLOW`) | `LiveSession.send_flow()` | Still no callers — a production knob kept for when storage/maintenance pressure needs it |
+| Subtree pruning (`PRUNE_NODE`) | `LiveSession.prune_node()` | Still no callers — reserved for server-side policy pruning |
 
-| Feature | Server method | Client handler | Status |
-|---|---|---|---|
-| Server-initiated backpressure | `LiveSession.send_flow()` | `flow` → `paused_by_server` ⇄ `active` | No callers (verified by grep) |
-| Subtree pruning | `LiveSession.prune_node()` | `prune_node` → `IngestFilter.shouldDescend` | No callers |
-| File rejection | `LiveSession.reject_file()` | `reject_file` → `progress.skipFile()` | No callers |
+`SessionState.PAUSED_BY_SERVER` therefore remains reachable only if `send_flow` is wired. `FAILED` is **now written** (commit-retry cap, storage abort). `EXPIRED` is still only *read* — the sweeper deletes expired sessions rather than transitioning them.
 
-Consequently `SessionState.PAUSED_BY_SERVER` is unreachable on the server, and the client's `waitIfPaused()` gate never blocks. `SessionState.FAILED` is vestigial server-side (never written), and `EXPIRED` is only ever *read* — the sweeper deletes expired sessions outright rather than transitioning them, so expiry surfaces to the client as a fatal `DATA_HTTP_ERROR` with `status: 410`.
-
-Six of the client's 22 `MfupErrorCode` members are declared but never constructed: `WS_SEND_FAILED`, `DATA_STREAM_ERROR`, `SESSION_ABORT_FAILED`, `SESSION_COMMIT_FAILED`, `SESSION_ENDED_BAD_STATE`, `INGEST_READ_ERROR`. `ProgressTracker.advanceBody()` is an empty stub with no callers.
+Six of the client's `MfupErrorCode` members are still declared but never constructed (`WS_SEND_FAILED`, `DATA_STREAM_ERROR`, `SESSION_ABORT_FAILED`, `SESSION_COMMIT_FAILED`, `SESSION_ENDED_BAD_STATE`, `INGEST_READ_ERROR`); `ProgressTracker.advanceBody()` is still an empty stub. `unknown_node` was **added** to `NACK_CHUNK.reason` and is fully wired.
 
 ### 7.3 Advertised but unenforced limits
 
-`HELLO_OK.limits` advertises three caps that the server **never checks**. Verified by grep — each appears only at its definition and inside the `HELLO_OK` payload:
+`HELLO_OK.limits` still advertises three caps the server does not enforce:
 
 | Limit | Default | Enforced? |
 |---|---|---|
-| `MFUP_MAX_CHUNK_BYTES` | 262144 | No — no code compares a chunk length against it |
-| `MFUP_MAX_OPEN_FILES` | 1 | No — no open-writer count is checked |
-| `MFUP_MAX_PENDING_FILES` | 64 | No — no pending-file count is checked |
+| `MFUP_MAX_CHUNK_BYTES` | 262144 | No — client-side hint only (`Math.min(chunkSize, …)`) |
+| `MFUP_MAX_OPEN_FILES` | 1 | No |
+| `MFUP_MAX_PENDING_FILES` | 64 | No |
 
-The client does honor `max_chunk_bytes` (`Math.min(chunkSize, limits.max_chunk_bytes)`), so the limits function as a client-side hint rather than a server-side control. Note that `RESUME_OK` carries no `limits` field, so a session constructed directly with `lastKnownEpoch` (the resume-only path) keeps the client's built-in defaults — `{262144, 1, 64}`, which happen to match the server's defaults.
-
-Related unbounded resources: `FrameReader` applies **no cap on `frame_len`**, so a corrupt or malicious 4-byte prefix declaring a multi-gigabyte frame grows the buffer without limit or error. There is also no cap on concurrent sessions (each holding an open SQLite connection) and no cap on total staged bytes.
+**[fixed]** `FrameReader` now caps `frame_len` (`DEFAULT_MAX_FRAME_LEN = 1 MiB`, raises on excess), and the buffered data path caps the POST body at `MFUP_MAX_BUFFERED_BODY` (16 MiB). Still open: no cap on concurrent sessions or total staged bytes; the three `limits` values remain advisory.
 
 ### 7.4 Durability
 
-`COMMIT_OK` means "the invariants held and the bytes reached the OS page cache" — not "the bytes survive power loss." `FileWriter._sync_write` calls `write()` + `flush()` with **no `fsync`**, and SQLite runs at `synchronous=NORMAL` under WAL. No comment in the code claims stronger durability.
+Unchanged: `COMMIT_OK` means "invariants held and bytes reached the OS page cache," not "survives power loss." `FileWriter._sync_write` does `write()`+`flush()` with **no `fsync`**; SQLite runs `synchronous=NORMAL` under WAL. Deliberate — see §3.7.
 
 ### 7.5 Authentication
 
-The data and probe endpoints authenticate via the `X-MFUP-Token` header (the resume token). The **four administrative routes perform no authentication or authorization at all** — no token check of any kind, read directly from the handler bodies:
+**[fixed]** All state-changing and listing routes now authenticate:
 
-- `GET /mfup/sessions` — lists every live session id, state, epoch, and leg
-- `GET /mfup/sessions/{id}` — full session detail
-- `POST /mfup/sessions/{id}/publish` — **moves files into an operator-visible directory and then deletes the staging dir**
-- `POST /mfup/sweep` — triggers cleanup
+- `POST /mfup/sessions/{id}/publish` requires the session's `X-MFUP-Token`.
+- `GET /mfup/sessions`, `GET /mfup/sessions/{id}`, `POST /mfup/sweep` require the `X-MFUP-Admin-Token` header matched against `MFUP_ADMIN_TOKEN`; if that env var is unset the routes return `403` (disabled by default).
 
-Publish in particular is a state-changing, destructive operation reachable by anyone who can guess or observe a session id. The demo application calls it directly from the browser, so this is by design for the demo — but it is not a posture for untrusted networks.
-
-Path traversal, by contrast, is defended in four independent layers (name validation at ingest, name validation at path construction, post-`resolve()` containment check, and `target_dir` containment at both HELLO and publish). None of those layers has a test (§7.7).
+Data/probe endpoints already used `X-MFUP-Token`; `?epoch=` is now mandatory (§0). Path traversal remains defended in four layers, and — unlike before — those defenses **now have tests** (§3.9): `validate_node_name` with `..`/`/`/`\`/NUL, and `resolve_payload_path` on an escaping/broken chain.
 
 ### 7.6 Concurrency observations
 
-`LiveSession._lock` **is created and never acquired** — all four `async with self._lock` sites belong to `SessionRegistry`, not `LiveSession`. There is therefore no per-session mutual exclusion. Serialization rests instead on two protocol-level invariants: one active leg per session (checked up front, per-chunk, and again in `process_frame`), and one epoch per leg (bumped on every `attach_leg`).
+`LiveSession._lock` **is still created and never acquired** — there is no
+per-session mutual exclusion; serialization rests on one-active-leg and
+one-epoch-per-leg. Two consequences persist:
 
-Two consequences, both inferred from control flow rather than documented:
+1. **Concurrent POSTs on the same leg** remain possible in the streaming path; the safety net is `FileWriter.write`'s offset assertion (misordered chunk → `NACK_CHUNK`, not corruption). The buffered/batch path is now processed atomically per POST, narrowing the window.
+2. **`body_done_bytes` can lose counts** across the `await` in `_handle_file_chunk`'s read-modify-write. Cosmetic only — `COMMIT_OK.bytes` comes from `count_committed_files()`.
 
-1. **Concurrent POSTs on the same leg remain possible.** `validate_and_advance_seq` is synchronous so its check-and-advance cannot interleave, but everything after it is `await`-heavy. Two back-to-back POSTs with `seq=N` and `seq=N+1` both pass the gate and then interleave. The safety net is `FileWriter.write`'s offset assertion — a misordered chunk produces `NACK_CHUNK` rather than a corrupt file. Data integrity holds; throughput does not.
-2. **The root summary's `body_done_bytes` can lose counts.** `_handle_file_chunk` does a read-modify-write across an `await` boundary. The damage is cosmetic: `COMMIT_OK`'s `bytes` figure comes from `count_committed_files()` summing `accepted_offset`, not from the summary.
+A related benign race surfaces as `sqlite3.ProgrammingError: Cannot operate on a closed database` in the log when a control-channel abort closes the DB while a data POST is mid-frame; it is caught (→ the POST fails) and the session is being torn down anyway. Taking `_lock` in `process_frame` and `registry.remove` would close it.
 
-Two smaller items: a duplicate `FILE_OPEN` replaces `self.writers[node_id]` without closing the previous writer, leaking a file handle; and `_on_idle()` calls `detach_leg()` directly, so a session that reaches `COMMITTING` and then goes idle without disconnecting is left in `COMMITTING` with its TTL unrefreshed (whether that window is reachable in practice was not confirmed).
-
-The pure-Python `crc32c` runs a per-byte loop on the event loop thread — 262,144 Python-level iterations for a 256 KiB chunk, synchronously, blocking all other sessions. Observed from the loop, not benchmarked.
+**[fixed]** duplicate `FILE_OPEN` now closes the prior writer (was an fd leak); `_on_idle`/`detach_leg` now revert `COMMITTING` to `WAITING_RESUME` and refresh TTL. The pure-Python `crc32c` hot loop is **gone** — CRC-32C is a C dependency now (§3.3).
 
 ### 7.7 Test coverage
 
-The server has **one test file**, `server/tests/test_protocol.py`, with 8 synchronous tests. It covers the pure binary decoder and nothing else: 4 of 8 frame types (`NODE`, `FILE_CHUNK`, `DIR_CLOSE`, `SESSION_END`), two CRC-32C vectors, incremental byte-at-a-time feeding, and multi-frame batching.
+The near-total gap is substantially closed.
 
-Everything stateful is untested:
+**Server** now has two test files: `test_protocol.py` (8 decoder tests) and `test_edge_cases.py` (23 tests) covering illegal/traversal names, dir/file collisions → `REJECT_FILE`, `resolve_payload_path` broken chain, ENOSPC → `SESSION_ABORT`, the commit-retry cap, and duplicate `FILE_OPEN`. `asyncio_mode=auto`; these drive real `LiveSession`s against a temp SQLite DB with a fake WS. Still thin: full HTTP-route/WS-handshake tests and a `redis_index` unit test.
 
-| Area | Coverage |
-|---|---|
-| `app.py` — all 8 routes, every status path, WS handshake, lifespan, sweeper | none |
-| `session_manager.py` — the entire state machine, COMMIT_RETRY, restart revert, epoch increment, `FileWriter` seek-and-truncate resume | none |
-| `storage.py` — SQLite layer, `get_incomplete_files` (the pre-commit invariant), **all four path-traversal defenses** | none |
-| `publish.py` — conflict detection, merge, clean rename | none |
-| `redis_index.py` | none |
-| Decoder robustness — unknown tag, truncated payload, oversized `frame_len` | none |
+**End-to-end** is new (`e2e/`, Playwright, 3 engines) and covers the stateful behaviour that was previously untested only by reading: OPFS/folder-input upload with byte-exact on-disk verification, resume across `docker compose kill` mid-transfer, the meta-loss regression (kill mid-scan → full tree still committed), a 4-case conflict matrix (`{overwrite,cancel} × {before,after commit}`), and retention (abort leaves no disk/Redis trace; reconciliation removes a planted orphan). See §6.7.
 
-`pytest-asyncio` and `httpx` are declared as dev dependencies but no async or HTTP-client test exists. The client package has no test script and no tests at all.
-
-The net position: the deterministic codec is verified; every security-relevant, stateful, and concurrency-sensitive behavior described in this document is verified only by reading.
+Remaining: `publish.py` merge paths, `redis_index.py`, and server-side HTTP status paths are still only exercised indirectly through e2e.
 
 ---
 
