@@ -103,12 +103,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Start vite dev server on :20060
+      - name: Build demo and serve it statically on :20060
         working-directory: example
         run: |
           npm install --no-audit --no-fund
+          MFUP_BACKEND_URL=http://localhost:8070 npx vite build
+          # `vite preview` serves the static build (no HMR dev server, which
+          # hangs the frozen macOS webkit); proxy config lives in vite.config.
           MFUP_BACKEND_URL=http://localhost:8070 \
-          nohup npx vite --port 20060 > ../vite.log 2>&1 &
+          nohup npx vite preview --port 20060 > ../vite.log 2>&1 &
 
       - name: Install Playwright WebKit
         working-directory: e2e

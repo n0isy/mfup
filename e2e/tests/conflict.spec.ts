@@ -9,9 +9,7 @@ import { standardManifest, writeTreeToDisk, verifyTree } from "../lib/gen.js";
 const UPLOADS = path.resolve(import.meta.dirname, "../../uploads");
 const TMP = path.resolve(import.meta.dirname, "../.tmp");
 
-test("second upload into same target → ASK → merge_overwrite → published", async ({ page, browserName }) => {
-  test.skip(browserName !== "chromium", "flow is engine-independent; run once");
-
+test("second upload into same target → ASK → merge_overwrite → published @chromium-only", async ({ page }) => {
   const rootName = `cfl-${Date.now().toString(36)}`;
   const manifest = standardManifest({ smallFiles: 20, bigFileBytes: 200_000 });
   const dirPath = writeTreeToDisk(TMP, rootName, manifest);

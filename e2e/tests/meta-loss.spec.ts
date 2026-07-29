@@ -32,8 +32,7 @@ function manySmallFiles(count: number): ManifestEntry[] {
   return entries;
 }
 
-test("backend killed mid-scan of many small files → full tree still published", async ({ page, browserName }) => {
-  test.skip(browserName !== "chromium", "run once; protocol path is engine-independent");
+test("backend killed mid-scan of many small files → full tree still published @chromium-only", async ({ page }) => {
   test.setTimeout(420_000);
 
   await page.goto("/e2e.html");

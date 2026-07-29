@@ -47,8 +47,8 @@ const CASES: { name: string; action: Action; when: When }[] = [
 ];
 
 for (const c of CASES) {
-  test(`conflict: ${c.name}`, async ({ page, browserName }) => {
-    test.skip(browserName !== "chromium", "run once; protocol path is engine-independent");
+  // @chromium-only: engine-independent protocol flow; run once on chromium.
+  test(`conflict: ${c.name} @chromium-only`, async ({ page }) => {
     test.setTimeout(240_000);
 
     await page.goto("/e2e.html");

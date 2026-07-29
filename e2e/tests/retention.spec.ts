@@ -29,8 +29,7 @@ function metaExists(sessionId: string): boolean {
 }
 
 test.describe("retention", () => {
-  test("client abort mid-transfer leaves no disk or Redis trace", async ({ page, browserName }) => {
-    test.skip(browserName !== "chromium", "run once");
+  test("client abort mid-transfer leaves no disk or Redis trace @chromium-only", async ({ page }) => {
     test.setTimeout(120_000);
 
     await page.goto("/e2e.html");
@@ -54,9 +53,7 @@ test.describe("retention", () => {
     expect(metaExists(res.sessionId)).toBe(false);
   });
 
-  test("no orphaned staging dirs accumulate (reconciliation net)", async ({ browserName }) => {
-    test.skip(browserName !== "chromium", "run once");
-
+  test("no orphaned staging dirs accumulate (reconciliation net) @chromium-only", async () => {
     // Plant a fake orphan INSIDE the backend container, so it is owned by the
     // same user that owns the bind-mounted uploads dir (the host test user
     // cannot write there in CI). It has payload contents, no Redis entry, and

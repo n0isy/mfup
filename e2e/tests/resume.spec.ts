@@ -13,8 +13,7 @@ import { standardManifest, totalBytes, verifyTree } from "../lib/gen.js";
 const UPLOADS = path.resolve(import.meta.dirname, "../../uploads");
 const REPO = path.resolve(import.meta.dirname, "../..");
 
-test("backend restart mid-upload → reconnect → resume → verified bytes", async ({ page, browserName }) => {
-  test.skip(browserName !== "chromium", "run once; protocol path is engine-independent");
+test("backend restart mid-upload → reconnect → resume → verified bytes @chromium-only", async ({ page }) => {
   test.setTimeout(420_000);
 
   await page.goto("/e2e.html");
