@@ -1,0 +1,134 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Server unit tests (protocol decoder, native crc32c vectors)
+  # ---------------------------------------------------------------------
+  server-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install server package
+        run: pip install ./server pytest
+      - name: Run unit tests
+        run: cd server && python -m pytest tests -q
+
+  # ---------------------------------------------------------------------
+  # Full-stack e2e on Linux: the real docker-compose stack inside the
+  # runner, all three engines, including kill/resume chaos tests.
+  # ---------------------------------------------------------------------
+  linux-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
+        working-directory: e2e
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium firefox webkit
+
+      - name: Wait for stack (backend health + built frontend)
+        run: |
+          timeout 300 bash -c '
+            until curl -sf http://localhost:20060/health >/dev/null \
+               && curl -sf http://localhost:20060/e2e.html | grep -q mfupE2E; do
+              sleep 3
+            done'
+          curl -s http://localhost:20060/health
+
+      - name: Run e2e tests
+        working-directory: e2e
+        run: npx playwright test
+
+      - name: Dump backend logs on failure
+        if: failure()
+        run: docker compose logs backend --tail 200
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: e2e/test-results/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Native WebKit on macOS — the closest CI proxy for real Safari.
+  # No Docker on macOS runners → run the stack natively:
+  # brew redis + pip server + vite dev server (proxy targets via env).
+  # Chaos tests self-skip (they are chromium-only).
+  # ---------------------------------------------------------------------
+  macos-webkit:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start redis
+        run: |
+          brew install redis
+          redis-server --daemonize yes
+
+      - name: Start MFUP backend
+        run: |
+          pip install ./server
+          MFUP_BASE_DIR="$GITHUB_WORKSPACE/uploads" \
+          REDIS_URL=redis://localhost:6379/0 \
+          nohup python -m uvicorn mfup.app:app --port 8070 > backend.log 2>&1 &
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Start vite dev server on :20060
+        working-directory: example
+        run: |
+          npm install --no-audit --no-fund
+          MFUP_BACKEND_URL=http://localhost:8070 \
+          nohup npx vite --port 20060 > ../vite.log 2>&1 &
+
+      - name: Install Playwright WebKit
+        working-directory: e2e
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install webkit
+
+      - name: Wait for stack
+        run: |
+          timeout 180 bash -c '
+            until curl -sf http://localhost:20060/health >/dev/null \
+               && curl -sf http://localhost:20060/e2e.html | grep -q mfupE2E; do
+              sleep 3
+            done'
+          curl -s http://localhost:20060/health
+
+      - name: Run e2e tests (WebKit)
+        working-directory: e2e
+        run: npx playwright test --project=webkit
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          tail -100 backend.log || true
+          tail -50 vite.log || true

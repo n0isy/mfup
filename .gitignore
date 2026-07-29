@@ -4,4 +4,11 @@ dist/
 __pycache__/
 .vite/
 uploads/
-repomix-output.xml
+repomix-output.md
+*.url
+repomix.sh
+# e2e artifacts
+e2e/.tmp/
+e2e/test-results/
+e2e/playwright-report/
+e2e/webtop/testdata/

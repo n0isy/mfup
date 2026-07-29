@@ -1,0 +1,39 @@
+# Web-desktop (KasmVNC/webtop) for REAL drag-and-drop testing of MFUP/2.
+#
+# Why not neko: neko streams video over WebRTC, which needs UDP (or at least a
+# raw TCP mux port) reachable from the client. This sandbox only exposes ports
+# through an HTTPS reverse proxy (https://<port>.public.buan.me), so WebRTC
+# media cannot traverse it. KasmVNC streams over plain WebSocket — works fine
+# through an HTTP-only proxy. On a server with open UDP ports, neko's
+# ghcr.io/m1k1o/neko/xfce image is the nicer option (lower latency).
+#
+# Usage:
+#   docker compose -f e2e/webtop/docker-compose.yaml up -d
+#   e2e/webtop/provision.sh          # installs firefox-esr + chromium inside
+#   open https://20061.public.buan.me
+#
+# Inside the desktop: Thunar (file manager) with ~/testdata → drag onto the
+# demo at http://caddy (same compose network → same-origin, WS works).
+
+services:
+  webtop:
+    image: lscr.io/linuxserver/webtop:debian-xfce
+    container_name: mfup-webtop
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - TITLE=MFUP DnD Lab
+    ports:
+      - "20061:3000"
+    volumes:
+      - ./testdata:/config/testdata
+    shm_size: "1gb"
+    security_opt:
+      - seccomp=unconfined # chromium in container
+    restart: unless-stopped
+
+networks:
+  default:
+    name: workspace_default
+    external: true
