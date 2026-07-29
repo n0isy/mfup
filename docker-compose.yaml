@@ -41,7 +41,10 @@ services:
     working_dir: /app
     expose:
       - "3000"
-    command: sh -c "npm install && npx vite"
+    # npm ci + npm run (local vite from the lockfile) — never `npx vite`,
+    # which fetches the latest vite (v8/rolldown) from the registry and
+    # breaks the build when local resolution hiccups.
+    command: sh -c "npm ci && npm run dev"
     volumes:
       - ./example:/app
       - ./client:/client
@@ -49,7 +52,7 @@ services:
   frontend-build:
     image: node:20-alpine
     working_dir: /app
-    command: sh -c "npm install && npx vite build"
+    command: sh -c "npm ci && npm run build"
     volumes:
       - ./example:/app
       - ./client:/client
