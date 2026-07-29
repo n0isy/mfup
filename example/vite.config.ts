@@ -1,6 +1,11 @@
 import { defineConfig } from "vite";
 import path from "path";
 
+// Proxy targets default to docker-compose service names; CI jobs without
+// Docker (e.g. the macOS WebKit runner) override them with localhost URLs.
+const BACKEND = process.env.MFUP_BACKEND_URL ?? "http://backend:8070";
+const TRIVIAL = process.env.MFUP_TRIVIAL_URL ?? "http://trivial:8071";
+
 export default defineConfig({
   root: ".",
   publicDir: "public",
@@ -14,6 +19,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, "index.html"),
         compare: path.resolve(__dirname, "compare.html"),
+        e2e: path.resolve(__dirname, "e2e.html"),
       },
     },
   },
@@ -23,24 +29,25 @@ export default defineConfig({
     strictPort: true,
     allowedHosts: true,
     fs: {
-      allow: ["/client", "/app"],
+      // repo root (native runs) + the docker-compose mount points
+      allow: [path.resolve(__dirname, ".."), "/client", "/app"],
     },
     proxy: {
       "/mfup/control": {
-        target: "http://backend:8070",
+        target: BACKEND,
         changeOrigin: true,
         ws: true,
       },
       "/mfup": {
-        target: "http://backend:8070",
+        target: BACKEND,
         changeOrigin: true,
       },
       "/health": {
-        target: "http://backend:8070",
+        target: BACKEND,
         changeOrigin: true,
       },
       "/trivial": {
-        target: "http://trivial:8071",
+        target: TRIVIAL,
         changeOrigin: true,
         rewrite: (path: string) => path.replace(/^\/trivial/, ""),
       },

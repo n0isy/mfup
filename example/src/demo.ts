@@ -149,6 +149,22 @@ function renderProgress(snap: ProgressSnapshot) {
   statSkipped.textContent = String(snap.skippedFiles);
 }
 
+// ProgressTracker emits synchronously on every mutation — for many-small-file
+// uploads (node_modules...) that is tens of thousands of DOM updates.
+// Coalesce to one render per animation frame.
+let pendingSnap: ProgressSnapshot | null = null;
+let progressRaf: number | null = null;
+function scheduleProgress(snap: ProgressSnapshot) {
+  pendingSnap = snap;
+  if (progressRaf == null) {
+    progressRaf = requestAnimationFrame(() => {
+      progressRaf = null;
+      if (pendingSnap) renderProgress(pendingSnap);
+      pendingSnap = null;
+    });
+  }
+}
+
 function renderState(state: SessionState) {
   stateBadge.textContent = state.toUpperCase().replace(/_/g, " ");
   stateBadge.className = `badge ${state}`;
@@ -183,7 +199,7 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
 
   log(`Session created: ${session.id}`, "info");
 
-  session.onProgress(renderProgress);
+  session.onProgress(scheduleProgress);
   session.on("state", (s) => { renderState(s); log(`State -> ${s}`, "info"); });
   session.on("ask", () => {
     log("Server: file conflicts detected in target directory", "warn");
@@ -233,7 +249,10 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
       return;
     }
     try {
-      const resp = await fetch(`${serverUrl}/mfup/sessions/${session!.id}/publish`, { method: "POST" });
+      const resp = await fetch(`${serverUrl}/mfup/sessions/${session!.id}/publish`, {
+        method: "POST",
+        headers: { "X-MFUP-Token": session!.token },
+      });
       if (resp.ok) {
         const data = await resp.json();
         log(`Published: ${data.published.join(", ")}`, "ok");
@@ -374,6 +393,14 @@ browseBtn.addEventListener("click", (e) => {
   fileInput.click();
 });
 
+// Folder picker — previously unreachable: the input existed but nothing
+// ever clicked it, so the uploadFileList path had no UI entry point.
+const browseFolderBtn = document.getElementById("browse-folder-btn");
+browseFolderBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  folderInput.click();
+});
+
 dropzone.addEventListener("click", () => {
   if (!session) fileInput.click();
 });
@@ -402,6 +429,11 @@ btnAbort.addEventListener("click", () => {
 });
 
 btnReset.addEventListener("click", () => {
+  // Reset must not orphan a live session: without this, clearing the guard
+  // left the previous upload running headless in the background.
+  if (session && !["committed", "aborted", "failed"].includes(session.state)) {
+    session.abort("client_reset", "user reset the UI");
+  }
   session = null;
   progressPanel.classList.remove("visible");
   dropzone.classList.remove("uploading");

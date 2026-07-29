@@ -210,7 +210,10 @@ async function runMfupLane(
       if (action === "cancel") { log("[MFUP] Cancelled", "warn"); return; }
     }
     try {
-      const resp = await fetch(`${serverUrl}/mfup/sessions/${session.id}/publish`, { method: "POST" });
+      const resp = await fetch(`${serverUrl}/mfup/sessions/${session.id}/publish`, {
+        method: "POST",
+        headers: { "X-MFUP-Token": session.token },
+      });
       if (resp.ok) {
         const data = await resp.json();
         log(`[MFUP] Published: ${data.published.join(", ")}`, "ok");
