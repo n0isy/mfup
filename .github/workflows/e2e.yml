@@ -80,8 +80,11 @@ jobs:
   # brew redis + pip server + vite dev server (proxy targets via env).
   # Chaos tests self-skip (they are chromium-only).
   # ---------------------------------------------------------------------
+  # macos-15 (not -14): the webkit build on macos-14/arm64 is frozen and
+  # rejects Playwright's Page.overrideSetting(PushAPIEnabled), failing every
+  # newPage. macos-15 ships a webkit compatible with current Playwright.
   macos-webkit:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
