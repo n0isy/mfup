@@ -61,6 +61,11 @@ class SessionIndex:
             now = datetime.now(timezone.utc)
         return await self._redis.zrangebyscore(SESSIONS_KEY, "-inf", now.timestamp())
 
+    async def is_registered(self, session_id: str) -> bool:
+        """True if the session is still scored in the expiry sorted set."""
+        score = await self._redis.zscore(SESSIONS_KEY, session_id)
+        return score is not None
+
     async def get_meta(self, session_id: str) -> SessionMeta | None:
         """Read paths for a session. Returns None if missing."""
         data = await self._redis.hgetall(META_PREFIX + session_id)

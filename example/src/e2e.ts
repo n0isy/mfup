@@ -229,4 +229,36 @@ function progress() {
   };
 }
 
-(window as any).mfupE2E = { detect, run, progress, bytesFor, fnv1a };
+// Start an upload but abort it partway (after `abortAfterBytes` accepted).
+// Returns the session id so a test can assert disk/Redis cleanup.
+async function runAndAbort(opts: RunOpts & { abortAfterBytes: number }): Promise<{ sessionId: string; state: string; log: string[] }> {
+  const log: string[] = [];
+  const root = await buildOpfsTree(opts.rootName, opts.manifest, opts.contentSeed ?? opts.rootName);
+  const session = new MfupSession({
+    serverUrl: location.origin,
+    targetDir: opts.targetDir,
+    chunkSize: opts.chunkSize ?? 256 * 1024,
+  });
+  currentSession = session;
+  session.on("state", (s) => log.push("state:" + s));
+  session.onProgress((snap) => { lastProgress = snap; });
+
+  await session.connect();
+  // Kick the upload but do not await it — abort once enough bytes landed.
+  const up = session.uploadHandles([root]).catch((e) => log.push("uploadErr:" + (e?.message ?? e)));
+  await new Promise<void>((resolve) => {
+    const timer = setInterval(() => {
+      const done = lastProgress ? Number(lastProgress.bodyDoneBytes) : 0;
+      if (done >= opts.abortAfterBytes) {
+        clearInterval(timer);
+        session.abort("client_cancel", "test abort");
+        resolve();
+      }
+    }, 50);
+  });
+  await up;
+  currentSession = null;
+  return { sessionId: session.id, state: session.state, log };
+}
+
+(window as any).mfupE2E = { detect, run, runAndAbort, progress, bytesFor, fnv1a };

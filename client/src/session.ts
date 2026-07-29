@@ -889,6 +889,16 @@ export class MfupSession {
     this.control.on("session_abort", (msg) => {
       this.setState("aborted");
       this.data?.abort("server aborted session");
+      // Close the control WS so the server's finally-block reclaims the
+      // staging dir + Redis entry immediately (e.g. storage_full aborts).
+      this.control?.close();
+      // Stop any reconnect loop — a server abort is terminal.
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+      this._reconnectResolve?.();
+      this._reconnectPromise = null;
+      this._reconnectResolve = null;
+      this._scanGateResolve?.();
+      this._scanGateResolve = null;
       this.emitError(sessionAbortedByServer(msg.code, msg.reason));
       this._commitReject?.(new Error(`session aborted: ${msg.code}`));
     });
@@ -904,7 +914,10 @@ export class MfupSession {
       // Server says these files are incomplete — requeue them and retry
       for (const entry of msg.incomplete) {
         const file = this.trackedFiles.get(entry.node_id);
-        if (file && file.status !== "acked") {
+        // Do not resurrect a file we already gave up on (NACK storm / rejected)
+        // — that would ping-pong COMMIT_RETRY with the server forever.
+        if (file && file.status !== "acked" && file.status !== "rejected"
+            && !this.rejectedFiles.has(entry.node_id)) {
           file.acceptedOffset = BigInt(entry.accepted_offset);
           file.status = "pending";
           this.fileQueue.push(file);

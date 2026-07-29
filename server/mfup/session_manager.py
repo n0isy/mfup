@@ -7,6 +7,7 @@ One writer per file is enforced. Each session has at most one active leg.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,17 @@ from .protocol import (
 from .storage import DEFAULT_STAGING_PREFIX, SessionDB, ensure_staging, open_session_db, resolve_payload_path, staging_dir, validate_node_name
 
 logger = logging.getLogger("mfup.session")
+
+# Storage errors that cannot be fixed by retrying the same write.
+_FATAL_STORAGE_ERRNOS = frozenset({
+    errno.ENOSPC,   # no space left on device
+    errno.EDQUOT,   # disk quota exceeded
+    errno.EROFS,    # read-only filesystem
+    errno.EFBIG,    # file too large
+})
+
+# Cap on COMMIT_RETRY round-trips before the server gives up on a session.
+MAX_COMMIT_RETRIES = 5
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +288,11 @@ class LiveSession:
             validate_node_name(f.name)
         except ValueError:
             logger.warning("Rejected node %d with illegal name: %r", f.node_id, f.name)
+            # Count it so the commit node-count invariant still balances (the
+            # node is never stored), and REJECT it so the client skips the file
+            # immediately instead of provoking an unknown_node NACK storm.
             self.dropped_nodes.add(f.node_id)
+            await self.reject_file(f.node_id, "illegal_name", f"illegal node name: {f.name!r}")
             return
         # A node whose parent chain is unknown must not be stored: its payload
         # path could not be resolved (or worse, would silently resolve short).
@@ -290,9 +306,17 @@ class LiveSession:
             size=f.size_hint, mtime_ms=f.mtime_ms,
         )
         if f.kind == NodeKind.DIR:
-            # Create directory in payload
-            path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
-            path.mkdir(parents=True, exist_ok=True)
+            # Create directory in payload. This can fail if a sibling FILE
+            # node already claimed the same path (a malformed/adversarial tree
+            # — a real filesystem can't hold a file and dir with one name).
+            # One bad node must never 500 the whole upload: reject it instead.
+            try:
+                path = resolve_payload_path(self.base_dir, self.session_id, self.db, f.node_id, self.staging_prefix)
+                path.mkdir(parents=True, exist_ok=True)
+            except (OSError, ValueError) as exc:
+                logger.warning("Cannot materialize dir node %d (%r): %s", f.node_id, f.name, exc)
+                await self.reject_file(f.node_id, "fs_conflict", str(exc))
+                return
             await self._check_conflict(f.node_id, is_dir=True)
         else:
             await self._check_conflict(f.node_id, is_dir=False)
@@ -322,7 +346,20 @@ class LiveSession:
         prev = self.writers.pop(f.node_id, None)
         if prev is not None:
             prev.close()
-        writer = FileWriter(path, f.node_id, accepted)
+        try:
+            writer = FileWriter(path, f.node_id, accepted)
+        except OSError as exc:
+            # Opening the payload file failed persistently — e.g. a DIR node
+            # already occupies this path (IsADirectoryError), or the disk is
+            # full. A capacity error aborts the session; a path/type conflict
+            # rejects just this file so the rest of the tree still commits.
+            if exc.errno in _FATAL_STORAGE_ERRNOS:
+                logger.error("Fatal storage error opening node %d: %s", f.node_id, exc)
+                await self.abort_storage_error(exc)
+                return
+            logger.warning("Cannot open payload file for node %d: %s", f.node_id, exc)
+            await self.reject_file(f.node_id, "fs_conflict", str(exc))
+            return
         self.writers[f.node_id] = writer
 
     async def _handle_file_chunk(self, f: FileChunkFrame) -> None:
@@ -353,6 +390,20 @@ class LiveSession:
 
         try:
             new_offset = await writer.write(f.payload, f.offset)
+        except OSError as exc:
+            # A storage-capacity error will not clear by retrying — a client
+            # that keeps resending would just spin. Abort the whole session
+            # with a clear reason and let cleanup reclaim the staging dir.
+            if exc.errno in _FATAL_STORAGE_ERRNOS:
+                logger.error("Fatal storage error for session %s node %d: %s",
+                             self.session_id, f.node_id, exc)
+                await self.abort_storage_error(exc)
+                return
+            # Other OS errors (transient) — NACK and let the client retry,
+            # bounded client-side by MAX_FILE_NACKS.
+            logger.error("Write error for node %d: %s", f.node_id, exc)
+            await self._send_nack(f.node_id, writer.accepted_offset, "server_policy")
+            return
         except Exception as exc:
             logger.error("Write error for node %d: %s", f.node_id, exc)
             await self._send_nack(f.node_id, writer.accepted_offset, "server_policy")
@@ -415,6 +466,22 @@ class LiveSession:
         self._close_all_writers()
         self.db.set_state(SessionState.ABORTED)
         logger.info("Session %s aborted by client: %s — %s", self.session_id, f.code, f.reason)
+
+    async def abort_storage_error(self, exc: OSError) -> None:
+        """Abort the session on an unrecoverable storage error (e.g. disk full).
+
+        Sets ABORTED so the WS finally-block reclaims the staging dir + Redis
+        entry, and notifies the client so it stops resending. `errno.ENOSPC`
+        maps to a distinct code the client surfaces as fatal.
+        """
+        self._close_all_writers()
+        self.db.set_state(SessionState.ABORTED)
+        code = "storage_full" if exc.errno in (errno.ENOSPC, errno.EDQUOT) else "storage_error"
+        await self.send_control({
+            "t": "SESSION_ABORT",
+            "code": code,
+            "reason": f"server storage error: {exc.strerror or exc}",
+        })
 
     # -- control message senders -------------------------------------------
 
@@ -509,7 +576,7 @@ class LiveSession:
                 "(expected %d, seen %d, attempt %d)",
                 self.session_id, expected_nodes, seen_nodes, self.commit_retries,
             )
-            if self.commit_retries > 5:
+            if self.commit_retries > MAX_COMMIT_RETRIES:
                 self.db.set_state(SessionState.FAILED)
                 await self.send_control({
                     "t": "SESSION_ABORT", "code": "commit_failed",
@@ -530,10 +597,21 @@ class LiveSession:
         # Invariant 2: all known files fully received (accepted_offset == final_size)
         incomplete = self.db.get_incomplete_files()
         if incomplete:
+            self.commit_retries += 1
             logger.warning(
-                "Session %s: commit blocked — %d incomplete file(s), sending COMMIT_RETRY",
-                self.session_id, len(incomplete),
+                "Session %s: commit blocked — %d incomplete file(s), sending COMMIT_RETRY (attempt %d)",
+                self.session_id, len(incomplete), self.commit_retries,
             )
+            # Bound the retry loop: a file that can never complete (e.g. a
+            # write the client keeps failing to satisfy) must not ping-pong
+            # COMMIT_RETRY forever.
+            if self.commit_retries > MAX_COMMIT_RETRIES:
+                self.db.set_state(SessionState.FAILED)
+                await self.send_control({
+                    "t": "SESSION_ABORT", "code": "commit_failed",
+                    "reason": f"{len(incomplete)} file(s) still incomplete after {MAX_COMMIT_RETRIES} retries",
+                })
+                return None
             # Tell client which files need resending, revert to ACTIVE
             retry_files = [
                 {"node_id": f["node_id"], "accepted_offset": f["accepted_offset"]}

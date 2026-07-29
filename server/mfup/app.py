@@ -36,6 +36,12 @@ MAX_OPEN_FILES = int(__import__("os").environ.get("MFUP_MAX_OPEN_FILES", "1"))
 MAX_PENDING_FILES = int(__import__("os").environ.get("MFUP_MAX_PENDING_FILES", "64"))
 SWEEP_INTERVAL = int(__import__("os").environ.get("MFUP_SWEEP_INTERVAL", "300"))
 STAGING_PREFIX = __import__("os").environ.get("MFUP_STAGING_PREFIX", ".incoming")
+# Run the filesystem-orphan reconciliation every Nth sweep.
+RECONCILE_EVERY = int(__import__("os").environ.get("MFUP_RECONCILE_EVERY", "4"))
+# A staging dir is only reconciled as an orphan once it is at least this old,
+# so a just-created session whose Redis registration is still in flight is
+# never mistaken for garbage.
+ORPHAN_GRACE_SECONDS = int(__import__("os").environ.get("MFUP_ORPHAN_GRACE", "600"))
 # Buffered-body threshold for atomic batch POSTs (see data_endpoint).
 MAX_BUFFERED_BODY = int(__import__("os").environ.get("MFUP_MAX_BUFFERED_BODY", str(16 * 1024 * 1024)))
 # Bearer token for admin/debug routes (/mfup/sessions*, /mfup/sweep).
@@ -61,6 +67,68 @@ def _is_safe_target(base_dir: Path, target_dir: str) -> bool:
 
 
 REDIS_URL = __import__("os").environ.get("REDIS_URL", "redis://redis:6379/0")
+
+
+async def reconcile_orphans(
+    base: Path,
+    registry: SessionRegistry,
+    index: SessionIndex,
+    prefix: str,
+    grace_seconds: int = ORPHAN_GRACE_SECONDS,
+) -> list[str]:
+    """Remove staging dirs that no live session and no Redis entry reference.
+
+    The zset-driven sweeper can only clean sessions Redis still knows about.
+    A staging dir becomes an unreachable orphan when cleanup is interrupted
+    (crash between rmtree and ZREM), when rmtree silently failed
+    (ignore_errors), or when Redis lost the entry (flush/eviction). Such a
+    dir can never be resumed (resume needs the session in the registry, which
+    at startup is populated only from Redis) nor swept — so it would
+    accumulate forever. This scan is the retention safety net.
+
+    An orphan is removed only when ALL hold, to avoid racing a live upload:
+      - not in the in-memory registry,
+      - not scored in the Redis session zset,
+      - last modified at least `grace_seconds` ago.
+    """
+    import time
+
+    removed: list[str] = []
+    if not base.exists():
+        return removed
+
+    now = time.time()
+    for entry in base.iterdir():
+        name = entry.name
+        if not entry.is_dir() or not name.startswith(f"{prefix}."):
+            continue
+        sid = name[len(prefix) + 1:]
+        if registry.get(sid) is not None:
+            continue  # live in this process
+        try:
+            if await index.is_registered(sid):
+                continue  # Redis still tracks it — sweeper owns it
+        except Exception:
+            # Redis unreachable — do not delete anything we cannot verify.
+            logger.warning("Reconcile: cannot verify session %s in Redis, skipping", sid)
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except OSError:
+            continue
+        if age < grace_seconds:
+            continue  # too fresh — might be a session mid-registration
+
+        shutil.rmtree(str(entry), ignore_errors=True)
+        # Belt and suspenders: drop any half-written Redis entry too.
+        try:
+            await index.remove(sid)
+        except Exception:
+            pass
+        removed.append(sid)
+
+    return removed
+
 
 _registry: SessionRegistry | None = None
 _session_index: SessionIndex | None = None
@@ -115,14 +183,25 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Startup: session recovery failed")
 
-    # Periodic sweeper — queries Redis sorted set, never iterdir
+    # One filesystem reconciliation at startup: catches staging dirs orphaned
+    # by a crash between rmtree and Redis-remove, a silently-failed rmtree, or
+    # a Redis flush — none of which the zset-driven sweeper can ever find.
+    try:
+        removed = await reconcile_orphans(base, _registry, _session_index, STAGING_PREFIX)
+        if removed:
+            logger.warning("Startup: reconciled %d orphaned staging dir(s): %s", len(removed), removed)
+    except Exception:
+        logger.exception("Startup: orphan reconciliation failed")
+
+    # Periodic sweeper — Redis sorted set drives expiry (no per-session
+    # iterdir); a periodic filesystem reconciliation is the retention safety
+    # net for orphans the zset lost track of.
     async def sweeper():
+        sweeps = 0
         while True:
             await asyncio.sleep(SWEEP_INTERVAL)
             try:
                 expired_ids = await _session_index.get_expired()
-                if not expired_ids:
-                    continue
                 for sid in expired_ids:
                     # Remove from in-memory registry (if present)
                     await _registry.remove(sid)
@@ -138,7 +217,15 @@ async def lifespan(app: FastAPI):
                     # Remove from Redis (sorted set + meta hash)
                     await _session_index.remove(sid)
                     logger.info("Sweeper cleaned session %s (staging=%s)", sid, sd)
-                logger.info("Sweeper removed %d sessions", len(expired_ids))
+                if expired_ids:
+                    logger.info("Sweeper removed %d sessions", len(expired_ids))
+
+                # Every RECONCILE_EVERY sweeps, scan the filesystem for orphans.
+                sweeps += 1
+                if sweeps % RECONCILE_EVERY == 0:
+                    orphans = await reconcile_orphans(base, _registry, _session_index, STAGING_PREFIX)
+                    if orphans:
+                        logger.warning("Sweeper reconciled %d orphaned staging dir(s): %s", len(orphans), orphans)
             except Exception:
                 logger.exception("Sweeper error")
 
