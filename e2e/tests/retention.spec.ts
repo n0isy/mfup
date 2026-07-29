@@ -57,30 +57,35 @@ test.describe("retention", () => {
   test("no orphaned staging dirs accumulate (reconciliation net)", async ({ browserName }) => {
     test.skip(browserName !== "chromium", "run once");
 
-    // Plant a fake orphan: a staging dir with a terminal DB, no Redis entry,
-    // aged past the grace window. The startup/periodic reconciler must remove
-    // it. We simulate age by touching mtime into the past, then trigger a
-    // reconcile via a fresh sweep + restart (startup runs reconcile once).
+    // Plant a fake orphan INSIDE the backend container, so it is owned by the
+    // same user that owns the bind-mounted uploads dir (the host test user
+    // cannot write there in CI). It has payload contents, no Redis entry, and
+    // an mtime aged past the grace window → a true unreachable orphan. The
+    // startup reconciler must remove it.
     const fakeSid = `orphan-${Date.now().toString(36)}`;
-    const dir = path.join(UPLOADS, `.incoming.${fakeSid}`);
-    fs.mkdirSync(path.join(dir, "payload"), { recursive: true });
-    fs.writeFileSync(path.join(dir, "payload", "leftover.bin"), Buffer.alloc(1024));
-    // Age it 20 minutes (> ORPHAN_GRACE default 600s).
-    const old = Date.now() / 1000 - 1200;
-    fs.utimesSync(dir, old, old);
+    const cdir = `/data/uploads/.incoming.${fakeSid}`; // path inside container
+    const plant = [
+      `mkdir -p ${cdir}/payload`,
+      `dd if=/dev/zero of=${cdir}/payload/leftover.bin bs=1024 count=1 2>/dev/null`,
+      `touch -d '20 minutes ago' ${cdir}`, // age past ORPHAN_GRACE (600s)
+    ].join(" && ");
+    execSync(`docker compose exec -T backend sh -c ${JSON.stringify(plant)}`, { cwd: REPO });
 
-    expect(fs.existsSync(dir)).toBe(true);
+    const existsInContainer = () =>
+      execSync(`docker compose exec -T backend sh -c ${JSON.stringify(`test -d ${cdir} && echo yes || echo no`)}`,
+        { cwd: REPO }).toString().trim() === "yes";
+
+    expect(existsInContainer()).toBe(true);
     expect(inZset(fakeSid)).toBe(false); // not registered → true orphan
 
     // Restart backend: startup reconciliation scans the filesystem.
     execSync("docker compose restart backend", { cwd: REPO, stdio: "inherit", timeout: 60_000 });
-    // Wait for health.
     await expect.poll(() => {
       try { execSync("curl -sf http://localhost:20060/health", { stdio: "ignore" }); return true; }
       catch { return false; }
     }, { timeout: 60_000 }).toBe(true);
 
     // The orphan must be gone.
-    await expect.poll(() => fs.existsSync(dir), { timeout: 20_000 }).toBe(false);
+    await expect.poll(() => existsInContainer(), { timeout: 20_000 }).toBe(false);
   });
 });
