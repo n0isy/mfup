@@ -814,6 +814,9 @@ export class MfupSession {
         if (delta > 0n) {
           this.bodyDoneTotal += delta;
           this.progress.setBodyAccepted(this.bodyDoneTotal);
+          // Forward progress — the NACK budget counts CONSECUTIVE failures,
+          // so a file that recovers after some NACKs is not falsely dropped.
+          file.nackCount = 0;
         }
         if (file.status === "sent" && file.acceptedOffset >= file.size) {
           file.status = "acked";
@@ -1109,36 +1112,27 @@ export class MfupSession {
     }
     this._pendingMeta = [];
 
-    const requeued: TrackedFile[] = [];
+    // Re-send the ENTIRE known node tree, not just requeued files' chains.
+    // Frames handed to the dead channel (buffered but never delivered) are
+    // gone, and RESUME_OK only lists what the server DID receive. Resending
+    // every NODE we still hold — idempotent server-side (INSERT OR REPLACE /
+    // OR IGNORE) — guarantees the server has the full tree before any
+    // FILE_OPEN, so recovery never triggers unknown_node NACK storms and the
+    // commit node-count invariant converges in one round. nodeMeta iterates
+    // in discovery order (parents before children); acked files are already
+    // durable server-side and were dropped from nodeMeta, which is fine.
+    for (const frame of this.nodeMeta.values()) {
+      this.safeWrite(frame);
+    }
+
     for (const file of this.trackedFiles.values()) {
       if (file.status === "pending" || file.status === "streaming" || file.status === "sent") {
         if (!this.rejectedFiles.has(file.nodeId) && !this.prunedNodes.has(file.nodeId)) {
           if (file.acceptedOffset < file.size) {
             file.status = "pending";
             this.fileQueue.push(file);
-            requeued.push(file);
           }
         }
-      }
-    }
-
-    // Re-send NODE chains for everything requeued: frames already handed to
-    // the dead channel (buffered but never delivered) are gone, and RESUME_OK
-    // only describes what the server DID receive. Re-sending is cheap and
-    // idempotent server-side (INSERT OR REPLACE / OR IGNORE).
-    const toSend = new Set<number>();
-    for (const file of requeued) {
-      let cur = this.nodeMeta.get(file.nodeId);
-      while (cur && !toSend.has(cur.nodeId)) {
-        toSend.add(cur.nodeId);
-        if (cur.parentId === ROOT_NODE_ID) break;
-        cur = this.nodeMeta.get(cur.parentId);
-      }
-    }
-    // nodeMeta iterates in discovery order → parents always precede children.
-    for (const frame of this.nodeMeta.values()) {
-      if (toSend.has(frame.nodeId)) {
-        this.safeWrite(frame);
       }
     }
   }

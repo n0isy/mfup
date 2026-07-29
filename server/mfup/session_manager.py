@@ -138,8 +138,12 @@ class LiveSession:
         # bad names can still commit; repopulated on retry streams.
         self.dropped_nodes: set[int] = set()
 
-        # COMMIT_RETRY loop guard (in-memory; reset on attach_leg)
+        # COMMIT_RETRY loop guard. The cap counts CONSECUTIVE retries that made
+        # no forward progress — a large-file resume that legitimately needs
+        # many rounds keeps progressing and never trips it, while a truly stuck
+        # file (ENOSPC, unsatisfiable) stalls and aborts. Reset on attach_leg.
         self.commit_retries: int = 0
+        self._commit_progress: tuple[int, int] = (-1, -1)  # (seen_nodes, accepted_bytes)
 
         # Publish action (set by client ACTION message)
         self.publish_action: Optional[str] = None
@@ -185,6 +189,7 @@ class LiveSession:
         self.last_data_seq = -1
         self.final_seq_seen = False
         self.commit_retries = 0
+        self._commit_progress = (-1, -1)
         self.epoch = self.db.increment_epoch()
         self.db.set_state(SessionState.ACTIVE)
         self._reset_idle_timer()
@@ -548,6 +553,22 @@ class LiveSession:
 
     # -- commit -------------------------------------------------------------
 
+    def _commit_retry_exhausted(self) -> bool:
+        """Increment the retry counter, but reset it whenever the session made
+        forward progress (more nodes seen, or more bytes accepted) since the
+        previous COMMIT_RETRY. Returns True only after MAX_COMMIT_RETRIES
+        *consecutive* no-progress retries — so a progressing large-file resume
+        is never falsely aborted, while a genuinely stuck file is."""
+        seen_nodes = self.db.count_nodes()
+        _, accepted_bytes = self.db.count_committed_files()
+        progress = (seen_nodes, accepted_bytes)
+        if progress > self._commit_progress:
+            self._commit_progress = progress
+            self.commit_retries = 0
+            return False
+        self.commit_retries += 1
+        return self.commit_retries > MAX_COMMIT_RETRIES
+
     async def try_commit(self) -> Optional[dict]:
         """Attempt to commit: returns COMMIT_OK payload or None if not ready."""
         state = self.db.get_state()
@@ -570,17 +591,17 @@ class LiveSession:
         expected_nodes = self.db.get_root_summary()["scan_done_units"]
         seen_nodes = self.db.count_nodes() + len(self.dropped_nodes)
         if expected_nodes and seen_nodes != expected_nodes:
-            self.commit_retries += 1
+            exhausted = self._commit_retry_exhausted()
             logger.warning(
                 "Session %s: commit blocked — node count mismatch "
-                "(expected %d, seen %d, attempt %d)",
+                "(expected %d, seen %d, no-progress attempt %d)",
                 self.session_id, expected_nodes, seen_nodes, self.commit_retries,
             )
-            if self.commit_retries > MAX_COMMIT_RETRIES:
+            if exhausted:
                 self.db.set_state(SessionState.FAILED)
                 await self.send_control({
                     "t": "SESSION_ABORT", "code": "commit_failed",
-                    "reason": f"node count mismatch after retries: expected {expected_nodes}, seen {seen_nodes}",
+                    "reason": f"node count mismatch, no progress: expected {expected_nodes}, seen {seen_nodes}",
                 })
                 return None
             self.db.set_state(SessionState.ACTIVE)
@@ -597,19 +618,19 @@ class LiveSession:
         # Invariant 2: all known files fully received (accepted_offset == final_size)
         incomplete = self.db.get_incomplete_files()
         if incomplete:
-            self.commit_retries += 1
+            # Bound the loop by CONSECUTIVE no-progress retries: a stuck file
+            # (unsatisfiable write, ENOSPC) aborts, but a large-file resume
+            # that keeps accepting bytes across rounds is never falsely killed.
+            exhausted = self._commit_retry_exhausted()
             logger.warning(
-                "Session %s: commit blocked — %d incomplete file(s), sending COMMIT_RETRY (attempt %d)",
+                "Session %s: commit blocked — %d incomplete file(s), COMMIT_RETRY (no-progress attempt %d)",
                 self.session_id, len(incomplete), self.commit_retries,
             )
-            # Bound the retry loop: a file that can never complete (e.g. a
-            # write the client keeps failing to satisfy) must not ping-pong
-            # COMMIT_RETRY forever.
-            if self.commit_retries > MAX_COMMIT_RETRIES:
+            if exhausted:
                 self.db.set_state(SessionState.FAILED)
                 await self.send_control({
                     "t": "SESSION_ABORT", "code": "commit_failed",
-                    "reason": f"{len(incomplete)} file(s) still incomplete after {MAX_COMMIT_RETRIES} retries",
+                    "reason": f"{len(incomplete)} file(s) incomplete, no progress after {MAX_COMMIT_RETRIES} retries",
                 })
                 return None
             # Tell client which files need resending, revert to ACTIVE

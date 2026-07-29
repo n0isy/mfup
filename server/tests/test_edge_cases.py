@@ -179,8 +179,9 @@ async def test_commit_retry_capped(tmp_path):
     await s.process_frame(node(1, 0, NodeKind.FILE, "f.bin", size=100), "leg1")
     s.db.set_file_final(1, 100, "x")  # final_size=100, accepted_offset=0 → incomplete
 
-    # Drive SESSION_END → try_commit repeatedly; server must give up.
-    for _ in range(MAX_COMMIT_RETRIES + 2):
+    # Drive SESSION_END → try_commit repeatedly. The file never accepts a
+    # byte (no progress), so the consecutive-no-progress cap must abort it.
+    for _ in range(MAX_COMMIT_RETRIES + 4):
         s.db.set_state(SessionState.COMMITTING)
         await s.try_commit()
         if s.state == SessionState.FAILED:
