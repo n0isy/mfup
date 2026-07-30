@@ -100,6 +100,7 @@ class LiveSession:
         session_resume_ttl: int = 3600,
         leg_idle_timeout: int = 60,
         publish_timeout: int = 30,
+        max_chunk_bytes: int = 262144,
     ) -> None:
         self.session_id = session_id
         self.resume_token = resume_token
@@ -148,6 +149,22 @@ class LiveSession:
         # Publish action (set by client ACTION message)
         self.publish_action: Optional[str] = None
 
+        # Advertised chunk limit — ENFORCED: oversized FILE_CHUNKs are NACKed.
+        self.max_chunk_bytes = max_chunk_bytes
+
+        # Per-session quotas, set from the consumer's authorize hook at HELLO
+        # (see mfup/hooks.py). None = unlimited. Exceeding either quota aborts
+        # the session with SESSION_ABORT(quota_exceeded).
+        self.quota_max_bytes: Optional[int] = None
+        self.quota_max_files: Optional[int] = None
+        # Free-form consumer bag from AuthResult.context (in-memory only).
+        self.auth_context: dict = {}
+        # Running totals for quota checks (avoid per-frame SQL aggregates);
+        # seeded from the DB so recovery/resume keeps quotas accurate.
+        fc, bts = db.count_committed_files()
+        self.files_seen: int = fc
+        self.bytes_accepted: int = bts
+
         # Callback for expiry changes (set by registry for Redis updates)
         self._on_expiry_change: Any = None  # async fn(session_id, expires_at_datetime)
 
@@ -190,6 +207,9 @@ class LiveSession:
         self.final_seq_seen = False
         self.commit_retries = 0
         self._commit_progress = (-1, -1)
+        # Re-seed quota counters from the DB: after seek+truncate resume the
+        # in-memory running totals would otherwise double-count re-sent tails.
+        self.files_seen, self.bytes_accepted = self.db.count_committed_files()
         self.epoch = self.db.increment_epoch()
         self.db.set_state(SessionState.ACTIVE)
         self._reset_idle_timer()
@@ -306,10 +326,17 @@ class LiveSession:
             logger.warning("Node %d references unknown parent %d", f.node_id, f.parent_id)
             await self._send_nack(f.node_id, 0, "unknown_node")
             return
-        self.db.upsert_node(
+        new_file = self.db.upsert_node(
             f.node_id, f.parent_id, f.kind, f.name,
             size=f.size_hint, mtime_ms=f.mtime_ms,
         )
+        if new_file:
+            self.files_seen += 1
+            if self.quota_max_files is not None and self.files_seen > self.quota_max_files:
+                await self.abort_quota(
+                    f"file count quota exceeded ({self.files_seen} > {self.quota_max_files})"
+                )
+                return
         if f.kind == NodeKind.DIR:
             # Create directory in payload. This can fail if a sibling FILE
             # node already claimed the same path (a malformed/adversarial tree
@@ -381,6 +408,21 @@ class LiveSession:
             await self._send_nack(f.node_id, expected, reason)
             return
 
+        # Enforce the advertised chunk-size limit (honest clients clamp to
+        # HELLO_OK.limits; a misbehaving one gets NACKed, bounded by its own
+        # NACK budget).
+        if f.length > self.max_chunk_bytes:
+            await self._send_nack(f.node_id, writer.accepted_offset, "server_policy")
+            return
+
+        # Enforce the byte quota BEFORE writing.
+        if (self.quota_max_bytes is not None
+                and self.bytes_accepted + f.length > self.quota_max_bytes):
+            await self.abort_quota(
+                f"byte quota exceeded ({self.bytes_accepted + f.length} > {self.quota_max_bytes})"
+            )
+            return
+
         # Verify checksum
         if f.checksum_kind == ChecksumKind.CRC32C:
             computed = crc32c(f.payload)
@@ -415,6 +457,7 @@ class LiveSession:
             return
 
         self.db.set_accepted_offset(f.node_id, new_offset)
+        self.bytes_accepted += f.length
 
         # Update root summary body_done
         summary = self.db.get_root_summary()
@@ -486,6 +529,20 @@ class LiveSession:
             "t": "SESSION_ABORT",
             "code": code,
             "reason": f"server storage error: {exc.strerror or exc}",
+        })
+
+    async def abort_quota(self, reason: str) -> None:
+        """Abort the session on a quota violation (from the authorize hook).
+
+        Same shape as a storage abort: terminal, cleanup reclaims staging.
+        """
+        self._close_all_writers()
+        self.db.set_state(SessionState.ABORTED)
+        logger.warning("Session %s aborted: %s", self.session_id, reason)
+        await self.send_control({
+            "t": "SESSION_ABORT",
+            "code": "quota_exceeded",
+            "reason": reason,
         })
 
     # -- control message senders -------------------------------------------

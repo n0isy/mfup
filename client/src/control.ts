@@ -154,11 +154,12 @@ export class ControlChannel {
   // -- internal --------------------------------------------------------
 
   private sendHello(): void {
+    // No resume_token here: the token is SERVER-issued and arrives in
+    // HELLO_OK. (opts.resumeToken is only used for RESUME.)
     const msg: HelloMsg = {
       t: "HELLO",
       v: PROTOCOL_VERSION,
       session_id: this.opts.sessionId,
-      resume_token: this.opts.resumeToken,
       leg_id: this.opts.legId,
       target_dir: this.opts.targetDir,
     };

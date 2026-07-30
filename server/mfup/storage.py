@@ -190,18 +190,24 @@ class SessionDB:
         name: str,
         size: Optional[int] = None,
         mtime_ms: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
+        """Upsert a node. Returns True iff a NEW files-row was created
+        (i.e. this is the first time we see this FILE node) — used by the
+        caller to maintain the file-count quota without SQL aggregates."""
         kind_str = "dir" if kind == NodeKind.DIR else "file"
         self._conn.execute(
             "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?)",
             (node_id, parent_id, kind_str, name, size, mtime_ms, NodeStatus.OPEN.value),
         )
+        new_file = False
         if kind == NodeKind.FILE:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT OR IGNORE INTO files (node_id, accepted_offset) VALUES (?, 0)",
                 (node_id,),
             )
+            new_file = cur.rowcount == 1
         self._maybe_commit()
+        return new_file
 
     def get_node(self, node_id: int) -> Optional[sqlite3.Row]:
         self._conn.row_factory = sqlite3.Row

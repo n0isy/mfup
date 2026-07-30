@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, status
 from fastapi.responses import JSONResponse
 
+from .hooks import AuthRequest, AuthorizeHook, load_authorize_hook
 from .protocol import CRC32C_IMPL, PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
 from .session_manager import SessionRegistry, LiveSession
 from .publish import publish_session, ConflictError
@@ -47,6 +49,9 @@ MAX_BUFFERED_BODY = int(__import__("os").environ.get("MFUP_MAX_BUFFERED_BODY", s
 # Bearer token for admin/debug routes (/mfup/sessions*, /mfup/sweep).
 # Unset (default) → those routes are disabled.
 ADMIN_TOKEN = __import__("os").environ.get("MFUP_ADMIN_TOKEN", "")
+# Dotted path ("pkg.module:callable") of the consumer's authorize hook.
+# Unset → allow-all (dev mode, logged loudly). See mfup/hooks.py.
+AUTHORIZE_PATH = __import__("os").environ.get("MFUP_AUTHORIZE", "")
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -133,6 +138,7 @@ async def reconcile_orphans(
 _registry: SessionRegistry | None = None
 _session_index: SessionIndex | None = None
 _sweep_task: asyncio.Task | None = None
+_authorize: AuthorizeHook | None = None
 
 
 def get_registry() -> SessionRegistry:
@@ -147,9 +153,12 @@ def get_session_index() -> SessionIndex:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _registry, _session_index, _sweep_task
+    global _registry, _session_index, _sweep_task, _authorize
     base = DEFAULT_BASE_DIR
     base.mkdir(parents=True, exist_ok=True)
+
+    # A misconfigured hook path must kill startup, not fall back to allow-all.
+    _authorize = load_authorize_hook(AUTHORIZE_PATH or None)
 
     _session_index = SessionIndex(REDIS_URL)
 
@@ -158,6 +167,7 @@ async def lifespan(app: FastAPI):
         staging_prefix=STAGING_PREFIX,
         session_resume_ttl=SESSION_RESUME_TTL,
         leg_idle_timeout=LEG_IDLE_TIMEOUT,
+        max_chunk_bytes=MAX_CHUNK_BYTES,
     )
     # Recover live sessions from Redis index → SQLite DBs
     try:
@@ -270,9 +280,41 @@ async def control_endpoint(ws: WebSocket):
                 return
 
             session_id = msg["session_id"]
-            resume_token = msg["resume_token"]
             leg_id = msg["leg_id"]
             target_dir = msg.get("target_dir", ".")
+            # The resume token is SERVER-issued (returned in HELLO_OK) — a
+            # client-chosen token would be a self-signed credential, useless
+            # as an authenticator for the data/publish endpoints. A token the
+            # client may still send in HELLO is deliberately ignored.
+            resume_token = secrets.token_urlsafe(32)
+
+            # Consumer authorization (config-driven hook, see mfup/hooks.py).
+            # Runs BEFORE anything is created. Deny → auth_failed.
+            auth_result = None
+            if _authorize is not None:
+                try:
+                    auth_result = await _authorize(AuthRequest(
+                        session_id=session_id,
+                        target_dir=target_dir,
+                        headers=dict(ws.headers),
+                        client=f"{ws.client.host}:{ws.client.port}" if ws.client else "",
+                        query=dict(ws.query_params),
+                    ))
+                except Exception:
+                    logger.exception("Authorize hook raised for session %s — denying", session_id)
+                    auth_result = None
+                if auth_result is None:
+                    await ws.send_json({
+                        "t": "SESSION_ABORT",
+                        "code": "auth_failed",
+                        "reason": "authorization denied",
+                    })
+                    await ws.close()
+                    return
+                if auth_result.target_dir is not None:
+                    # The hook may pin the target (e.g. per-user directory);
+                    # still subject to the containment check below.
+                    target_dir = auth_result.target_dir
 
             # Validate target_dir stays within base_dir
             if not _is_safe_target(registry.base_dir, target_dir):
@@ -324,11 +366,19 @@ async def control_endpoint(ws: WebSocket):
                 await ws.close()
                 return
 
+            # Apply authorize-hook constraints to the live session.
+            if auth_result is not None:
+                session.quota_max_bytes = auth_result.max_total_bytes
+                session.quota_max_files = auth_result.max_files
+                session.auth_context = dict(auth_result.context)
+
             session.ws = ws
             await ws.send_json({
                 "t": "HELLO_OK",
                 "epoch": session.epoch,
                 "expires_at": session.expires_at,
+                # Server-issued bearer token for data/probe/publish/RESUME.
+                "resume_token": resume_token,
                 "limits": {
                     "max_chunk_bytes": MAX_CHUNK_BYTES,
                     "max_open_files": MAX_OPEN_FILES,
@@ -342,7 +392,22 @@ async def control_endpoint(ws: WebSocket):
             leg_id = msg["leg_id"]
 
             try:
-                session = await registry.resume(session_id, resume_token, leg_id)
+                try:
+                    session = await registry.resume(session_id, resume_token, leg_id)
+                except KeyError:
+                    # Lazy recovery: the session is not in THIS process's
+                    # memory (different worker after a deploy/failover, or a
+                    # session this process never saw), but its durable state
+                    # may still exist — Redis meta points at the staging dir.
+                    # Ownership transfers to whichever worker holds the WS.
+                    meta = await get_session_index().get_meta(session_id)
+                    if not meta or not meta.staging_dir:
+                        raise
+                    recovered = await registry.recover_session(session_id, Path(meta.staging_dir))
+                    if recovered is None:
+                        raise
+                    logger.info("Lazy-recovered session %s for RESUME", session_id)
+                    session = await registry.resume(session_id, resume_token, leg_id)
             except KeyError:
                 await ws.send_json({
                     "t": "SESSION_ABORT",

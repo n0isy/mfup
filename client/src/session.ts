@@ -81,6 +81,24 @@ export interface MfupSessionEvents {
 
 type Listener<T> = (ev: T) => void;
 
+/**
+ * crypto.randomUUID() exists only in secure contexts (https / localhost).
+ * Consumers embedding the SDK on plain-HTTP intranets still need ids, so
+ * fall back to an RFC 4122 v4 built from getRandomValues (available
+ * everywhere crypto is).
+ */
+function genUUID(): string {
+  if (typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  b[6] = (b[6] & 0x0f) | 0x40; // version 4
+  b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0"));
+  return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-${h[8]}${h[9]}-${h.slice(10).join("")}`;
+}
+
 // ---------------------------------------------------------------------------
 // Per-file tracking
 // ---------------------------------------------------------------------------
@@ -190,9 +208,12 @@ export class MfupSession {
   constructor(config: MfupSessionConfig) {
     this.serverUrl = config.serverUrl.replace(/\/$/, "");
     this.targetDir = config.targetDir ?? ".";
-    this.sessionId = config.sessionId ?? crypto.randomUUID();
-    this.resumeToken = config.resumeToken ?? crypto.randomUUID();
-    this.legId = crypto.randomUUID();
+    this.sessionId = config.sessionId ?? genUUID();
+    // The resume token is SERVER-issued: empty until HELLO_OK delivers it
+    // (probe/data/publish all happen after the handshake, so ordering is
+    // safe). For a resumed session the caller passes the token it persisted.
+    this.resumeToken = config.resumeToken ?? "";
+    this.legId = genUUID();
     this.chunkSize = config.chunkSize ?? 262144;
     this.maxReconnectAttempts = config.maxReconnectAttempts ?? null;
     this.reconnectDelayMs = config.reconnectDelayMs ?? 1000;
@@ -244,7 +265,7 @@ export class MfupSession {
   // -- lifecycle -----------------------------------------------------------
 
   async connect(): Promise<void> {
-    this.legId = crypto.randomUUID();
+    this.legId = genUUID();
     const isResume = this.epoch > 0;
 
     // Build WS URL — handle both http:// and https:// origins
@@ -795,6 +816,9 @@ export class MfupSession {
     this.control.on("hello_ok", (msg) => {
       this.epoch = msg.epoch;
       this.limits = msg.limits;
+      // Adopt the server-issued bearer token — used by probe, data POSTs,
+      // publish, and any future RESUME.
+      this.resumeToken = msg.resume_token;
       this.progress.setExpiresAt(msg.expires_at);
     });
 

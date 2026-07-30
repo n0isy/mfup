@@ -119,7 +119,6 @@ export interface HelloMsg {
   t: "HELLO";
   v: typeof PROTOCOL_VERSION;
   session_id: string;
-  resume_token: string;
   leg_id: string;
   target_dir: string;
 }
@@ -150,6 +149,9 @@ export interface HelloOkMsg {
   t: "HELLO_OK";
   epoch: number;
   expires_at: string;
+  /** SERVER-issued bearer token for the data/probe/publish endpoints and
+   * future RESUMEs. The client must not invent its own. */
+  resume_token: string;
   limits: ServerLimits;
 }
 

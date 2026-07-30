@@ -205,3 +205,80 @@ async def test_duplicate_file_open_closes_prior_writer(tmp_path):
     second = s.writers[1]
     assert first is not second
     assert first._fh.closed, "prior writer's file handle must be closed"
+
+
+# ---------------------------------------------------------------------------
+# Quotas (from the authorize hook) and chunk-size enforcement
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_byte_quota_aborts_session(tmp_path):
+    s = make_session(tmp_path)
+    s.quota_max_bytes = 5  # tiny quota
+    await s.process_frame(node(1, 0, NodeKind.FILE, "f.bin", size=10), "leg1")
+    await s.process_frame(FileOpenFrame(node_id=1, size=10), "leg1")
+    payload = b"0123456789"
+    await s.process_frame(
+        FileChunkFrame(node_id=1, offset=0, length=10, checksum=crc32c(payload), payload=payload),
+        "leg1",
+    )
+    assert s.state == SessionState.ABORTED
+    aborts = s.ws.of_type("SESSION_ABORT")
+    assert aborts and aborts[-1]["code"] == "quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_file_quota_aborts_session(tmp_path):
+    s = make_session(tmp_path)
+    s.quota_max_files = 2
+    await s.process_frame(node(1, 0, NodeKind.FILE, "a.bin", size=1), "leg1")
+    await s.process_frame(node(2, 0, NodeKind.FILE, "b.bin", size=1), "leg1")
+    assert s.state == SessionState.ACTIVE
+    await s.process_frame(node(3, 0, NodeKind.FILE, "c.bin", size=1), "leg1")
+    assert s.state == SessionState.ABORTED
+    aborts = s.ws.of_type("SESSION_ABORT")
+    assert aborts and aborts[-1]["code"] == "quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_node_does_not_double_count_file_quota(tmp_path):
+    s = make_session(tmp_path)
+    s.quota_max_files = 1
+    await s.process_frame(node(1, 0, NodeKind.FILE, "a.bin", size=1), "leg1")
+    # NODE replay (resume path) must not count the same file twice.
+    await s.process_frame(node(1, 0, NodeKind.FILE, "a.bin", size=1), "leg1")
+    assert s.state == SessionState.ACTIVE
+    assert s.files_seen == 1
+
+
+@pytest.mark.asyncio
+async def test_oversized_chunk_nacked(tmp_path):
+    s = make_session(tmp_path)
+    s.max_chunk_bytes = 8
+    await s.process_frame(node(1, 0, NodeKind.FILE, "f.bin", size=100), "leg1")
+    await s.process_frame(FileOpenFrame(node_id=1, size=100), "leg1")
+    payload = b"x" * 16  # over the limit
+    await s.process_frame(
+        FileChunkFrame(node_id=1, offset=0, length=16, checksum=crc32c(payload), payload=payload),
+        "leg1",
+    )
+    nacks = s.ws.of_type("NACK_CHUNK")
+    assert nacks and nacks[-1]["reason"] == "server_policy"
+    assert s.state == SessionState.ACTIVE  # not fatal — client's problem
+
+
+# ---------------------------------------------------------------------------
+# Hook loading (config-driven authorize)
+# ---------------------------------------------------------------------------
+
+def test_load_hook_valid():
+    from mfup.hooks import load_hook
+    fn = load_hook("os.path:join")
+    assert fn("a", "b") == "a/b"
+
+
+@pytest.mark.parametrize("bad", ["", "no_colon", "nonexistent.module:fn", "os.path:nonexistent"])
+def test_load_hook_invalid_raises(bad):
+    from mfup.hooks import load_hook
+    with pytest.raises((ImportError, AttributeError, ModuleNotFoundError)):
+        load_hook(bad)
