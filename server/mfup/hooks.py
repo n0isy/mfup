@@ -57,8 +57,19 @@ class AuthResult:
     max_total_bytes: Optional[int] = None
     #: Cap on the number of file nodes; exceeding aborts likewise.
     max_files: Optional[int] = None
+    #: Per-session BASE directory (absolute path) — e.g. the user's home.
+    #: Overrides MFUP_BASE_DIR for this session: the staging dir is created
+    #: inside it (publish stays a same-filesystem rename even when homes live
+    #: on their own mount), relative target_dir resolves against it, and the
+    #: containment check confines the session to it. Created if missing.
+    #: None = the global MFUP_BASE_DIR.
+    base_dir: Optional[str] = None
     #: Optional override of the client-requested target_dir (e.g. force
-    #: uploads into a per-user directory). Still validated against base_dir.
+    #: uploads into a fixed subdirectory, or a MAPPING of the client's
+    #: request — the hook receives req.target_dir and may prefix/rewrite it:
+    #:     target_dir=f"incoming/{req.target_dir}"
+    #: Escapes are impossible regardless: the resolved target must stay
+    #: within the session's base_dir or HELLO is refused (bad_target_dir).
     target_dir: Optional[str] = None
     #: Free-form bag the consumer may use to correlate sessions with users;
     #: stored in memory on the LiveSession, never persisted or sent to the

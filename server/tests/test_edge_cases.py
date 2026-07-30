@@ -282,3 +282,70 @@ def test_load_hook_invalid_raises(bad):
     from mfup.hooks import load_hook
     with pytest.raises((ImportError, AttributeError, ModuleNotFoundError)):
         load_hook(bad)
+
+
+# ---------------------------------------------------------------------------
+# Per-session base_dir (authorize hook: per-user homes)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_per_session_base_dir_staging_and_publish(tmp_path):
+    from mfup.session_manager import SessionRegistry
+    from mfup.publish import publish_session
+
+    global_base = tmp_path / "global"
+    home = tmp_path / "homes" / "alice"
+    global_base.mkdir(parents=True)
+
+    reg = SessionRegistry(global_base)
+    s = await reg.create("sid1", "tok", "leg1", "2099-01-01T00:00:00+00:00",
+                         target_dir="incoming", base_dir=home)
+    s.ws = FakeWS()
+
+    # Staging must live INSIDE the user's home, not the global base.
+    assert (home / ".incoming.sid1" / "payload").is_dir()
+    assert not (global_base / ".incoming.sid1").exists()
+
+    # Upload one file and publish — it must land in the home's target.
+    await s.process_frame(node(1, 0, NodeKind.FILE, "hello.txt", size=5), "leg1")
+    await s.process_frame(FileOpenFrame(node_id=1, size=5), "leg1")
+    payload = b"hello"
+    await s.process_frame(
+        FileChunkFrame(node_id=1, offset=0, length=5, checksum=crc32c(payload), payload=payload),
+        "leg1",
+    )
+    await s.process_frame(FileCloseFrame(node_id=1, size_sent=5), "leg1")
+    await s.process_frame(SessionEndFrame(scan_done_units=1, scan_est_units=1,
+                                          body_done_bytes=5, body_est_bytes=5), "leg1")
+    result = await s.try_commit()
+    assert result and result["t"] == "COMMIT_OK"
+
+    published = publish_session(home, "sid1", home / "incoming")
+    assert published == ["hello.txt"]
+    assert (home / "incoming" / "hello.txt").read_bytes() == b"hello"
+    assert not (home / ".incoming.sid1").exists()  # staging reclaimed
+
+
+@pytest.mark.asyncio
+async def test_recover_session_derives_base_from_staging_parent(tmp_path):
+    from mfup.session_manager import SessionRegistry
+
+    global_base = tmp_path / "global"
+    home = tmp_path / "homes" / "bob"
+    global_base.mkdir(parents=True)
+
+    reg1 = SessionRegistry(global_base)
+    s1 = await reg1.create("sid2", "tok", "leg1", "2099-01-01T00:00:00+00:00",
+                           target_dir=".", base_dir=home)
+    s1.detach_leg()
+    await reg1.remove("sid2")
+
+    # "Another worker": fresh registry, recovery via the staging path only
+    # (as lazy-resume does, from Redis meta). Base must come from the parent.
+    reg2 = SessionRegistry(global_base)
+    s2 = await reg2.recover_session("sid2", home / ".incoming.sid2")
+    assert s2 is not None
+    assert s2.base_dir == home
+    # And it is resumable.
+    resumed = await reg2.resume("sid2", "tok", "leg2")
+    assert resumed.state == SessionState.ACTIVE

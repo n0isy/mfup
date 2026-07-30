@@ -788,13 +788,19 @@ class SessionRegistry:
         leg_id: str,
         expires_at: str,
         target_dir: str = ".",
+        base_dir: Optional[Path] = None,
     ) -> LiveSession:
+        """Create a session. `base_dir` overrides the registry-wide base for
+        THIS session (per-user home from the authorize hook): staging lives
+        inside it, so publish stays a same-filesystem rename even when homes
+        are separate mounts."""
+        base = base_dir if base_dir is not None else self.base_dir
         async with self._lock:
             if session_id in self._sessions:
                 raise ValueError(f"session {session_id} already exists")
-            db = open_session_db(self.base_dir, session_id, self.staging_prefix)
+            db = open_session_db(base, session_id, self.staging_prefix)
             db.init_session(session_id, resume_token, expires_at, target_dir)
-            session = LiveSession(session_id, resume_token, self.base_dir, db, target_dir=target_dir, staging_prefix=self.staging_prefix, **self.defaults)
+            session = LiveSession(session_id, resume_token, base, db, target_dir=target_dir, staging_prefix=self.staging_prefix, **self.defaults)
             session.attach_leg(leg_id)
             self._sessions[session_id] = session
             return session
@@ -883,8 +889,12 @@ class SessionRegistry:
                 db.close()
                 return self._sessions[session_id]
 
+            # The session's base dir is by construction the PARENT of its
+            # staging dir (staging = <base>/<prefix>.<sid>). Deriving it here
+            # keeps recovery correct for per-user base_dir sessions (authorize
+            # hook homes) without persisting the base anywhere else.
             session = LiveSession(
-                session_id, resume_token, self.base_dir, db,
+                session_id, resume_token, staging_path.parent, db,
                 target_dir=target_dir,
                 staging_prefix=self.staging_prefix,
                 **self.defaults,

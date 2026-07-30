@@ -312,12 +312,34 @@ async def control_endpoint(ws: WebSocket):
                     await ws.close()
                     return
                 if auth_result.target_dir is not None:
-                    # The hook may pin the target (e.g. per-user directory);
-                    # still subject to the containment check below.
+                    # The hook may pin or MAP the target (it received the
+                    # client-requested value in req.target_dir); still subject
+                    # to the containment check below.
                     target_dir = auth_result.target_dir
 
-            # Validate target_dir stays within base_dir
-            if not _is_safe_target(registry.base_dir, target_dir):
+            # Per-session base directory (e.g. the user's home). Staging is
+            # created INSIDE it so publish remains a same-filesystem rename
+            # even when homes live on their own mount.
+            session_base = registry.base_dir
+            if auth_result is not None and auth_result.base_dir is not None:
+                candidate = Path(auth_result.base_dir)
+                if not candidate.is_absolute():
+                    logger.error(
+                        "Authorize hook returned a relative base_dir %r for session %s — denying",
+                        auth_result.base_dir, session_id,
+                    )
+                    await ws.send_json({
+                        "t": "SESSION_ABORT",
+                        "code": "auth_failed",
+                        "reason": "authorization misconfigured (relative base_dir)",
+                    })
+                    await ws.close()
+                    return
+                session_base = candidate
+                session_base.mkdir(parents=True, exist_ok=True)
+
+            # Validate target_dir stays within the session's base dir
+            if not _is_safe_target(session_base, target_dir):
                 await ws.send_json({
                     "t": "SESSION_ABORT",
                     "code": "bad_target_dir",
@@ -331,6 +353,7 @@ async def control_endpoint(ws: WebSocket):
                 session = await registry.create(
                     session_id, resume_token, leg_id, expires.isoformat(),
                     target_dir=target_dir,
+                    base_dir=session_base if session_base is not registry.base_dir else None,
                 )
             except ValueError:
                 # Session already exists — treat as conflict
@@ -348,7 +371,9 @@ async def control_endpoint(ws: WebSocket):
             # so roll back the registry entry and abort explicitly.
             try:
                 idx = get_session_index()
-                sd = staging_dir(registry.base_dir, session_id, STAGING_PREFIX)
+                # Absolute staging path in Redis meta is what makes sweeper /
+                # lazy-resume work for per-user base dirs too.
+                sd = staging_dir(session_base, session_id, STAGING_PREFIX)
                 await idx.register(session_id, expires, target_dir, str(sd))
                 session._on_expiry_change = lambda sid, exp: idx.update_expiry(sid, exp)
             except Exception:
@@ -497,7 +522,8 @@ async def control_endpoint(ws: WebSocket):
                 if meta and meta.staging_dir:
                     sd = Path(meta.staging_dir)
                 else:
-                    sd = staging_dir(registry.base_dir, sid, STAGING_PREFIX)
+                    # session.base_dir, not the global one: per-user homes.
+                    sd = staging_dir(session.base_dir, sid, STAGING_PREFIX)
                 if sd.exists():
                     shutil.rmtree(str(sd), ignore_errors=True)
                 await idx.remove(sid)
@@ -836,13 +862,14 @@ async def publish_endpoint(session_id: str, request: Request):
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    # Resolve target_dir: relative paths are under base_dir
+    # Resolve target_dir against the SESSION's base dir (may be a per-user
+    # home from the authorize hook, not the global MFUP_BASE_DIR).
     target = Path(session.target_dir)
     if not target.is_absolute():
-        target = registry.base_dir / target
+        target = session.base_dir / target
 
-    # Defense in depth: verify target stays within base_dir
-    if not _is_safe_target(registry.base_dir, session.target_dir):
+    # Defense in depth: verify target stays within the session's base dir
+    if not _is_safe_target(session.base_dir, session.target_dir):
         return JSONResponse(
             {"error": "target_dir escapes base directory"},
             status_code=status.HTTP_403_FORBIDDEN,
@@ -853,7 +880,7 @@ async def publish_endpoint(session_id: str, request: Request):
         # walks) — keep it off the event loop.
         published = await asyncio.to_thread(
             publish_session,
-            registry.base_dir, session_id, target, STAGING_PREFIX,
+            session.base_dir, session_id, target, STAGING_PREFIX,
             session.publish_action,
         )
     except ConflictError as exc:

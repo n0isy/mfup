@@ -66,13 +66,14 @@ resolve the user, decide.
 | *(return `None`)* | — | **Deny.** Client gets `SESSION_ABORT{code: "auth_failed"}` |
 | `max_total_bytes` | `int \| None` | Byte quota; exceeding → `SESSION_ABORT{code: "quota_exceeded"}`, staging reclaimed |
 | `max_files` | `int \| None` | File-count quota; same abort semantics |
-| `target_dir` | `str \| None` | Override the client's target (e.g. force `users/{id}/incoming`); still contained within `MFUP_BASE_DIR` |
+| `base_dir` | `str \| None` | **Per-session base directory** (absolute), e.g. the user's home. Replaces `MFUP_BASE_DIR` for this session: the staging dir is created *inside* it (publish stays a same-filesystem rename even when homes are separate mounts), relative targets resolve against it, containment confines the session to it. Created if missing. A relative path is a config error → deny |
+| `target_dir` | `str \| None` | Replace **or map** the client's request — the hook receives the client value in `req.target_dir` and may rewrite it. Contained within the session's base dir regardless |
 | `context` | `dict` | Your correlation bag (user id, org id, …). In-memory only; never persisted, never sent to the client |
 
 Raising an exception from the hook is treated as a deny (logged with
 traceback server-side, generic reason to the client).
 
-### Example
+### Example: per-user homes + mapping the client's path
 
 ```python
 # myapp/uploads.py
@@ -84,12 +85,30 @@ async def authorize(req: AuthRequest) -> AuthResult | None:
     if user is None or not user.can_upload:
         return None
     return AuthResult(
-        target_dir=f"users/{user.id}/incoming",
+        # Every user gets their own base — staging and targets never leave it.
+        base_dir=f"/data/homes/{user.id}",
+        # MAP the client's request under a fixed prefix instead of trusting
+        # it verbatim. Escapes are impossible either way: the server refuses
+        # any resolved target outside base_dir (bad_target_dir) — a client
+        # sending "../bob" is rejected, not silently corrected.
+        target_dir=f"incoming/{req.target_dir}",
         max_total_bytes=user.quota_remaining_bytes,
         max_files=50_000,
         context={"user_id": user.id},
     )
 ```
+
+Notes on per-session `base_dir`:
+
+- The sweeper and lazy-resume work unchanged — Redis meta stores the
+  **absolute** staging path, and recovery derives the base from the staging
+  dir's parent.
+- The filesystem-orphan reconciliation net (`MFUP_RECONCILE_EVERY`) scans
+  only the global `MFUP_BASE_DIR`. Orphans inside per-user homes are still
+  cleaned by the Redis-driven sweeper (the primary mechanism); they are only
+  unreachable in the rare "Redis lost the entry AND cleanup was interrupted"
+  double-failure. If that matters to you, keep homes under one parent and
+  point a periodic job at `<homes>/*/.incoming.*` older than a day.
 
 Quota semantics: both quotas are enforced server-side during transfer
 (counters are re-seeded from durable state on every reconnect, so resume
