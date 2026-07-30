@@ -92,6 +92,26 @@ match. Where a subsection below still describes old behaviour, §0 wins.
   entry point), Reset aborts a live session instead of orphaning it, publish
   carries the token (§5.1).
 
+**Embeddability stage (see docs/EXTENDING.md — the integration contract)**
+- **`resume_token` is now SERVER-issued**: `HELLO` carries no token; `HELLO_OK`
+  returns one (`secrets.token_urlsafe(32)`). A client-chosen token was a
+  self-signed credential. Protocol change made pre-publication by design.
+- **Config-driven authorization**: `MFUP_AUTHORIZE="pkg.module:callable"`
+  (`mfup/hooks.py` — `AuthRequest`/`AuthResult`). Deny → `auth_failed`;
+  the hook can pin `target_dir` and set quotas. Unset ⇒ allow-all with a loud
+  startup warning; a broken path kills startup.
+- **Quotas enforced**: `max_total_bytes` / `max_files` from the hook →
+  `SESSION_ABORT quota_exceeded`; counters re-seeded from the DB on every
+  `attach_leg` so resume never double-counts. `MAX_CHUNK_BYTES` is now
+  enforced too (oversized `FILE_CHUNK` → `NACK server_policy`) — retiring
+  part of the §7.3 gap.
+- **Lazy-resume**: a `RESUME` at a worker that has never seen the session
+  recovers it from Redis meta + on-disk SQLite and takes ownership — deploys,
+  restarts and failovers work; round-robin without sticky routing still does
+  not (§ EXTENDING 4).
+- Client id generation falls back to a `getRandomValues`-based UUIDv4 where
+  `crypto.randomUUID` is unavailable (non-secure contexts).
+
 ---
 
 ## 1. Architecture
