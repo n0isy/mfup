@@ -91,6 +91,13 @@ class SessionDB:
         self._conn.execute("PRAGMA busy_timeout=3000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        # Lightweight migration: sessions are short-lived (TTL), so additive
+        # columns are applied in place instead of versioned migrations.
+        for col in ("meta_json", "auth_json"):
+            try:
+                self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self._conn.commit()
 
     @property
@@ -127,12 +134,25 @@ class SessionDB:
         resume_token: str,
         expires_at: str,
         target_dir: str = ".",
+        meta_json: Optional[str] = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        # Explicit column list: the table gains additive columns over time
+        # (ALTER migration above) — positional VALUES would break.
         self._conn.execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?,?,1,?,?,?,?,?)",
-            (session_id, resume_token, SessionState.ACTIVE.value, target_dir, expires_at, now, now),
+            "INSERT OR REPLACE INTO sessions "
+            "(session_id, resume_token, epoch, state, target_dir, expires_at,"
+            " created_at, updated_at, meta_json) "
+            "VALUES (?,?,1,?,?,?,?,?,?)",
+            (session_id, resume_token, SessionState.ACTIVE.value, target_dir,
+             expires_at, now, now, meta_json),
         )
+        self._maybe_commit()
+
+    def set_auth_json(self, auth_json: str) -> None:
+        """Persist authorize-hook constraints (quotas + JSON-able context) so
+        they survive restarts / lazy-resume on another worker."""
+        self._conn.execute("UPDATE sessions SET auth_json=?", (auth_json,))
         self._maybe_commit()
 
     def get_target_dir(self) -> str:

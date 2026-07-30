@@ -47,6 +47,8 @@ export interface ControlChannelOpts {
   legId: string;
   /** Relative path where files should be placed on the server */
   targetDir: string;
+  /** Arbitrary JSON attached to the session (HELLO.meta) */
+  meta?: unknown;
   /** If set, we send RESUME instead of HELLO */
   lastKnownEpoch?: number | null;
 }
@@ -163,6 +165,9 @@ export class ControlChannel {
       leg_id: this.opts.legId,
       target_dir: this.opts.targetDir,
     };
+    if (this.opts.meta !== undefined) {
+      msg.meta = this.opts.meta;
+    }
     this.send(msg);
   }
 

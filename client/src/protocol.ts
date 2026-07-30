@@ -121,6 +121,10 @@ export interface HelloMsg {
   session_id: string;
   leg_id: string;
   target_dir: string;
+  /** Arbitrary JSON the consumer attaches to the session (scope/purpose/ids).
+   * Fed to the server-side authorize and map_file hooks. Size-capped
+   * server-side (default 16 KiB). */
+  meta?: unknown;
 }
 
 export interface ResumeMsg {

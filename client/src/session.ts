@@ -56,6 +56,10 @@ export interface MfupSessionConfig {
   serverUrl: string;
   /** Relative target directory on the server where files will be placed */
   targetDir?: string;
+  /** Arbitrary JSON attached to the session (upload scope/purpose/ids).
+   * Delivered to the server's authorize and map_file hooks via HELLO.meta.
+   * Untrusted by the server until the consumer's hook validates it. */
+  meta?: unknown;
   /** Existing session_id for resume, or omit for new session */
   sessionId?: string;
   /** Existing resume_token for resume */
@@ -180,6 +184,7 @@ export class MfupSession {
   // Config
   private serverUrl: string;
   private targetDir: string;
+  private meta: unknown;
 
   // Data channel mode (detected via probe on first connect)
   private _streamingMode: boolean | null = null; // null = not yet probed
@@ -208,6 +213,7 @@ export class MfupSession {
   constructor(config: MfupSessionConfig) {
     this.serverUrl = config.serverUrl.replace(/\/$/, "");
     this.targetDir = config.targetDir ?? ".";
+    this.meta = config.meta;
     this.sessionId = config.sessionId ?? genUUID();
     // The resume token is SERVER-issued: empty until HELLO_OK delivers it
     // (probe/data/publish all happen after the handshake, so ordering is
@@ -277,6 +283,7 @@ export class MfupSession {
       resumeToken: this.resumeToken,
       legId: this.legId,
       targetDir: this.targetDir,
+      meta: this.meta,
       lastKnownEpoch: isResume ? this.epoch : undefined,
     });
 

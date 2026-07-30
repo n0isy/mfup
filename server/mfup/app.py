@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import secrets
 import shutil
 from contextlib import asynccontextmanager
@@ -14,10 +15,23 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, status
 from fastapi.responses import JSONResponse
 
-from .hooks import AuthRequest, AuthorizeHook, load_authorize_hook
+from .hooks import (
+    AuthRequest,
+    AuthorizeHook,
+    FileMapRequest,
+    MapFileHook,
+    load_authorize_hook,
+    load_map_file_hook,
+)
 from .protocol import CRC32C_IMPL, PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
 from .session_manager import SessionRegistry, LiveSession
-from .publish import publish_session, ConflictError
+from .publish import (
+    ConflictError,
+    MappingError,
+    list_payload_files,
+    publish_session,
+    publish_session_mapped,
+)
 from .redis_index import SessionIndex
 from .storage import staging_dir
 
@@ -52,6 +66,11 @@ ADMIN_TOKEN = __import__("os").environ.get("MFUP_ADMIN_TOKEN", "")
 # Dotted path ("pkg.module:callable") of the consumer's authorize hook.
 # Unset → allow-all (dev mode, logged loudly). See mfup/hooks.py.
 AUTHORIZE_PATH = __import__("os").environ.get("MFUP_AUTHORIZE", "")
+# Dotted path of the per-file mapping hook, applied at publish time.
+# Unset → files keep the client's layout. See mfup/hooks.py (MapFileHook).
+MAP_FILE_PATH = __import__("os").environ.get("MFUP_MAP_FILE", "")
+# Cap on the JSON size of HELLO.meta (client-attached session metadata).
+MAX_META_BYTES = int(__import__("os").environ.get("MFUP_MAX_META_BYTES", "16384"))
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -139,6 +158,7 @@ _registry: SessionRegistry | None = None
 _session_index: SessionIndex | None = None
 _sweep_task: asyncio.Task | None = None
 _authorize: AuthorizeHook | None = None
+_map_file: MapFileHook | None = None
 
 
 def get_registry() -> SessionRegistry:
@@ -153,12 +173,13 @@ def get_session_index() -> SessionIndex:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _registry, _session_index, _sweep_task, _authorize
+    global _registry, _session_index, _sweep_task, _authorize, _map_file
     base = DEFAULT_BASE_DIR
     base.mkdir(parents=True, exist_ok=True)
 
-    # A misconfigured hook path must kill startup, not fall back to allow-all.
+    # A misconfigured hook path must kill startup, not fall back silently.
     _authorize = load_authorize_hook(AUTHORIZE_PATH or None)
+    _map_file = load_map_file_hook(MAP_FILE_PATH or None)
 
     _session_index = SessionIndex(REDIS_URL)
 
@@ -168,6 +189,10 @@ async def lifespan(app: FastAPI):
         session_resume_ttl=SESSION_RESUME_TTL,
         leg_idle_timeout=LEG_IDLE_TIMEOUT,
         max_chunk_bytes=MAX_CHUNK_BYTES,
+        # With a map_file hook the client's layout no longer predicts final
+        # paths — the ingest-time conflict ASK would be noise; publish-time
+        # conflict handling (409 → action) takes over.
+        conflict_check=(_map_file is None),
     )
     # Recover live sessions from Redis index → SQLite DBs
     try:
@@ -288,6 +313,21 @@ async def control_endpoint(ws: WebSocket):
             # client may still send in HELLO is deliberately ignored.
             resume_token = secrets.token_urlsafe(32)
 
+            # Client-attached session metadata (scope/purpose/ids). Untrusted;
+            # size-capped; handed to authorize and to the map_file hook.
+            client_meta = msg.get("meta")
+            meta_json: str | None = None
+            if client_meta is not None:
+                meta_json = json.dumps(client_meta, ensure_ascii=False)
+                if len(meta_json.encode()) > MAX_META_BYTES:
+                    await ws.send_json({
+                        "t": "SESSION_ABORT",
+                        "code": "protocol_error",
+                        "reason": f"meta exceeds {MAX_META_BYTES} bytes",
+                    })
+                    await ws.close()
+                    return
+
             # Consumer authorization (config-driven hook, see mfup/hooks.py).
             # Runs BEFORE anything is created. Deny → auth_failed.
             auth_result = None
@@ -299,6 +339,7 @@ async def control_endpoint(ws: WebSocket):
                         headers=dict(ws.headers),
                         client=f"{ws.client.host}:{ws.client.port}" if ws.client else "",
                         query=dict(ws.query_params),
+                        meta=client_meta,
                     ))
                 except Exception:
                     logger.exception("Authorize hook raised for session %s — denying", session_id)
@@ -354,6 +395,7 @@ async def control_endpoint(ws: WebSocket):
                     session_id, resume_token, leg_id, expires.isoformat(),
                     target_dir=target_dir,
                     base_dir=session_base if session_base is not registry.base_dir else None,
+                    meta_json=meta_json,
                 )
             except ValueError:
                 # Session already exists — treat as conflict
@@ -391,11 +433,14 @@ async def control_endpoint(ws: WebSocket):
                 await ws.close()
                 return
 
-            # Apply authorize-hook constraints to the live session.
+            # Apply authorize-hook constraints to the live session
+            # (persisted — they must survive restarts / lazy-resume).
             if auth_result is not None:
-                session.quota_max_bytes = auth_result.max_total_bytes
-                session.quota_max_files = auth_result.max_files
-                session.auth_context = dict(auth_result.context)
+                session.apply_auth(
+                    auth_result.max_total_bytes,
+                    auth_result.max_files,
+                    auth_result.context,
+                )
 
             session.ws = ws
             await ws.send_json({
@@ -876,12 +921,51 @@ async def publish_endpoint(session_id: str, request: Request):
         )
 
     try:
-        # publish_session is synchronous filesystem work (renames / merge
-        # walks) — keep it off the event loop.
-        published = await asyncio.to_thread(
-            publish_session,
-            session.base_dir, session_id, target, STAGING_PREFIX,
-            session.publish_action,
+        if _map_file is not None:
+            # Per-file layout is the consumer's: run the (async) hook per
+            # file first, then hand the precomputed plan to the sync mover.
+            files = await asyncio.to_thread(
+                list_payload_files, session.base_dir, session_id, STAGING_PREFIX,
+            )
+            mapping: dict[str, str] = {}
+            for rel, size in files:
+                try:
+                    mapped = await _map_file(FileMapRequest(
+                        session_id=session_id,
+                        path=rel,
+                        name=rel.rsplit("/", 1)[-1],
+                        size=size,
+                        target_dir=session.target_dir,
+                        meta=session.client_meta,
+                        context=session.auth_context,
+                    ))
+                except Exception:
+                    logger.exception("map_file hook raised for %s (%s)", session_id, rel)
+                    return JSONResponse(
+                        {"error": "map_file_hook_error", "path": rel},
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+                if mapped is not None:
+                    mapping[rel] = mapped
+            published = await asyncio.to_thread(
+                publish_session_mapped,
+                session.base_dir, session_id, target, mapping, STAGING_PREFIX,
+                session.publish_action,
+            )
+        else:
+            # publish_session is synchronous filesystem work (renames / merge
+            # walks) — keep it off the event loop.
+            published = await asyncio.to_thread(
+                publish_session,
+                session.base_dir, session_id, target, STAGING_PREFIX,
+                session.publish_action,
+            )
+    except MappingError as exc:
+        # Consumer-hook bug (escape / duplicate destination) — nothing moved.
+        logger.error("Mapping error for session %s: %s", session_id, exc)
+        return JSONResponse(
+            {"error": "mapping_error", "detail": str(exc)},
+            status_code=status.HTTP_409_CONFLICT,
         )
     except ConflictError as exc:
         return JSONResponse(

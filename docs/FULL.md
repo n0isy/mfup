@@ -111,6 +111,17 @@ match. Where a subsection below still describes old behaviour, §0 wins.
   not (§ EXTENDING 4).
 - Client id generation falls back to a `getRandomValues`-based UUIDv4 where
   `crypto.randomUUID` is unavailable (non-secure contexts).
+- **Per-session base_dir** from the authorize hook (per-user homes): staging
+  is created inside the home so publish stays a same-filesystem rename;
+  recovery derives the base from the staging dir's parent (§ EXTENDING 2).
+- **Consumer session object + per-file mapping**: `MfupSessionConfig.meta` →
+  `HELLO.meta` → `AuthRequest.meta` (untrusted, size-capped) — drives
+  authorization; `MFUP_MAP_FILE` hook (`FileMapRequest`) decides each file's
+  final path at PUBLISH time (layout by type/scope). Whole plan validated
+  before anything moves (escape / duplicate destination → `409
+  mapping_error`, staging intact); ingest-time ASK disabled under mapping.
+  Quotas, `AuthResult.context` and `meta` are persisted in SQLite (schema
+  migration) so they survive restarts / lazy-resume (§ EXTENDING 2b).
 
 ---
 

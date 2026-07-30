@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -101,6 +102,7 @@ class LiveSession:
         leg_idle_timeout: int = 60,
         publish_timeout: int = 30,
         max_chunk_bytes: int = 262144,
+        conflict_check: bool = True,
     ) -> None:
         self.session_id = session_id
         self.resume_token = resume_token
@@ -152,13 +154,40 @@ class LiveSession:
         # Advertised chunk limit — ENFORCED: oversized FILE_CHUNKs are NACKed.
         self.max_chunk_bytes = max_chunk_bytes
 
+        # When a map_file hook is configured, the ingest-time conflict ASK is
+        # disabled: it checks the CLIENT's layout, which no longer predicts
+        # the final one. Conflicts then surface at publish (409 → action).
+        self.conflict_check = conflict_check
+
         # Per-session quotas, set from the consumer's authorize hook at HELLO
         # (see mfup/hooks.py). None = unlimited. Exceeding either quota aborts
         # the session with SESSION_ABORT(quota_exceeded).
         self.quota_max_bytes: Optional[int] = None
         self.quota_max_files: Optional[int] = None
-        # Free-form consumer bag from AuthResult.context (in-memory only).
+        # Consumer bag from AuthResult.context.
         self.auth_context: dict = {}
+        # Client-attached session meta (HELLO.meta), parsed JSON.
+        self.client_meta: Any = None
+
+        # Restore persisted meta / authorize constraints (survive restarts
+        # and lazy-resume on another worker — the map_file hook at publish
+        # and the quota checks depend on them).
+        row = db.get_session()
+        if row is not None:
+            keys = row.keys()
+            if "meta_json" in keys and row["meta_json"]:
+                try:
+                    self.client_meta = json.loads(row["meta_json"])
+                except ValueError:
+                    logger.warning("Session %s: unreadable meta_json ignored", session_id)
+            if "auth_json" in keys and row["auth_json"]:
+                try:
+                    auth = json.loads(row["auth_json"])
+                    self.quota_max_bytes = auth.get("max_total_bytes")
+                    self.quota_max_files = auth.get("max_files")
+                    self.auth_context = auth.get("context") or {}
+                except ValueError:
+                    logger.warning("Session %s: unreadable auth_json ignored", session_id)
         # Running totals for quota checks (avoid per-frame SQL aggregates);
         # seeded from the DB so recovery/resume keeps quotas accurate.
         fc, bts = db.count_committed_files()
@@ -290,6 +319,8 @@ class LiveSession:
 
     async def _check_conflict(self, node_id: int, is_dir: bool) -> None:
         """Advance conflict FSM by checking if target path exists."""
+        if not self.conflict_check:
+            return  # map_file hook owns the final layout; publish handles conflicts
         if self.conflict_state == "conflict_files":
             return  # already at terminal state
         dest = self._resolve_target_path(node_id)
@@ -530,6 +561,30 @@ class LiveSession:
             "code": code,
             "reason": f"server storage error: {exc.strerror or exc}",
         })
+
+    def apply_auth(self, max_total_bytes: Optional[int], max_files: Optional[int], context: dict) -> None:
+        """Set authorize-hook constraints and persist them (restart-safe).
+
+        `context` should be JSON-serializable to survive restarts; a
+        non-serializable one is kept in memory but persisted as {} (warned).
+        """
+        self.quota_max_bytes = max_total_bytes
+        self.quota_max_files = max_files
+        self.auth_context = dict(context)
+        persist_ctx: dict = self.auth_context
+        try:
+            json.dumps(persist_ctx)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Session %s: AuthResult.context is not JSON-serializable — "
+                "it will NOT survive a server restart", self.session_id,
+            )
+            persist_ctx = {}
+        self.db.set_auth_json(json.dumps({
+            "max_total_bytes": max_total_bytes,
+            "max_files": max_files,
+            "context": persist_ctx,
+        }))
 
     async def abort_quota(self, reason: str) -> None:
         """Abort the session on a quota violation (from the authorize hook).
@@ -789,17 +844,19 @@ class SessionRegistry:
         expires_at: str,
         target_dir: str = ".",
         base_dir: Optional[Path] = None,
+        meta_json: Optional[str] = None,
     ) -> LiveSession:
         """Create a session. `base_dir` overrides the registry-wide base for
         THIS session (per-user home from the authorize hook): staging lives
         inside it, so publish stays a same-filesystem rename even when homes
-        are separate mounts."""
+        are separate mounts. `meta_json` is the client-attached session meta
+        (HELLO.meta), persisted for the publish-time map_file hook."""
         base = base_dir if base_dir is not None else self.base_dir
         async with self._lock:
             if session_id in self._sessions:
                 raise ValueError(f"session {session_id} already exists")
             db = open_session_db(base, session_id, self.staging_prefix)
-            db.init_session(session_id, resume_token, expires_at, target_dir)
+            db.init_session(session_id, resume_token, expires_at, target_dir, meta_json=meta_json)
             session = LiveSession(session_id, resume_token, base, db, target_dir=target_dir, staging_prefix=self.staging_prefix, **self.defaults)
             session.attach_leg(leg_id)
             self._sessions[session_id] = session

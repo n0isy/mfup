@@ -349,3 +349,101 @@ async def test_recover_session_derives_base_from_staging_parent(tmp_path):
     # And it is resumable.
     resumed = await reg2.resume("sid2", "tok", "leg2")
     assert resumed.state == SessionState.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# Per-file mapping at publish (map_file hook) + auth/meta persistence
+# ---------------------------------------------------------------------------
+
+async def _upload_tree(s, files):
+    """files: list of (node_id, parent_id, name, content) with parent dirs
+    given as (node_id, parent_id, name, None) rows first."""
+    for nid, pid, name, content in files:
+        kind = NodeKind.DIR if content is None else NodeKind.FILE
+        await s.process_frame(node(nid, pid, kind, name,
+                                   size=None if content is None else len(content)), "leg1")
+        if content is not None:
+            await s.process_frame(FileOpenFrame(node_id=nid, size=len(content)), "leg1")
+            await s.process_frame(FileChunkFrame(node_id=nid, offset=0, length=len(content),
+                                                 checksum=crc32c(content), payload=content), "leg1")
+            await s.process_frame(FileCloseFrame(node_id=nid, size_sent=len(content)), "leg1")
+    n_nodes = len(files)
+    total = sum(len(c) for _, _, _, c in files if c is not None)
+    await s.process_frame(SessionEndFrame(scan_done_units=n_nodes, scan_est_units=n_nodes,
+                                          body_done_bytes=total, body_est_bytes=total), "leg1")
+    result = await s.try_commit()
+    assert result and result["t"] == "COMMIT_OK", result
+
+
+@pytest.mark.asyncio
+async def test_mapped_publish_by_type(tmp_path):
+    from mfup.publish import list_payload_files, publish_session_mapped
+
+    s = make_session(tmp_path, sid="map1")
+    await _upload_tree(s, [
+        (1, 0, "shots", None),
+        (2, 1, "a.jpg", b"JPG1"),
+        (3, 1, "b.pdf", b"PDFPDF"),
+        (4, 0, "c.jpg", b"JPG2!"),
+    ])
+
+    files = list_payload_files(tmp_path, "map1")
+    assert [f[0] for f in files] == ["c.jpg", "shots/a.jpg", "shots/b.pdf"]
+
+    # Consumer decision: images by scope, documents flat — client layout gone.
+    mapping = {
+        "shots/a.jpg": "media/avatars/a.jpg",
+        "c.jpg": "media/avatars/c.jpg",
+        "shots/b.pdf": "docs/b.pdf",
+    }
+    target = tmp_path / "final"
+    published = publish_session_mapped(tmp_path, "map1", target, mapping)
+    assert sorted(published) == ["docs/b.pdf", "media/avatars/a.jpg", "media/avatars/c.jpg"]
+    assert (target / "media/avatars/a.jpg").read_bytes() == b"JPG1"
+    assert (target / "docs/b.pdf").read_bytes() == b"PDFPDF"
+    assert not (target / "shots").exists()          # client layout not replicated
+    assert not (tmp_path / ".incoming.map1").exists()  # staging reclaimed
+
+
+@pytest.mark.asyncio
+async def test_mapped_publish_rejects_escape_and_collision(tmp_path):
+    from mfup.publish import publish_session_mapped, MappingError
+
+    s = make_session(tmp_path, sid="map2")
+    await _upload_tree(s, [
+        (1, 0, "x.bin", b"xx"),
+        (2, 0, "y.bin", b"yy"),
+    ])
+    target = tmp_path / "final2"
+
+    with pytest.raises(MappingError):
+        publish_session_mapped(tmp_path, "map2", target, {"x.bin": "../evil"})
+    with pytest.raises(MappingError):
+        publish_session_mapped(tmp_path, "map2", target, {"x.bin": "same.bin", "y.bin": "same.bin"})
+    # Nothing moved, staging intact after failed attempts.
+    assert (tmp_path / ".incoming.map2" / "payload" / "x.bin").exists()
+    assert not target.exists() or not any(target.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_auth_and_meta_persist_across_recovery(tmp_path):
+    import json as _json
+    from mfup.session_manager import SessionRegistry
+
+    reg1 = SessionRegistry(tmp_path)
+    s1 = await reg1.create(
+        "pers1", "tok", "leg1", "2099-01-01T00:00:00+00:00",
+        meta_json=_json.dumps({"scope": "avatars", "album": 7}),
+    )
+    s1.apply_auth(12345, 10, {"user_id": "alice"})
+    s1.detach_leg()
+    await reg1.remove("pers1")
+
+    # Fresh registry = restart / another worker.
+    reg2 = SessionRegistry(tmp_path)
+    s2 = await reg2.recover_session("pers1", tmp_path / ".incoming.pers1")
+    assert s2 is not None
+    assert s2.client_meta == {"scope": "avatars", "album": 7}
+    assert s2.quota_max_bytes == 12345
+    assert s2.quota_max_files == 10
+    assert s2.auth_context == {"user_id": "alice"}

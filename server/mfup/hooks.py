@@ -46,6 +46,11 @@ class AuthRequest:
     client: str
     #: Query parameters of the WebSocket URL.
     query: Mapping[str, str]
+    #: Arbitrary JSON the CONSUMER'S FRONTEND attached to the session
+    #: (MfupSessionConfig.meta → HELLO.meta). Untrusted client input — the
+    #: hook validates it. Typical use: upload scope/purpose ("avatars",
+    #: {"album_id": 123}) that authorization and per-file mapping key on.
+    meta: Any = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,36 @@ class AuthResult:
 AuthorizeHook = Callable[[AuthRequest], Awaitable[Optional[AuthResult]]]
 
 
+@dataclass(frozen=True)
+class FileMapRequest:
+    """One file about to be published — input to the map_file hook."""
+
+    session_id: str
+    #: Path of the file inside the uploaded tree, "/"-separated, as the
+    #: client sent it (e.g. "photos/2024/img_001.jpg").
+    path: str
+    #: Basename convenience (last segment of `path`).
+    name: str
+    #: Actual size on disk, bytes.
+    size: int
+    #: The session's target_dir (already authorized/mapped at HELLO).
+    target_dir: str
+    #: Client-attached session meta (see AuthRequest.meta).
+    meta: Any
+    #: AuthResult.context from the authorize hook.
+    context: Mapping[str, Any]
+
+
+#: async (FileMapRequest) -> str | None
+#:   str  — new path RELATIVE to target_dir (e.g. "media/img_001.jpg");
+#:   None — keep the client's layout for this file.
+#: Two files mapping to the same destination is a consumer bug → publish
+#: fails with mapping_conflict. Escaping segments ("..", absolute, "\\")
+#: fail publish likewise. The hook runs once per file at PUBLISH time, so
+#: it does not need to be deterministic across retries of the transfer.
+MapFileHook = Callable[[FileMapRequest], Awaitable[Optional[str]]]
+
+
 def load_hook(dotted: str) -> Callable[..., Any]:
     """Import ``pkg.module:attr`` and return the attribute.
 
@@ -105,4 +140,13 @@ def load_authorize_hook(dotted: str | None) -> AuthorizeHook | None:
         return None
     hook = load_hook(dotted)
     logger.info("Authorize hook loaded: %s", dotted)
+    return hook  # type: ignore[return-value]
+
+
+def load_map_file_hook(dotted: str | None) -> MapFileHook | None:
+    """Resolve MFUP_MAP_FILE. None (unset) → identity layout."""
+    if not dotted:
+        return None
+    hook = load_hook(dotted)
+    logger.info("map_file hook loaded: %s", dotted)
     return hook  # type: ignore[return-value]

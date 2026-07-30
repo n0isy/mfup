@@ -55,9 +55,11 @@ Called once per `HELLO`, before any session state is created.
 | `headers` | `Mapping[str, str]` | HTTP headers of the WS handshake — cookies, `Authorization`, etc. |
 | `client` | `str` | `"ip:port"` of the peer (as seen by the ASGI server) |
 | `query` | `Mapping[str, str]` | Query params of the WS URL |
+| `meta` | `Any` | **Consumer-attached session object** (`MfupSessionConfig.meta` → `HELLO.meta`): arbitrary JSON your frontend put on the session — upload scope, album id, purpose. Untrusted until your hook validates it. Size-capped (`MFUP_MAX_META_BYTES`, 16 KiB). Persisted with the session, so it survives restarts and reaches the publish-time map hook |
 
 Typical flow: read your session cookie / bearer token from `req.headers`,
-resolve the user, decide.
+resolve the user, validate `req.meta` (it names *what* is being uploaded —
+"avatars", `{"album_id": 123}`), decide.
 
 ### `AuthResult` (what you return)
 
@@ -114,6 +116,51 @@ Quota semantics: both quotas are enforced server-side during transfer
 (counters are re-seeded from durable state on every reconnect, so resume
 does not double-count). Violation is **terminal** — predictable for the
 user, nothing partial is ever published, staging is deleted.
+
+---
+
+## 2b. Per-file layout: the map_file hook (`MFUP_MAP_FILE`)
+
+The client uploads *its* directory tree; your product may want a different
+final layout — by type, by scope, sharded. The map hook owns the layout:
+
+```bash
+MFUP_MAP_FILE="myapp.uploads:map_file"
+```
+
+```python
+from mfup.hooks import FileMapRequest
+
+async def map_file(req: FileMapRequest) -> str | None:
+    scope = req.context.get("scope", "misc")        # from your authorize hook
+    kind = "img" if req.name.endswith((".jpg", ".png")) else "other"
+    return f"{scope}/{kind}/{req.name}"             # relative to target_dir
+    # return None  → keep the client's path for this file
+```
+
+`FileMapRequest`: `session_id`, `path` (client-relative, `/`-separated),
+`name`, `size` (on-disk bytes), `target_dir`, `meta` (client session object),
+`context` (your `AuthResult.context`). Both `meta` and the JSON-serializable
+part of `context` are persisted with the session, so mapping works even if
+the server restarted between commit and publish.
+
+Semantics — deliberately publish-time, not transfer-time:
+
+- **Transfer/resume are untouched.** Staging remains a verbatim mirror of the
+  client tree; the hook runs once per file at publish, so it need not be
+  deterministic across transfer retries, and it may be slow-ish (a DB lookup
+  per file is fine).
+- **The whole plan is validated before anything moves**: an escaping path
+  (`..`, absolute, `\`) or two files mapped to one destination fail the
+  publish with `409 {"error": "mapping_error"}` and leave staging intact —
+  a consumer-hook bug can't half-publish a session.
+- Conflicts with existing files follow the usual rule: without an action →
+  `409 conflict_files`; with `merge_overwrite` → `os.replace`.
+- With a map hook configured the **ingest-time conflict ASK is disabled**
+  (it checks the client layout, which no longer predicts final paths);
+  conflicts surface at publish instead.
+- Mapped publish materializes **files**; empty client directories are not
+  preserved.
 
 ---
 
@@ -184,6 +231,8 @@ All read at process start (import time). Restart to apply.
 |---|---|---|
 | `MFUP_BASE_DIR` | `/tmp/mfup-uploads` | Root for staging dirs and relative targets |
 | `MFUP_AUTHORIZE` | *(unset = allow-all + warning)* | Dotted path of the authorize hook |
+| `MFUP_MAP_FILE` | *(unset = keep client layout)* | Dotted path of the per-file mapping hook (§2b) |
+| `MFUP_MAX_META_BYTES` | `16384` | Size cap for `HELLO.meta` JSON |
 | `MFUP_ADMIN_TOKEN` | *(unset = admin routes disabled)* | Bearer for `/mfup/sessions*`, `/mfup/sweep` |
 | `REDIS_URL` | `redis://redis:6379/0` | Session index |
 | `MFUP_SESSION_RESUME_TTL` | `3600` | Seconds a detached session stays resumable |
@@ -195,10 +244,10 @@ All read at process start (import time). Restart to apply.
 | `MFUP_ORPHAN_GRACE` | `600` | Min age before an unreferenced staging dir is reclaimed |
 | `MFUP_STAGING_PREFIX` | `.incoming` | Staging dir name prefix |
 
-Client (`MfupSession` config): `serverUrl`, `targetDir`, `chunkSize`,
-`maxReconnectAttempts`, `reconnectDelayMs`; for resume — `sessionId`,
-`resumeToken` (the server-issued one, from `getResumeState()`),
-`lastKnownEpoch`.
+Client (`MfupSession` config): `serverUrl`, `targetDir`, `meta` (the session
+object delivered to your hooks), `chunkSize`, `maxReconnectAttempts`,
+`reconnectDelayMs`; for resume — `sessionId`, `resumeToken` (the
+server-issued one, from `getResumeState()`), `lastKnownEpoch`.
 
 ---
 
