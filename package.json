@@ -3,10 +3,12 @@
   "private": true,
   "workspaces": [
     "packages/client",
-    "packages/react"
+    "packages/react",
+    "packages/server"
   ],
   "scripts": {
-    "build": "npm run build -w @mfup/client && npm run build -w @mfup/react",
-    "check": "npm run check -w @mfup/client && npm run check -w @mfup/react"
+    "build": "npm run build -w @mfup/client && npm run build -w @mfup/react && npm run build -w @mfup/server",
+    "check": "npm run check -w @mfup/client && npm run check -w @mfup/react && npm run check -w @mfup/server",
+    "test:server": "npm test -w @mfup/server"
   }
 }

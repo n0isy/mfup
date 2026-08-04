@@ -4,6 +4,7 @@
 [![release](https://github.com/n0isy/mfup/actions/workflows/release.yml/badge.svg)](https://github.com/n0isy/mfup/actions/workflows/release.yml)
 [![npm @mfup/client](https://img.shields.io/npm/v/%40mfup%2Fclient?label=%40mfup%2Fclient&color=cb3837)](https://www.npmjs.com/package/@mfup/client)
 [![npm @mfup/react](https://img.shields.io/npm/v/%40mfup%2Freact?label=%40mfup%2Freact&color=cb3837)](https://www.npmjs.com/package/@mfup/react)
+[![npm @mfup/server](https://img.shields.io/npm/v/%40mfup%2Fserver?label=%40mfup%2Fserver&color=cb3837)](https://www.npmjs.com/package/@mfup/server)
 [![PyPI mfup-core](https://img.shields.io/pypi/v/mfup-core?label=mfup-core&color=3775a9)](https://pypi.org/project/mfup-core/)
 [![PyPI mfup-fastapi](https://img.shields.io/pypi/v/mfup-fastapi?label=mfup-fastapi&color=3775a9)](https://pypi.org/project/mfup-fastapi/)
 
@@ -31,8 +32,13 @@ files) from a browser to a server — resumable, interactive, atomic.
 |---|---|---|
 | [`packages/client`](packages/client) | npm [`@mfup/client`](https://www.npmjs.com/package/@mfup/client) | Browser SDK: session, ingestion (DnD/pickers), events + snapshot store |
 | [`packages/react`](packages/react) | npm [`@mfup/react`](https://www.npmjs.com/package/@mfup/react) | React hooks: `useMfupUpload`, `useMfupDropzone`, `useMfupSession` |
+| [`packages/server`](packages/server) | npm [`@mfup/server`](https://www.npmjs.com/package/@mfup/server) | **Node server**: universal `(req,res)` + upgrade handler for express/vite/raw http; memory or Redis store; zero native deps |
 | [`server/mfup-core`](server/mfup-core) | PyPI [`mfup-core`](https://pypi.org/project/mfup-core/) | Engine: protocol, session state machine, storage, publish, hooks |
 | [`server/mfup-fastapi`](server/mfup-fastapi) | PyPI [`mfup-fastapi`](https://pypi.org/project/mfup-fastapi/) | `MfupEngine` + `APIRouter` to mount into your FastAPI, or standalone server |
+
+Both servers speak the same wire protocol, share the on-disk session-journal
+format and (in Redis mode) the same index keys — the CI e2e matrix runs the
+full chaos suite against each. Pick FastAPI or Node by stack, not by feature.
 
 Around the packages:
 
@@ -65,6 +71,13 @@ docker compose -f e2e/docker-compose.yaml up -d    # :20060
 The full walkthrough for wiring MFUP into your product as a separate upload
 service. (The alternative — embedding `engine.router` into your own FastAPI
 app — is one `include_router` call; see `docs/EXTENDING.md` §0.)
+
+This guide uses the Python server. **On a Node stack** the same protocol
+ships as [`@mfup/server`](packages/server) — one universal handler pair for
+express/vite/raw `node:http` (`mfup.middleware` + `mfup.attach(server)`),
+a memory session store by default (no Redis needed for a single process),
+and `npx mfup-server` for the standalone role with the same `MFUP_*` env
+vars. See [packages/server/README.md](packages/server/README.md).
 
 ### 1. Install the server
 

@@ -1,4 +1,4 @@
-# Release: build + publish all four packages on a version tag (v0.2.0, …).
+# Release: build + publish all five packages on a version tag (v0.2.0, …).
 #
 # NO long-lived tokens anywhere — both registries use OIDC trusted publishing.
 #
@@ -7,13 +7,16 @@
 #     "Add a new pending publisher" TWICE (mfup-core, mfup-fastapi) with:
 #     owner=n0isy, repository=mfup, workflow=release.yml, environment=release.
 #     The first tag then CREATES the projects via OIDC.
-#   - npm has no "pending publisher": the FIRST publish of @mfup/client and
-#     @mfup/react must be done manually once (npm login with 2FA; from repo
-#     root: npm publish -w @mfup/client -w @mfup/react --access public).
+#   - npm has no "pending publisher": the FIRST publish of each npm package
+#     (@mfup/client, @mfup/react, @mfup/server) must be done manually once
+#     (npm login with 2FA; from repo root:
+#     npm publish -w @mfup/<name> --access public).
 #     Then on npmjs.com for EACH package: Settings → Publishing access →
 #     add Trusted Publisher (GitHub Actions: n0isy/mfup, release.yml,
 #     environment release) and select "Require two-factor authentication
 #     and disallow tokens". Subsequent tags publish via OIDC below.
+#     The publish loop below skips packages that do not exist on the
+#     registry yet, so an unpublished package never fails a release.
 #
 # Also create the "release" GitHub environment (Settings → Environments).
 # Versions: keep package.json / pyproject.toml versions == the tag.
@@ -33,7 +36,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
 
       - name: Build npm packages
@@ -41,7 +44,7 @@ jobs:
           npm ci
           npm run build
           mkdir -p dist-npm    # npm pack does not create the destination
-          npm pack -w @mfup/client -w @mfup/react --pack-destination dist-npm
+          npm pack -w @mfup/client -w @mfup/react -w @mfup/server --pack-destination dist-npm
 
       - uses: actions/setup-python@v5
         with:
@@ -79,17 +82,21 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Ensure npm >= 11.5.1 (OIDC support)
         run: npm install -g npm@latest && npm --version
-      - name: Publish @mfup/client and @mfup/react (OIDC, provenance auto)
+      - name: Publish npm packages (OIDC, provenance auto)
         # Skip versions already on the registry — reruns and partial releases
         # must be idempotent, and 0.2.0 was first-published manually anyway.
+        # A package with NO releases at all is skipped too: npm cannot create
+        # a package via OIDC, so its first publish is manual (see header).
         run: |
           npm ci
           npm run build
-          for dir in client react; do
+          for dir in client react server; do
             pkg="@mfup/$dir"
             v=$(node -p "require('./packages/$dir/package.json').version")
             if npm view "$pkg@$v" version >/dev/null 2>&1; then
               echo "$pkg@$v already published — skipping"
+            elif ! npm view "$pkg" name >/dev/null 2>&1; then
+              echo "::warning::$pkg has never been published — first publish is manual, skipping"
             else
               npm publish -w "$pkg" --access public
             fi

@@ -22,7 +22,26 @@ jobs:
         run: cd server && python -m pytest tests -q
 
   # ---------------------------------------------------------------------
-  # Packaging smoke: the four artifacts must BUILD and INSTALL cleanly —
+  # Node server unit tests (@mfup/server: vitest — protocol decoder,
+  # hardening mirror of the Python suite, wire-level integration).
+  # Node 22: node:sqlite floor.
+  # ---------------------------------------------------------------------
+  node-server-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install workspaces
+        run: npm ci
+      - name: Build @mfup/client (test dependency of the server suite)
+        run: npm run build -w @mfup/client
+      - name: Run @mfup/server tests
+        run: npm test -w @mfup/server
+
+  # ---------------------------------------------------------------------
+  # Packaging smoke: the five artifacts must BUILD and INSTALL cleanly —
   # npm tarballs import in Node, wheels pass twine check and import.
   # Catches exports-map / const-enum / metadata regressions before publish.
   # ---------------------------------------------------------------------
@@ -33,25 +52,30 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Build + pack npm workspaces
         run: |
           npm ci
           npm run build
           mkdir -p /tmp/pack
-          npm pack -w @mfup/client -w @mfup/react --pack-destination /tmp/pack
+          npm pack -w @mfup/client -w @mfup/react -w @mfup/server --pack-destination /tmp/pack
 
       - name: Install tarballs in a scratch project and import
         run: |
           mkdir /tmp/smoke && cd /tmp/smoke && npm init -y >/dev/null
-          npm install --no-audit --no-fund /tmp/pack/mfup-client-*.tgz /tmp/pack/mfup-react-*.tgz react@18
+          npm install --no-audit --no-fund /tmp/pack/mfup-client-*.tgz /tmp/pack/mfup-react-*.tgz /tmp/pack/mfup-server-*.tgz react@18
           node --input-type=module -e "
           import * as c from '@mfup/client';
           import * as r from '@mfup/react';
+          import * as s from '@mfup/server';
           if (typeof c.MfupSession !== 'function') throw new Error('MfupSession missing');
           if (c.FrameTag.NODE !== 1) throw new Error('FrameTag broken');
           if (typeof r.useMfupUpload !== 'function') throw new Error('useMfupUpload missing');
+          if (typeof s.createMfup !== 'function') throw new Error('createMfup missing');
+          const m = s.createMfup({ baseDir: '/tmp/smoke-uploads', authorize: async () => ({}) });
+          if (typeof m.handle !== 'function' || typeof m.upgrade !== 'function') throw new Error('handler pair missing');
+          await m.close();
           console.log('npm pack smoke OK');
           "
 
@@ -76,19 +100,36 @@ jobs:
   # ---------------------------------------------------------------------
   # Full-stack e2e on Linux: the real docker-compose stack inside the
   # runner, all three engines, including kill/resume chaos tests.
+  # Matrix: the SAME suite runs against the Python backend (mfup-fastapi)
+  # and the Node backend (@mfup/server) — the wire-compatibility contract.
   # ---------------------------------------------------------------------
   linux-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [python, node]
+    name: linux-e2e (${{ matrix.backend }})
+    env:
+      COMPOSE_FILES: >-
+        -f e2e/docker-compose.yaml
+        ${{ matrix.backend == 'node' && '-f e2e/docker-compose.node.yaml' || '' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start stack
-        run: docker compose -f e2e/docker-compose.yaml up -d
-
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
+      - name: Build @mfup/server (bind-mounted into the backend container)
+        if: matrix.backend == 'node'
+        run: |
+          npm ci
+          npm run build -w @mfup/server
+
+      - name: Start stack
+        run: docker compose ${{ env.COMPOSE_FILES }} up -d
 
       - name: Install Playwright
         working-directory: e2e
@@ -106,8 +147,8 @@ jobs:
             sleep 3
           done
           echo "::error::stack did not become ready in 120s"
-          echo "--- backend ---"; docker compose -f e2e/docker-compose.yaml logs backend --tail 50
-          echo "--- frontend-build (dist producer) ---"; docker compose -f e2e/docker-compose.yaml logs frontend-build --tail 50
+          echo "--- backend ---"; docker compose ${{ env.COMPOSE_FILES }} logs backend --tail 50
+          echo "--- frontend-build (dist producer) ---"; docker compose ${{ env.COMPOSE_FILES }} logs frontend-build --tail 50
           exit 1
 
       - name: Run e2e tests
@@ -116,13 +157,13 @@ jobs:
 
       - name: Dump backend logs on failure
         if: failure()
-        run: docker compose -f e2e/docker-compose.yaml logs backend --tail 200
+        run: docker compose ${{ env.COMPOSE_FILES }} logs backend --tail 200
 
       - name: Upload test artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-artifacts
+          name: playwright-artifacts-${{ matrix.backend }}
           path: e2e/test-results/
           retention-days: 7
 
