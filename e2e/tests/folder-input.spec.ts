@@ -18,7 +18,10 @@ test("webkitdirectory input upload via demo page", async ({ page, browserName })
   await page.setInputFiles("#folder-input", dirPath);
 
   await expect(page.locator("#log")).toContainText("Published:", { timeout: 180_000 });
-  await expect(page.locator("#state-badge")).toHaveText("COMMITTED");
+  // On failure, surface WHAT error card flipped the badge — a bare
+  // "Received: FAILED" hides the actual fatal (learned the hard way).
+  const diag = await page.locator("#error-list").innerText().catch(() => "(no error cards)");
+  await expect(page.locator("#state-badge"), `error cards:\n${diag}`).toHaveText("COMMITTED");
 
   // demo uses targetDir "." → files land at uploads/<rootName>/
   const problems = verifyTree(path.join(UPLOADS, rootName), rootName, manifest);

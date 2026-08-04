@@ -702,6 +702,16 @@ class MfupEngine:
                 logger.exception("Control WS error for session %s",
                                  session.session_id if session else "unknown")
             finally:
+                # The session may have been removed — and its SQLite handle
+                # CLOSED — while this socket was still open: publish does
+                # exactly that. Touching session.state/db then raises
+                # sqlite3.ProgrammingError inside this finally and surfaces
+                # as a bogus ASGI exception after a perfectly good upload.
+                # Nothing is left to clean up in that case.
+                if session and registry.get(session.session_id) is not session:
+                    if session.ws is ws:
+                        session.ws = None
+                    session = None
                 if session:
                     # If in COMMITTING state, attempt commit before detaching
                     if session.state == SessionState.COMMITTING:
