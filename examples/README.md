@@ -9,6 +9,7 @@ record of that guide (notes below).
 | Example | Pattern it proves |
 |---|---|
 | [`multiuser-scopes/`](multiuser-scopes) | auto-created users (id cookie) × three file zones (`workspace` / `scratch` / `uploads`) → server-owned layout `data/<user_id>/<scope>/…`; router mounted under a prefix inside a bigger FastAPI app; one `useMfupUpload`+`useMfupDropzone` pair per zone |
+| [`multiuser-scopes-node/`](multiuser-scopes-node) | the SAME app on the Node server: express + [`@mfup/server`](https://www.npmjs.com/package/@mfup/server) (npm), memory session store (no Redis), the same React client unchanged — the wire-compatibility contract as a consumer would experience it |
 
 ## Running multiuser-scopes
 

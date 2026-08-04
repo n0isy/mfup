@@ -22,11 +22,23 @@ docker compose up -d server-node client-node
 # → http://localhost:20062
 ```
 
-Or natively:
+Or natively (server needs **Node ≥ 22.5** — `node:sqlite`):
 
 ```bash
+# Terminal 1 — server (:8091; data lands in ./data/<uid>/<scope>/,
+# override with DEMO_DATA_DIR; set REDIS_URL to switch to the Redis store)
 cd examples/multiuser-scopes-node/server
-npm install && node server.mjs                     # :8091
-cd ../../multiuser-scopes/client
+npm install
+node server.mjs
+
+# Terminal 2 — the shared client from the Python edition
+cd examples/multiuser-scopes/client
+npm install
 EXAMPLE_BACKEND_URL=http://localhost:8091 npm run dev -- --port 20062
 ```
+
+Then poke the interactive parts: cancel mid-upload (single click, instant),
+drop the same folder twice (the server ASKs — Overwrite / Cancel — while the
+transfer keeps running), and restart the server mid-upload (the client
+reconnects and resumes; with the memory store the session is re-discovered
+from its staging directory on disk).
