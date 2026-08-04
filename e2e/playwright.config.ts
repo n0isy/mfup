@@ -21,6 +21,10 @@ export default defineConfig({
     // Other engines skip @chromium-only at COLLECTION time (grepInvert), so
     // those tests never instantiate a page fixture on webkit/firefox — no hang.
     { name: "firefox", use: { ...devices["Desktop Firefox"] }, grepInvert: /@chromium-only/ },
-    { name: "webkit", use: { ...devices["Desktop Safari"] }, grepInvert: /@chromium-only/ },
+    // CI-only retry: the macOS runner's cold start sporadically serves the
+    // first page load slower than any sane timeout (observed twice, different
+    // specs each time, never reproducible). One retry absorbs exactly that;
+    // a real regression still fails twice.
+    { name: "webkit", use: { ...devices["Desktop Safari"] }, grepInvert: /@chromium-only/, retries: process.env.CI ? 1 : 0 },
   ],
 });

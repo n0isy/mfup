@@ -1,9 +1,19 @@
 /**
  * Three drop zones — workspace / scratch / uploads — each doubling as a
  * plain viewer of that zone's top-level server directory. Built ONLY on the
- * published @mfup/react surface: one useMfupUpload + one useMfupDropzone
- * per zone; the scope travels as session meta and the SERVER decides the
- * final layout (data/<user_id>/<scope>/...).
+ * published @mfup/react surface.
+ *
+ * What each zone demonstrates besides the transfer itself:
+ *   - the INTERACTIVE conflict dialog: drop the same folder twice and the
+ *     server ASKs mid-flight — the transfer keeps running while you decide;
+ *     "No" cancels the whole session (nothing is published), "Overwrite"
+ *     publishes over the old files;
+ *   - cancelling a running upload (abort);
+ *   - live status from the snapshot store: state, reconnect attempts, the
+ *     file currently streaming, accepted bytes/files.
+ *
+ * The scope travels as session meta; the SERVER decides the final layout
+ * (data/<user_id>/<scope>/...).
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -18,15 +28,15 @@ interface Entry {
   size: number | null;
 }
 
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+function fmtBytes(n: number | bigint): string {
+  const v = Number(n);
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  return `${(v / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function ScopeZone({ scope }: { scope: Scope }) {
   const [entries, setEntries] = useState<Entry[] | null>(null);
-  const [lastError, setLastError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -38,20 +48,21 @@ function ScopeZone({ scope }: { scope: Scope }) {
   }, [scope]);
   useEffect(() => { void refresh(); }, [refresh]);
 
-  const { snapshot, pendingAsks, busy, start } = useMfupUpload({
+  const { snapshot, pendingAsks, busy, start, abort } = useMfupUpload({
     meta: { scope },                 // → AuthRequest.meta on the server
-    onPublished: () => { setLastError(null); void refresh(); },
-    onError: (e) => { if (e.fatal) setLastError(`[${e.code}] ${e.message}`); },
+    onPublished: () => void refresh(),
   });
 
   const { isDragActive, getRootProps, getInputProps } = useMfupDropzone({
     disabled: busy,
-    onSource: (src) => {
-      start(src).catch((e) => setLastError(e?.message ?? String(e)));
-    },
+    onSource: (src) => { start(src).catch(() => {/* surfaced via snapshot */}); },
   });
 
+  const st = snapshot?.state;
   const pct = snapshot?.fraction != null ? Math.round(snapshot.fraction * 100) : 0;
+  const cancelled = st === "aborted";
+  const failed = st === "failed";
+  const done = st === "committed" && snapshot?.published != null;
 
   return (
     <section className={"zone" + (isDragActive ? " drag" : "")} {...getRootProps()}>
@@ -61,21 +72,48 @@ function ScopeZone({ scope }: { scope: Scope }) {
         <label className="pick">folder<input {...getInputProps({ directory: true })} /></label>
       </header>
 
+      {/* live transfer status, straight from the snapshot store */}
       {busy && (
-        <div className="progress" title={snapshot?.currentFile?.path}>
-          <div style={{ width: `${pct}%` }} />
+        <div className="status">
+          <div className="progress"><div style={{ width: `${pct}%` }} /></div>
+          <div className="statline">
+            <span className="badge">{snapshot?.reconnect
+              ? `reconnecting #${snapshot.reconnect.attempt}`
+              : st}</span>
+            <span className="counts">
+              {snapshot ? `${snapshot.progress.acceptedFiles} files · ${fmtBytes(snapshot.progress.bodyDoneBytes)}` : ""}
+            </span>
+            <button className="abort" onClick={abort}>Cancel upload</button>
+          </div>
+          {snapshot?.currentFile && (
+            <div className="cur" title={snapshot.currentFile.path}>
+              ↑ {snapshot.currentFile.path}
+            </div>
+          )}
         </div>
       )}
 
+      {/* the interactive part: the server asks, the transfer keeps running */}
       {pendingAsks.map((ask) => (
         <div className="ask" key={ask.id}>
-          <span>&ldquo;{ask.name ?? "entry"}&rdquo; exists — overwrite?</span>
-          <button onClick={() => ask.respond("merge_overwrite")}>Yes</button>
-          <button className="no" onClick={() => ask.respond("cancel")}>No</button>
+          <p>
+            <b>&ldquo;{ask.name ?? "entry"}&rdquo; already exists here.</b><br />
+            The upload is still streaming while you decide.
+          </p>
+          <div>
+            <button onClick={() => ask.respond("merge_overwrite")}>Overwrite</button>
+            <button className="no" onClick={() => ask.respond("cancel")}>
+              No — cancel everything
+            </button>
+          </div>
         </div>
       ))}
 
-      {lastError && <div className="error">{lastError}</div>}
+      {done && <div className="note ok">✓ published {snapshot!.published!.length} top-level entr{snapshot!.published!.length === 1 ? "y" : "ies"}</div>}
+      {cancelled && <div className="note warn">upload cancelled — nothing was published, the old files are untouched</div>}
+      {failed && snapshot?.fatalError && (
+        <div className="note err">[{snapshot.fatalError.code}] {snapshot.fatalError.message}</div>
+      )}
 
       <ul className="listing">
         {entries === null && <li className="hint">loading…</li>}
@@ -89,8 +127,9 @@ function ScopeZone({ scope }: { scope: Scope }) {
       </ul>
 
       <footer>
-        Top-level listing straight from the server&rsquo;s disk — a demo
-        viewer, not a file manager.
+        Top-level listing straight from the server&rsquo;s disk (a demo
+        viewer, not a file manager). Tip: drop the <b>same folder twice</b>
+        to see the mid-transfer overwrite dialog.
       </footer>
     </section>
   );
