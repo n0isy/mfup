@@ -80,11 +80,20 @@ jobs:
       - name: Ensure npm >= 11.5.1 (OIDC support)
         run: npm install -g npm@latest && npm --version
       - name: Publish @mfup/client and @mfup/react (OIDC, provenance auto)
+        # Skip versions already on the registry — reruns and partial releases
+        # must be idempotent, and 0.2.0 was first-published manually anyway.
         run: |
           npm ci
           npm run build
-          npm publish -w @mfup/client --access public
-          npm publish -w @mfup/react --access public
+          for dir in client react; do
+            pkg="@mfup/$dir"
+            v=$(node -p "require('./packages/$dir/package.json').version")
+            if npm view "$pkg@$v" version >/dev/null 2>&1; then
+              echo "$pkg@$v already published — skipping"
+            else
+              npm publish -w "$pkg" --access public
+            fi
+          done
 
   publish-pypi:
     needs: build
@@ -101,3 +110,6 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-py/
+          # Idempotent reruns: files already on PyPI are skipped, not fatal
+          # (e.g. re-running after adding the second pending publisher).
+          skip-existing: true
