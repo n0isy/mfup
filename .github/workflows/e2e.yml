@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Start stack
-        run: docker compose up -d
+        run: docker compose -f e2e/docker-compose.yaml up -d
 
       - uses: actions/setup-node@v4
         with:
@@ -106,8 +106,8 @@ jobs:
             sleep 3
           done
           echo "::error::stack did not become ready in 120s"
-          echo "--- backend ---"; docker compose logs backend --tail 50
-          echo "--- frontend-build (dist producer) ---"; docker compose logs frontend-build --tail 50
+          echo "--- backend ---"; docker compose -f e2e/docker-compose.yaml logs backend --tail 50
+          echo "--- frontend-build (dist producer) ---"; docker compose -f e2e/docker-compose.yaml logs frontend-build --tail 50
           exit 1
 
       - name: Run e2e tests
@@ -116,7 +116,7 @@ jobs:
 
       - name: Dump backend logs on failure
         if: failure()
-        run: docker compose logs backend --tail 200
+        run: docker compose -f e2e/docker-compose.yaml logs backend --tail 200
 
       - name: Upload test artifacts on failure
         if: failure()

@@ -8,6 +8,9 @@ export interface ProgressSnapshot {
   scanEstUnits: bigint;
   /** Bytes accepted by the server (from FILE_ACK) */
   bodyDoneBytes: bigint;
+  /** Bytes handed to the transport (chunks written). Runs ahead of
+   * bodyDoneBytes; drives smooth in-flight progress between server ACKs. */
+  bodySentBytes: bigint;
   /** Estimated total body bytes (from size hints) */
   bodyEstBytes: bigint;
   /** Number of files fully accepted */
@@ -35,7 +38,14 @@ export class ProgressTracker {
 
   // Body counters
   private _bodyDone = 0n;
+  private _bodySent = 0n;
   private _bodyEst = 0n;
+
+  // Send-progress notifications are rate-limited (a chunk writer can tick
+  // hundreds of times a second); trailing timer so the last value lands.
+  private static readonly SENT_NOTIFY_MS = 200; // ≤5 updates/sec
+  private _lastSentNotify = 0;
+  private _sentTimer: ReturnType<typeof setTimeout> | null = null;
 
   // File counters
   private _acceptedFiles = 0;
@@ -70,6 +80,26 @@ export class ProgressTracker {
     if (bytes > this._bodyDone) {
       this._bodyDone = bytes;
       this.notify();
+    }
+  }
+
+  /** Cumulative bytes written to the transport. Fires listeners at most
+   * every SENT_NOTIFY_MS so per-chunk calls stay cheap and UIs get a smooth
+   * ~5 Hz motion instead of either a firehose or 2 MiB jumps. */
+  setBodySent(total: bigint): void {
+    if (total <= this._bodySent) return;
+    this._bodySent = total;
+    const now = Date.now();
+    const elapsed = now - this._lastSentNotify;
+    if (elapsed >= ProgressTracker.SENT_NOTIFY_MS) {
+      this._lastSentNotify = now;
+      this.notify();
+    } else if (this._sentTimer === null) {
+      this._sentTimer = setTimeout(() => {
+        this._sentTimer = null;
+        this._lastSentNotify = Date.now();
+        this.notify();
+      }, ProgressTracker.SENT_NOTIFY_MS - elapsed);
     }
   }
 
@@ -109,6 +139,7 @@ export class ProgressTracker {
       scanDoneUnits: this._scanDone,
       scanEstUnits: this._scanEst,
       bodyDoneBytes: this._bodyDone,
+      bodySentBytes: this._bodySent,
       bodyEstBytes: this._bodyEst,
       acceptedFiles: this._acceptedFiles,
       skippedFiles: this._skippedFiles,
@@ -133,7 +164,13 @@ export class ProgressTracker {
 
     let bodyFrac = 0;
     if (this._bodyEst > 0n) {
-      bodyFrac = Number(this._bodyDone * 10000n / this._bodyEst) / 10000;
+      // Blend in transport progress: the bar moves WHILE a chunk is being
+      // sent, not only when the server ACKs a whole 2 MiB batch. Sent bytes
+      // are clamped to the estimate (retries can resend) and never move the
+      // bar backwards (monotonic clamp below).
+      const sent = this._bodySent > this._bodyEst ? this._bodyEst : this._bodySent;
+      const ahead = sent > this._bodyDone ? sent : this._bodyDone;
+      bodyFrac = Number(ahead * 10000n / this._bodyEst) / 10000;
     }
 
     const raw = 0.1 * scanFrac + 0.9 * bodyFrac;

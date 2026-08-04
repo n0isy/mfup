@@ -24,7 +24,7 @@ code { background: #1a222c; padding: .1em .35em; border-radius: 4px; }
 
 .status { display: flex; flex-direction: column; gap: .35rem; }
 .progress { height: 6px; background: #1a222c; border-radius: 3px; overflow: hidden; }
-.progress > div { height: 100%; background: #4da3ff; transition: width .1s; }
+.progress > div { height: 100%; background: #4da3ff; transition: width .25s linear; }
 .statline { display: flex; align-items: center; gap: .6rem; font-size: .78rem; }
 .badge { background: #16324a; color: #7fc0ff; padding: .1rem .5rem; border-radius: 4px; letter-spacing: .04em; }
 .counts { color: #7b8894; flex: 1; }

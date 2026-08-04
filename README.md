@@ -44,12 +44,20 @@ Around the packages:
 - [`benchmarks/`](benchmarks) — the naive POST-per-file baseline and the
   race methodology.
 
-## Quick start (dev stack)
+## Quick start
 
 ```bash
-docker compose up -d          # redis + backend + demo build + caddy on :20060
-# demo:        http://localhost:20060/
-# react demo:  http://localhost:20060/react.html
+docker compose up -d          # the CONSUMER example (multiuser scopes)
+# app:  http://localhost:20061   — uploads land in ./uploads/<user_id>/<scope>/
+```
+
+The main compose app is `examples/multiuser-scopes` running the way an
+outside integrator would (deps from PyPI/npm, not from this repo). The
+internal protocol dev/test stack (e2e harness, chaos tests, benchmark
+baseline) is separate:
+
+```bash
+docker compose -f e2e/docker-compose.yaml up -d    # :20060
 ```
 
 ## Integration guide — standalone, step by step

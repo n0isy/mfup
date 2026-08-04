@@ -12,7 +12,8 @@ import * as path from "node:path";
 import { standardManifest } from "../lib/gen.js";
 
 const UPLOADS = path.resolve(import.meta.dirname, "../../uploads");
-const REPO = path.resolve(import.meta.dirname, "../..");
+// compose commands run against the TEST stack: e2e/docker-compose.yaml
+const REPO = path.resolve(import.meta.dirname, "..");
 
 function redisCli(args: string): string {
   return execSync(`docker compose exec -T redis redis-cli ${args}`, { cwd: REPO }).toString().trim();

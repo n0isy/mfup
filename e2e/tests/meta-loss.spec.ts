@@ -19,7 +19,8 @@ import * as path from "node:path";
 import { type ManifestEntry, totalBytes, verifyTree } from "../lib/gen.js";
 
 const UPLOADS = path.resolve(import.meta.dirname, "../../uploads");
-const REPO = path.resolve(import.meta.dirname, "../..");
+// compose commands run against the TEST stack: e2e/docker-compose.yaml
+const REPO = path.resolve(import.meta.dirname, "..");
 
 function manySmallFiles(count: number): ManifestEntry[] {
   // ~14 KB average × 600 ≈ 8.4 MB → several 2 MiB batch POSTs, so a kill

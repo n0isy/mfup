@@ -88,27 +88,34 @@ export async function probeStreaming(opts: {
 
   const start = performance.now();
 
-  // Race: PROBE_ACK on control channel vs timeout.
+  // Race: PROBE_ACK on control channel vs the fetch settling vs timeout.
   // The server includes first_chunk_bytes in PROBE_ACK so we can verify the
   // browser actually sent our binary data (not "[object ReadableStream]" = 23 bytes).
   const streaming = await new Promise<boolean>((resolve) => {
     let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      unsub();
-      resolve(false);
-    }, timeoutMs);
-
-    const unsub = control.on("probe_ack", (msg) => {
+    const settle = (verdict: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      unsub();
+      resolve(verdict);
+    };
+
+    const timer = setTimeout(() => settle(false), timeoutMs);
+
+    const unsub = control.on("probe_ack", (msg) => {
       // Verify server received real binary data, not a stringified ReadableStream
-      const receivedBytes = msg.first_chunk_bytes ?? 0;
-      resolve(receivedBytes >= CHUNK_SIZE);
+      settle((msg.first_chunk_bytes ?? 0) >= CHUNK_SIZE);
     });
+
+    // Chrome on plain HTTP/1.1 rejects streaming bodies IMMEDIATELY
+    // (ERR_H2_OR_QUIC_REQUIRED) — without listening to the fetch, the probe
+    // sat out the full timeout before falling back to batch. An early
+    // response (proxy buffered the whole body → non-duplex) is a "no" too.
+    fetchPromise.then(
+      (resp) => { if (!resp.ok) settle(false); },
+      () => settle(false),
+    );
   });
 
   const latencyMs = streaming ? Math.round(performance.now() - start) : 0;

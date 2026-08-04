@@ -261,6 +261,9 @@ export class MfupSession {
   private scanEst = 0n;
   private bodyEstTotal = 0n;
   private bodyDoneTotal = 0n;
+  // Cumulative bytes handed to the transport (monotonic; retries re-add —
+  // the tracker clamps against the estimate).
+  private bodySentTotal = 0n;
   private scanSealed = false;
 
   // Progress
@@ -468,6 +471,11 @@ export class MfupSession {
   // -- lifecycle -----------------------------------------------------------
 
   async connect(): Promise<void> {
+    // A cancelled/failed session must stay dead — connect() would otherwise
+    // open fresh channels nobody will ever close.
+    if (this._state === "aborted" || this._state === "failed") {
+      throw new Error(`cannot connect: session is ${this._state}`);
+    }
     this.legId = genUUID();
     const isResume = this.epoch > 0;
 
@@ -735,13 +743,17 @@ export class MfupSession {
     this._scanGateResolve?.();
     this._scanGateResolve = null;
 
+    // State first: every loop (pump, chunk writer, finalizeScan) keys off it.
+    this.setState("aborted");
     this.control?.sendAbort(code, reason);
-    const frame: ClientAbortFrame = { tag: FrameTag.CLIENT_ABORT, code, reason };
-    try { this.data?.write(frame); } catch { /* expected during abort teardown */ }
-    this.data?.close();
+    // Tear the data channel down HARD. close() would be the graceful path —
+    // flush the whole buffered batch (megabytes on a slow link) before
+    // returning; a user cancelling wants the network to stop NOW. The server
+    // learns about the abort over the control WS, and abortCtrl kills any
+    // in-flight POST.
+    this.data?.abort(reason);
     this.control?.close();
     this.abortCtrl.abort();
-    this.setState("aborted");
     this.emit("abort", { by: "client", code, reason });
     // Reject any pending commit wait
     this._commitReject?.(new Error("aborted"));
@@ -877,6 +889,10 @@ export class MfupSession {
       while (pos < raw.length) {
         await this.waitIfPaused();
 
+        // Terminal states stop the writer immediately — without this an
+        // abort() kept slicing the file into a dead channel.
+        if (this._state === "aborted" || this._state === "failed") return;
+
         if (this.rejectedFiles.has(file.nodeId)) {
           file.status = "rejected";
           this.progress.skipFile();
@@ -900,6 +916,9 @@ export class MfupSession {
         };
         this.safeWrite(chunkFrame);
         offset += BigInt(piece.length);
+        // Drive the in-flight progress (rate-limited inside the tracker).
+        this.bodySentTotal += BigInt(piece.length);
+        this.progress.setBodySent(this.bodySentTotal);
 
         // Backpressure: in batch mode, flush if buffer exceeds threshold
         if (this.data) {
@@ -951,6 +970,14 @@ export class MfupSession {
 
     // Commit loop: send SESSION_END, wait for COMMIT_OK or COMMIT_RETRY
     while (true) {
+      // An abort (user cancel) may land while the pump drains — entering the
+      // commit phase then flipped the UI to "committing" and hung waiting
+      // for a COMMIT_OK that can never come. (Cast: state mutates across
+      // awaits, TS narrowing does not know that.)
+      const st = this._state as SessionState;
+      if (st === "aborted" || st === "failed") {
+        throw new Error(`session ended in state: ${st}`);
+      }
       const endFrame: SessionEndFrame = {
         tag: FrameTag.SESSION_END,
         rootSummary: {
@@ -1080,6 +1107,12 @@ export class MfupSession {
   }
 
   private setState(s: SessionState): void {
+    // aborted/failed are terminal. Without this freeze, a reconnect that was
+    // already in flight when the user cancelled could finish AFTER abort()
+    // and resurrect the session (aborted → active → …committing).
+    if ((this._state === "aborted" || this._state === "failed") && s !== this._state) {
+      return;
+    }
     this._state = s;
     if (s === "committed" || s === "aborted" || s === "failed") {
       this._reconnectInfo = null;
@@ -1441,6 +1474,15 @@ export class MfupSession {
 
       try {
         await this.connect();
+        // abort() may have raced the (awaited) connect — do not resurrect.
+        if ((this._state as SessionState) === "aborted") {
+          this.data?.abort("aborted during reconnect");
+          this.control?.close();
+          this._reconnectResolve?.();
+          this._reconnectPromise = null;
+          this._reconnectResolve = null;
+          return;
+        }
         this.requeuePendingFiles();
         this.kickPump();
         // Signal reconnect complete — finalizeScan can proceed
