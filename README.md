@@ -15,8 +15,9 @@ files) from a browser to a server — resumable, interactive, atomic.
   frames, CRC-32C per chunk). Streaming (`duplex:"half"`) where the browser
   supports it, atomic batched POSTs everywhere else — detected by a live probe.
 - **Resume** across page reloads, network drops, server restarts and worker
-  failovers (per-session SQLite journal, epoch/leg fencing, lazy recovery
-  from a Redis index).
+  failovers (per-session SQLite journal, epoch/leg fencing, session-store
+  recovery — Redis for multi-worker, or the Node server's default in-memory
+  store with a filesystem rescan on restart).
 - **Interactive transfers**: the server ASKs the user mid-flight (overwrite?
   cancel?) while the bytes keep flowing — the non-blocking control channel is
   the core of the design.
@@ -88,11 +89,12 @@ pip install "mfup-core @ git+https://github.com/n0isy/mfup#subdirectory=server/m
             "mfup-fastapi @ git+https://github.com/n0isy/mfup#subdirectory=server/mfup-fastapi"
 ```
 
-Requirements: **Redis** (session expiry index) and a **POSIX filesystem**
-for `MFUP_BASE_DIR` — publish is a same-filesystem `rename`, so the base dir
-and your target dirs must live on one mount (per-user homes from the
-authorize hook each stage inside themselves, so separate mounts per user
-are fine).
+Requirements: **Redis** (the Python server's session expiry index; the Node
+server defaults to an in-memory store and takes Redis as an opt-in) and a
+**POSIX filesystem** for `MFUP_BASE_DIR` — publish is a same-filesystem
+`rename`, so the base dir and your target dirs must live on one mount
+(per-user homes from the authorize hook each stage inside themselves, so
+separate mounts per user are fine).
 
 ### 2. Write your authorize hook (do not skip)
 
@@ -136,6 +138,7 @@ Verify:
 ```bash
 curl -s localhost:8070/health
 # {"status":"ok","protocol":"MFUP/2","crc32c":"native"}   ← "native" matters
+# (the Node server reports "js-table" — that is its normal fast path)
 ```
 
 ### 4. Put it behind your reverse proxy
@@ -192,7 +195,7 @@ resumes from the accepted offsets.
 ### 7. Production checklist
 
 - [ ] `MFUP_AUTHORIZE` set (no allow-all warning in the log)
-- [ ] `/health` says `"crc32c":"native"`
+- [ ] `/health` says `"crc32c":"native"` (Python) / `"js-table"` (Node)
 - [ ] `MFUP_ADMIN_TOKEN` set (or admin routes stay disabled — also fine)
 - [ ] quotas set in `AuthResult` (`max_total_bytes` / `max_files`)
 - [ ] one worker per engine, or replicas with **sticky routing** on
@@ -208,10 +211,16 @@ resumes from the accepted offsets.
 
 ## Testing
 
-- `server/tests` — 49 unit tests (protocol vectors, edge cases, hooks).
+- `server/tests` — pytest hardening suite for the Python server (34 tests →
+  41 cases: protocol vectors, traversal, quotas, recovery, hooks).
+- `packages/server/test` — vitest (69 cases): byte-level codec pinned
+  against the client encoders, a mirror of the Python hardening suite, and
+  wire-level integration over real http + WebSocket (incl. RESUME).
 - `e2e/` — Playwright suites on chromium/firefox/webkit, incl. chaos tests
   (backend killed mid-transfer, byte-exact disk verification).
-- CI: Linux full-stack in docker compose, native WebKit on macOS.
+- CI: Linux full-stack in docker compose as a **python | node backend
+  matrix** (the same suite proves wire compatibility of both servers),
+  native WebKit on macOS.
 
 ## License
 
