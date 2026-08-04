@@ -62,10 +62,14 @@ test.describe("retention", () => {
     // startup reconciler must remove it.
     const fakeSid = `orphan-${Date.now().toString(36)}`;
     const cdir = `/data/uploads/.incoming.${fakeSid}`; // path inside container
+    // Age past ORPHAN_GRACE (600s). Explicit UTC timestamp, not GNU
+    // "20 minutes ago": busybox touch (alpine-based backends) rejects
+    // relative dates, and both busybox and GNU accept this format.
+    const aged = new Date(Date.now() - 20 * 60 * 1000).toISOString().slice(0, 19).replace("T", " ");
     const plant = [
       `mkdir -p ${cdir}/payload`,
       `dd if=/dev/zero of=${cdir}/payload/leftover.bin bs=1024 count=1 2>/dev/null`,
-      `touch -d '20 minutes ago' ${cdir}`, // age past ORPHAN_GRACE (600s)
+      `TZ=UTC touch -d '${aged}' ${cdir}`,
     ].join(" && ");
     execSync(`docker compose exec -T backend sh -c ${JSON.stringify(plant)}`, { cwd: REPO });
 
