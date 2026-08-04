@@ -1,710 +1,360 @@
 # MFUP/2 — Multi-File Upload Protocol
 
-**Packages:** `mfup-core` + `mfup-fastapi` (Python), `@mfup/client` + `@mfup/react` (TypeScript)
+**Packages:** `mfup-core` + `mfup-fastapi` (PyPI) · `@mfup/client` + `@mfup/react` (npm)
 **Languages:** Python 3.10+ · TypeScript 5.5 (ES2022, browser-only)
 **Frameworks:** FastAPI + uvicorn (server) · zero runtime dependencies (client) · Vite 6 (demo)
 **Protocol version:** `MFUP/2`
 **Stores:** SQLite (one DB per session) · Redis (session expiry index) · POSIX filesystem
-**Server runtime dependency:** the C-accelerated `crc32c` package (hard requirement — see §3.3)
+**Hard runtime dependency:** the C-accelerated `crc32c` package (§3.2)
+**License:** MIT
 
----
-
-## 0. Revision — post-hardening changes
-
-This document was first written as an audit of the initial experiment. The
-protocol was then hardened for production. This section is the authoritative
-list of what changed; the per-module sections and §7 have been updated to
-match. Where a subsection below still describes old behaviour, §0 wins.
-
-**Correctness**
-- **False `COMMIT_OK` on an incomplete tree — fixed.** A data POST that died in
-  transit took its `NODE` frames with it, leaving files the server never heard
-  of; `get_incomplete_files()` couldn't see them, so the session committed
-  short. Now closed by four layers: atomic buffered batch POSTs (seq advances
-  only after the whole body is processed), client-side transport retry of a
-  failed batch POST on the same seq, client re-send of `NODE` chains on
-  reconnect and on the new `unknown_node` NACK, and a server **node-count
-  commit invariant** (`SESSION_END.scan_done_units` vs `COUNT(nodes)`) that
-  emits `COMMIT_RETRY` / aborts rather than committing short (§3.1, §3.2, §4.2).
-- `resolve_payload_path` now **raises** on a broken parent chain or a cycle;
-  previously it `break`-ed and silently resolved a *shortened* path, writing the
-  file into the wrong directory (§3.4).
-- `MAX_COMMIT_RETRIES` caps **both** COMMIT_RETRY branches; a file that can
-  never complete aborts the session instead of ping-ponging forever (§3.2).
-- Duplicate `FILE_OPEN` closes the previous writer (was an fd leak); a session
-  that reaches `COMMITTING` and then goes idle is reverted to `WAITING_RESUME`
-  (was stuck until TTL) (§3.2).
-
-**Retention (clean exit — no disk/Redis garbage)**
-- **Filesystem orphan reconciliation** (`reconcile_orphans`, at startup and
-  every Nth sweep) reclaims staging dirs the Redis-zset-driven sweeper can
-  never see — orphaned by a crash between `rmtree` and `ZREM`, a silently
-  failed `rmtree`, or a Redis flush. Backed by `SessionIndex.is_registered`
-  (§3.1, §3.5). This retires the §7.1 "orphan is unreclaimable" gap.
-- Redis-registration failure during `HELLO` now rolls back the in-memory
-  session **and** its staging dir instead of orphaning them (§3.5).
-- The client makes `cancel` terminal locally and stops reconnecting on a fatal
-  handshake rejection, so a cancelled/aborted session's WS closes promptly and
-  the server reclaims its staging + Redis entry (§4.2).
-
-**Storage / adversarial-input robustness (one bad node never 500s the upload)**
-- `ENOSPC`/`EDQUOT`/`EROFS`/`EFBIG` on write or open → `SESSION_ABORT`
-  `storage_full`, not an infinite retry (§3.2).
-- `dir`-on-`file` / `file`-on-`dir` payload collisions → `REJECT_FILE`, not an
-  uncaught exception → 500. This **wires the previously-dead `REJECT_FILE`
-  path** (§3.2, §7.2).
-- Illegal / traversal node names → counted in the commit invariant and
-  `REJECT_FILE`d (no `unknown_node` NACK storm) (§3.4).
-
-**Security**
-- `POST …/publish` now requires the session's `X-MFUP-Token`; the four admin
-  routes require `MFUP_ADMIN_TOKEN` (unset ⇒ disabled) (§3.1, §7.5).
-- `?epoch=` is **mandatory** on data POSTs (missing ⇒ `400`); the old `-1`
-  opt-out that bypassed epoch fencing is gone (§3.1).
-- `FrameReader` caps declared `frame_len` (default 1 MiB); an oversized prefix
-  can no longer grow the buffer without bound (§3.3, §7.3).
-
-**Performance**
-- **CRC-32C is now a hard C dependency** (the `crc32c` package, ~GB/s). The
-  pure-Python fallback (~6 MB/s, ~10 ms/64 KiB blocking the event loop) was
-  removed deliberately — fail loudly at import rather than degrade silently
-  (§3.3). `/health` reports `"crc32c":"native"`.
-- `SessionDB` supports **deferred-commit batching**; a data POST wraps its
-  frames in one SQLite transaction instead of ≥2 commits per chunk (§3.4).
-- `publish_session` runs in a thread (`asyncio.to_thread`), off the event loop
-  (§3.6). Progress rendering in the demo is coalesced to one paint per frame.
-
-**Tests & CI**
-- 23 new server edge-case tests (names, collisions, ENOSPC, retry cap,
-  traversal, dup `FILE_OPEN`); `asyncio_mode=auto` (§3.9).
-- A Playwright e2e suite (`e2e/`, 3 engines) with byte-exact on-disk
-  verification, resume/meta-loss chaos tests (`docker compose kill`
-  mid-transfer), a 4-case conflict matrix, and a retention suite (§6.7).
-- GitHub Actions CI (`.github/workflows/e2e.yml`): `server-unit`, `linux-e2e`
-  (full compose stack), `macos-webkit` (native-Safari proxy on `macos-15`).
-  The demo build is deterministic (`npm ci` + committed lockfile + `npm run`,
-  never `npx vite`) (§6.7).
-
-**Client**
-- `nodeMeta` registry + NODE-chain resend; batch transport retry; NACK-storm
-  guard (`MAX_FILE_NACKS`); probe verdict cached in `localStorage` (§4.2, §4.4).
-- Demo: the folder picker is now wired (the `uploadFileList` path had no UI
-  entry point), Reset aborts a live session instead of orphaning it, publish
-  carries the token (§5.1).
-
-**Embeddability stage (see docs/EXTENDING.md — the integration contract)**
-- **`resume_token` is now SERVER-issued**: `HELLO` carries no token; `HELLO_OK`
-  returns one (`secrets.token_urlsafe(32)`). A client-chosen token was a
-  self-signed credential. Protocol change made pre-publication by design.
-- **Config-driven authorization**: `MFUP_AUTHORIZE="pkg.module:callable"`
-  (`mfup/hooks.py` — `AuthRequest`/`AuthResult`). Deny → `auth_failed`;
-  the hook can pin `target_dir` and set quotas. Unset ⇒ allow-all with a loud
-  startup warning; a broken path kills startup.
-- **Quotas enforced**: `max_total_bytes` / `max_files` from the hook →
-  `SESSION_ABORT quota_exceeded`; counters re-seeded from the DB on every
-  `attach_leg` so resume never double-counts. `MAX_CHUNK_BYTES` is now
-  enforced too (oversized `FILE_CHUNK` → `NACK server_policy`) — retiring
-  part of the §7.3 gap.
-- **Lazy-resume**: a `RESUME` at a worker that has never seen the session
-  recovers it from Redis meta + on-disk SQLite and takes ownership — deploys,
-  restarts and failovers work; round-robin without sticky routing still does
-  not (§ EXTENDING 4).
-- Client id generation falls back to a `getRandomValues`-based UUIDv4 where
-  `crypto.randomUUID` is unavailable (non-secure contexts).
-- **Per-session base_dir** from the authorize hook (per-user homes): staging
-  is created inside the home so publish stays a same-filesystem rename;
-  recovery derives the base from the staging dir's parent (§ EXTENDING 2).
-- **Consumer session object + per-file mapping**: `MfupSessionConfig.meta` →
-  `HELLO.meta` → `AuthRequest.meta` (untrusted, size-capped) — drives
-  authorization; `MFUP_MAP_FILE` hook (`FileMapRequest`) decides each file's
-  final path at PUBLISH time (layout by type/scope). Whole plan validated
-  before anything moves (escape / duplicate destination → `409
-  mapping_error`, staging intact); ingest-time ASK disabled under mapping.
-  Quotas, `AuthResult.context` and `meta` are persisted in SQLite (schema
-  migration) so they survive restarts / lazy-resume (§ EXTENDING 2b).
-
-**Packaging stage (four publishable packages; monorepo restructured)**
-- **Repo layout**: `client/` → `packages/client` (`@mfup/client`), new
-  `packages/react` (`@mfup/react`); `server/mfup/` split into
-  `server/mfup-core/mfup_core` (protocol, storage, session machine, publish,
-  Redis index, hooks — no FastAPI import) and
-  `server/mfup-fastapi/mfup_fastapi` (config + engine + standalone app).
-  npm workspaces at the root; the demo still builds against package SOURCE
-  via vite aliases.
-- **`MfupEngine` / `MfupConfig`**: no module-level state or import-time env
-  reads in the library path; all routes live on an `APIRouter` built per
-  engine instance, mountable under any prefix (`include_router(prefix=
-  "/api/uploads")` — the client's `serverUrl` may carry the same prefix).
-  Hooks accepted as callables or dotted paths. `python -m mfup_fastapi` /
-  `mfup_fastapi.app:app` is a thin `create_app(MfupConfig.from_env())`.
-- **`on_committed` hook + `engine.publish()`**: server-side commit
-  notification (`CommitEvent` with meta/context); returning `"publish"`
-  publishes immediately; consumer backends can call
-  `engine.publish(session_id)` themselves (typed errors). Hook errors are
-  contained — never damage a commit.
-- **Client event model + snapshot store** (docs/CLIENT.md): file-level
-  events (`file:start/ack/reject`), `ask` events carrying a payload and
-  `respond()` (server ASK enriched with additive `code`/`node_id`/`name`
-  fields), `abort`/`published` events, `settleAsks()`, `publish()` on the
-  session, DnD source extraction (`sourceFromDataTransfer`/`sourceFromInput`)
-  moved from the demo into the SDK, and a coalesced immutable snapshot store
-  (`subscribe`/`getSnapshot`) implementing the `useSyncExternalStore`
-  contract. `export const enum` eliminated (isolatedModules consumers).
-- **`@mfup/react`**: `useMfupUpload` (auto-publish after `settleAsks`,
-  StrictMode-safe, uploads survive unmount by default), `useMfupDropzone`,
-  `useMfupSession`, `MfupProvider`. The demo's `react.html` page is built
-  solely on the public hook surface and is covered by e2e.
-- **Publication hygiene**: MIT LICENSE, per-package READMEs, `py.typed`,
-  exports maps + `sideEffects:false`, versions 0.2.0 everywhere (wire
-  protocol stays `MFUP/2`); CI gained a `packaging` job (npm pack → tarball
-  install → Node import smoke; `python -m build` → `twine check` → wheel
-  install smoke); `.github/workflows/release.yml` publishes all four on a
-  `v*` tag (PyPI trusted publishing + npm provenance; one-time registry
-  setup documented in the workflow).
+The problem: moving whole directory trees — `node_modules`-scale, tens of thousands of
+small files — from a browser to a server, resumably, interactively, and atomically. The
+industry default is one multipart POST per file; the measured cost of that on a 188-file,
+1.0 MB tree is 17.2 s, of which only ~1.3 s is transfer and the rest is round-trip latency
+and `FormData` construction (§7).
 
 ---
 
 ## 1. Architecture
 
-### 1.1 The problem
+### 1.1 The split every design decision follows
 
-MFUP/2 exists to make a browser upload an entire directory tree — hundreds of files — without paying one HTTP round-trip per file. The project's design note (`docs/MFUP_RU.md`) records the motivating measurement: a 188-file, 1.0 MB project folder took **17.2 seconds** over conventional `multipart/form-data` POST-per-file, of which roughly 13 seconds was pure round-trip latency and ~2.9 s was `FormData` construction. Actual data transfer was ~1.3 s. The bottleneck was the protocol, not the bytes.
-
-MFUP/2 collapses that to **two HTTP requests and one WebSocket** for the whole tree: a single streaming `POST` carrying every file body, a control WebSocket for metadata and acknowledgements, and a final `POST` to publish. The repository ships a side-by-side benchmark page (§5.2) that races the two approaches in the same browser.
-
-### 1.2 Two channels, one session
-
-A session is a triple of identifiers — `session_id`, `resume_token`, and a per-connection `leg_id` — shared across two cooperating transports:
+MFUP/2 separates **control** from **data**, and separates both from **durability**.
 
 ```
-                    ┌─────────────────────────────────────────────┐
-   browser          │                                   server    │
-                    │                                             │
-  MfupSession       │   WebSocket  /mfup/control                  │
-   ├─ ControlChannel├──────────────────────────────────────────► JSON control plane
-   │                │   HELLO / RESUME / ACTION / CLIENT_ABORT    │   ├─ handshake
-   │                │ ◄──────────────────────────────────────────┤   ├─ FILE_ACK / NACK
-   │                │   HELLO_OK / FILE_ACK / ASK / COMMIT_OK     │   ├─ ASK (conflicts)
-   │                │                                             │   └─ COMMIT_OK / RETRY
-   ├─ DataChannel   │   POST /mfup/data/{session_id}/{leg_id}     │
-   │                ├──────────────────────────────────────────► binary frame stream
-   │                │   [u32 len][u8 tag][payload] × N            │   └─ writes to staging
-   │                │                                             │
-   └─ ProgressTracker   POST /mfup/sessions/{id}/publish          │
-                    ├──────────────────────────────────────────► os.rename → target_dir
-                    └─────────────────────────────────────────────┘
+browser                                    server
+┌─────────────────────┐                    ┌──────────────────────────────┐
+│ @mfup/react (hooks) │                    │  host FastAPI app            │
+├─────────────────────┤                    │  └─ include_router(          │
+│ @mfup/client        │                    │       engine.router)         │
+│  ├ MfupSession      │  WS  /mfup/control ├──────────────────────────────┤
+│  ├ ControlChannel   │<══════════════════>│  mfup-fastapi                │
+│  ├ DataChannel      │  POST /mfup/data   │   MfupEngine                 │
+│  ├ ingestion (DnD)  │───────────────────>│    ├ routes + fencing        │
+│  ├ ProgressTracker  │  POST /mfup/probe  │    ├ lifecycle + sweeper     │
+│  └ probe            │───────────────────>│    └ hook invocation         │
+└─────────────────────┘  POST …/publish    ├──────────────────────────────┤
+                         ───────────────── >│  mfup-core (no HTTP at all)  │
+                                            │   ├ FrameReader / CRC-32C    │
+                                            │   ├ LiveSession + Registry   │
+                                            │   ├ SessionDB (SQLite)       │
+                                            │   ├ publish (rename)         │
+                                            │   └ hooks contracts          │
+                                            └───────┬──────────┬───────────┘
+                                                    │          │
+                                         ┌──────────▼──┐  ┌────▼─────────────┐
+                                         │ Redis       │  │ POSIX filesystem │
+                                         │ expiry zset │  │ staging → target │
+                                         └─────────────┘  └──────────────────┘
 ```
 
-**There is no WebRTC anywhere in this codebase.** The term "data channel" refers to the HTTP `POST` data plane (`client/src/data-channel.ts`, `POST /mfup/data/...`), not `RTCDataChannel`. This was verified independently on both sides by grep for `RTCPeerConnection`, `webrtc`, `rtc`, `datachannel`, and `data_channel` — zero hits in `/workspace/client/src` and `/workspace/server`.
+**Control is a WebSocket carrying JSON**; **data is HTTP POSTs carrying length-prefixed
+binary frames**. They are deliberately different transports because they have opposite
+requirements. Control must stay responsive while gigabytes are in flight — that is what
+makes the interactive `ASK` ("this file exists, overwrite?") possible *without pausing the
+transfer*. Data must be able to use whatever the browser and the proxy path actually
+support, which is discovered empirically rather than assumed (§1.4).
 
-The split is deliberate: bulk bytes flow one-way over a transport that never waits for a reply, while every acknowledgement, error, and interactive decision travels out-of-band on the WebSocket. The uploader is therefore never blocked on a response mid-stream.
+**`mfup-core` knows nothing about HTTP.** It receives decoded frames and a duck-typed
+object with a `send_json` method. This is why the session state machine, the SQLite
+journal, the commit invariants, and the publish step are all testable in-process with a
+fake WebSocket and no network (§8).
 
-### 1.3 Interleaved scan and transfer
+### 1.2 Layers and what each one owns
 
-The client does not scan the tree and then upload it. `MfupSession.onDiscover` writes a `NODE` frame the instant a node is found and, for files, queues the body for immediate streaming. Directory metadata, file names, and file contents interleave in a single ordered byte stream:
-
-```
-NODE(1, dir, "src") → NODE(2, file, "index.ts") → FILE_OPEN(2) → FILE_CHUNK(2, …)
-  → FILE_CLOSE(2) → NODE(3, file, "app.ts") → FILE_OPEN(3) → … → SESSION_END
-```
-
-Scan and pump run concurrently and throttle each other through a two-mark gate: ingestion parks when `fileQueue` reaches 10,000 entries (`SCAN_HIGH_WATER`) and resumes below 5,000 (`SCAN_LOW_WATER`). Because the browser File System APIs yield files lazily during traversal, nothing is buffered in memory ahead of the network.
-
-### 1.4 Staging and the two-phase commit
-
-Bytes never land in the caller's target directory during transfer. Each session owns a staging directory whose name is `{MFUP_STAGING_PREFIX}.{session_id}` (default `.incoming.<uuid>`), sited as a **sibling** of the target so that publication is a same-filesystem rename:
-
-```
-<base_dir>/
-  .incoming.<session_id>/
-    state.sqlite            ← all durable session state (WAL mode)
-    payload/                ← mirrors the client's tree
-      src/index.ts
-  <target_dir>/             ← untouched until publish
-```
-
-Three phases separate "received" from "visible":
-
-| Phase | Trigger | What it guarantees |
-|---|---|---|
-| **COMMITTING** | client sends `SESSION_END` | All bodies written to `payload/`; per-chunk CRC-32C verified on arrival |
-| **COMMITTED** | `try_commit()` finds no incomplete files → `COMMIT_OK` | Every file's `accepted_offset == final_size`; nothing is missing |
-| **Published** | explicit `POST /mfup/sessions/{id}/publish` | `os.rename` moves top-level entries into `target_dir` |
-
-Commit is a *state flip*, not a filesystem operation — the pre-commit invariant (`get_incomplete_files()`) is what makes `COMMIT_OK` meaningful. If any file is short, the server sends `COMMIT_RETRY` with the incomplete list and reverts to `ACTIVE` instead of committing, so a truncated upload can never be published as complete. Publish itself is atomic per top-level entry; see §7 for the limits of that guarantee.
-
-### 1.5 Durable state and crash recovery
-
-**State lives in SQLite, not in memory.** `LiveSession.state` is a property that reads `SELECT state FROM sessions` on every access, and every write commits immediately. The same holds for `epoch`, `expires_at`, per-file `accepted_offset`, and the root progress summary. A process restart therefore loses no protocol state.
-
-On startup, `lifespan()` asks Redis (not the filesystem) for the live session set, reopens each session's SQLite DB, and forces any session found in `ACTIVE`, `PAUSED_BY_SERVER`, or `COMMITTING` back to `WAITING_RESUME`. Including `COMMITTING` in that revert is essential: commit is client-initiated, so a session frozen mid-commit would otherwise be unresumable — `data_endpoint` rejects `COMMITTING` with `409` and `resume()` refuses it with `invalid_state`.
-
-Redis holds a sorted set keyed by expiry (`mfup:sessions`) plus a metadata hash per session (`mfup:meta:{id}`). This is what lets both the sweeper and restart recovery work **without ever calling `iterdir()` or opening a SQLite file speculatively** — an explicit design goal stated in the `redis_index.py` docstring and the `SessionRegistry` class docstring.
-
-### 1.6 Resume, legs, and epoch fencing
-
-Every reconnect mints a new `leg_id` and increments the persisted `epoch`. Both are checked on the data path — up front and again on *every streamed chunk* — so a superseded connection whose TCP socket is still alive cannot write into the new leg's file state. Stale requests are rejected with `409 stale leg` or `409 stale_epoch`, and an in-flight body is abandoned mid-stream the moment the epoch changes.
-
-Resume is byte-exact rather than file-exact. `RESUME_OK` reports each file's server-side `accepted_offset`; the client seeks its local `Blob` to that offset (`blobChunks(blob, offset)`) and re-streams only the remainder. On the server side, `FileWriter` opens the final payload path with `r+b`, seeks to `accepted_offset`, and **truncates** — discarding any bytes past the last acknowledged offset, so a resume can leave neither a hole nor a duplicated tail.
-
-Note the deliberate exception: `COMMIT_RETRY` does *not* bump the epoch. The client resends on the same leg and epoch.
-
-### 1.7 Integrity, progress, and conflicts
-
-**Integrity** is per-chunk CRC-32C (Castagnoli, `0x82F63B78`), computed by the client and verified by the server before any write; a mismatch yields `NACK_CHUNK{reason: "bad_checksum"}` and nothing is written. A source comment in `client/src/protocol.ts` records that SHA-256 whole-file hashing was removed because it "was never verified server-side" — CRC-32C per chunk is the only integrity mechanism in the system.
-
-**Progress** is a fixed 10/90 blend, `fraction = 0.1 × scanFrac + 0.9 × bodyFrac`, computed in `bigint` and clamped monotonically (`max(last, min(1, raw))`) so the bar starts moving on the first discovered node and never runs backwards when the scan estimate grows.
-
-**Conflicts** are resolved without stalling the transfer. A separate three-state FSM (`clean` → `conflict_dir` → `conflict_files`) inspects where each node would land; a directory landing on a directory auto-merges silently, while a file-on-file collision sends a single `ASK` to the client. The upload keeps running while the user decides, and the answer (`merge_overwrite` or `cancel`) is applied at publish time.
-
-### 1.8 Layering and where to look
-
-| Layer | Server | Client | Section |
+| Layer | Package | Owns | Never touches |
 |---|---|---|---|
-| Transport / routing | `app.py` — 8 routes, WS + HTTP | `control.ts`, `data-channel.ts`, `probe.ts` | §3.1, §4.4, §4.6, §4.7 |
-| Wire codec | `protocol.py` (decode-only) | `protocol.ts` (encode-only) | §2, §3.3, §4.3 |
-| Session state / orchestration | `session_manager.py` | `session.ts` | §3.2, §4.2 |
-| Persistence | `storage.py` (SQLite + paths), `redis_index.py` | — | §3.4, §3.5 |
-| Materialization | `publish.py` | — | §3.6 |
-| Discovery / IO | — | `ingestion.ts`, `progress.ts`, `errors.ts` | §4.5, §4.8, §4.9 |
+| Hooks | `@mfup/react` | React binding: context, `useSyncExternalStore` adapter, prop getters | protocol, network |
+| Client | `@mfup/client` | Session state machine, ingestion, chunking, retry, progress, probe | server policy |
+| Transport | `mfup-fastapi` | Routes, auth/token/leg/epoch/seq validation, lifecycle, sweeper, hook invocation | durable state |
+| Core | `mfup-core` | Frame codec, session state machine, SQLite journal, CRC verification, publish, hook contracts | HTTP, FastAPI |
+| Stores | — | Redis expiry index; per-session SQLite; POSIX staging + target trees | — |
 
-The codec asymmetry is worth noting: the server only ever *decodes* binary frames and the client only ever *encodes* them, because the reverse direction (server → client) is entirely JSON over the WebSocket. Neither side ships the other half.
+The dependency arrow points one way only: `mfup-fastapi` imports from `mfup_core`;
+`mfup_core` imports nothing from the transport. On the client, `@mfup/react` peer-depends
+on `@mfup/client` and adds no protocol logic.
 
-### 1.9 Deployment shape
+### 1.3 Data flow: one upload, end to end
 
-The whole stack runs from one `docker compose` file with **no Dockerfiles** — stock images, bind-mounted source, dependencies installed in each service's `command`. Caddy is the single published port (`20060:80`) and fronts everything on one origin, so the browser makes no cross-origin request and the stack carries no CORS configuration at all. A deliberately naive baseline server (`benchmarks/trivial-server/`) is deployed alongside as the benchmark control. See §6.
+1. **`HELLO`** over the WebSocket carries the protocol version, a client-generated
+   `session_id`, a `leg_id`, a `target_dir`, and arbitrary `meta`. The server calls the
+   consumer's `authorize` hook, which is the single policy surface: it may deny, pin a
+   per-user `base_dir`, rewrite `target_dir`, and set byte/file quotas. The server then
+   creates the session, registers it in Redis, and replies **`HELLO_OK`** with a
+   **server-issued** `resume_token` and its limits.
+2. **Ingestion** walks the dropped tree (FileSystem handles, `webkitGetAsEntry` entries,
+   `webkitRelativePath` lists, or a flat `File[]`), emitting `NODE` frames that carry
+   structure as `(nodeId, parentId, name)` triples — never as path strings.
+3. **Transfer** runs a scan and a file pump concurrently. Each file emits `FILE_OPEN`,
+   a stream of `FILE_CHUNK` frames (each carrying an absolute offset and a CRC-32C of its
+   payload), then `FILE_CLOSE`. The server verifies each chunk's checksum before writing,
+   writes at the exact offset, and records the new `accepted_offset` in SQLite *after* the
+   write returns — so the durable offset is never ahead of the bytes.
+4. **Acknowledgement** flows back on the control channel: `FILE_ACK` roughly every 256 KiB,
+   `NACK_CHUNK` on checksum/offset/policy failures, `ASK` on a target conflict,
+   `REJECT_FILE`/`PRUNE_NODE` for per-node refusals, `FLOW` for backpressure.
+5. **`SESSION_END`** moves the session to `COMMITTING`. The server checks two invariants:
+   the node count it recorded plus the nodes it deliberately dropped must equal the count
+   the client claims to have scanned, and no file may be incomplete. Failure sends
+   `COMMIT_RETRY` and returns the session to `ACTIVE`; success sends `COMMIT_OK`.
+6. **Publish** `rename()`s staged entries into the target directory — one syscall per
+   top-level entry on the clean path. A `map_file` hook may re-lay-out every file first.
+   Staging is then removed.
 
-**The server is inherently single-process.** `SessionRegistry` is an in-memory dict; a second uvicorn worker would not see sessions created by the first (`registry.get()` → `None` → `410` on data POSTs). Redis indexes sessions for expiry but does not share the live registry.
+### 1.4 Design decisions worth knowing
+
+**Durability lives in one SQLite file per session, inside that session's staging
+directory.** One file per session means recovery opens exactly one database, cleanup is a
+single `rmtree` that takes the journal with it, and there is no cross-session write
+contention. The DB is opened WAL with `busy_timeout=3000`.
+
+**Resume is built on three independent counters.** `epoch` is bumped in SQLite on every
+leg attach and fences stale POSTs; `leg_id` fences frames from a superseded connection;
+`seq` orders POSTs within a leg. A buffered POST advances `seq` only after the whole body
+processed successfully, which is what makes retrying an identical POST safe — and makes a
+duplicate detectable as `seq_mismatch`.
+
+**The client never trusts, and the server never assumes.** The streaming verdict is
+*probed*: the client checks whether `duplex: "half"` even constructs, then sends 1 KiB
+and waits for the server to report on the control channel how many bytes actually arrived.
+A browser that stringified the stream sends 23 bytes and fails the check; a proxy that
+buffered the whole body answers too early and also fails. The verdict is cached in
+`localStorage` for 24 h (§5.9).
+
+**A failed data POST used to be able to lose `NODE` frames**, which is precisely how a
+`COMMIT_OK` could be returned for an incomplete tree. Three mechanisms close that: an
+`unknown_node` NACK triggers a parent-chain re-send, a reconnect replays the entire node
+map (idempotent server-side), and the server's node-count commit invariant refuses to
+commit a tree it cannot fully account for. `meta-loss.spec.ts` is the regression test.
+
+**Failures are classified, not uniformly retried.** `ENOSPC`/`EDQUOT`/`EROFS`/`EFBIG`
+abort the session, because retrying cannot clear a full disk. Every other `OSError` is a
+recoverable `NACK_CHUNK`. Failures scoped to one node — an illegal name, a file/directory
+collision — reject that node and let the rest of the tree commit. A commit that cannot
+make progress terminates after 5 *consecutive no-progress* rounds rather than looping.
+
+**Publish is a same-filesystem `rename`.** That is why `AuthResult.base_dir` exists: per-user
+homes on separate mounts each stage *inside themselves*, so the final move never degrades
+into a copy. Each individual rename is atomic; the publish as a whole is a loop of renames,
+so mapped publish validates the entire plan before moving anything.
+
+**Retention has three layers.** A resume TTL (default 1 h) scored into a Redis sorted set;
+an idle-leg timeout (default 60 s) that detaches an inactive leg; and a periodic sweeper
+that reclaims expired staging directories by path — plus a filesystem reconciliation pass
+for staging that Redis has forgotten about, guarded by a grace window so it never deletes
+something it cannot verify.
+
+**One worker per engine, or sticky routing on `session_id`.** Lazy resume covers failover:
+a `RESUME` for a session this worker does not know triggers recovery from the Redis-recorded
+staging path. Round-robin across workers is unsupported.
 
 ---
 
-## 2. Protocol Reference
+## 2. Wire protocol at a glance
 
-This section is the shared contract. Implementation-specific details live in §3.3 (Python decoder) and §4.3 (TypeScript encoder).
+Two channels, four HTTP endpoints, eight binary frame tags, sixteen JSON control messages.
+The authoritative per-field detail is in §3.2 (server codec), §4 (routes and messages) and
+§5.3 (client types).
 
-### 2.1 Channel roles
+### 2.1 Endpoints
 
-| Channel | Transport | Encoding | Direction | Carries |
-|---|---|---|---|---|
-| Control | WebSocket `/mfup/control` | JSON, discriminated by `t` | bidirectional | Handshake, acks, conflicts, commit verdict |
-| Data | HTTP `POST /mfup/data/{session_id}/{leg_id}` | Binary frames | client → server only | Tree metadata and file bodies |
-| Probe | HTTP `POST /mfup/probe/{session_id}` | Raw bytes | client → server | Duplex-streaming capability check |
-| Publish | HTTP `POST /mfup/sessions/{id}/publish` | JSON | client → server | Materialize staged tree |
+| Transport | Path | Carries |
+|---|---|---|
+| WebSocket | `/mfup/control` | JSON control messages, both directions |
+| `POST` | `/mfup/data/{session_id}/{leg_id}?seq=&final=&epoch=` | Length-prefixed binary frames |
+| `POST` | `/mfup/probe/{session_id}` | Streaming-capability probe body |
+| `POST` | `/mfup/sessions/{session_id}/publish` | — (moves staged files into the target) |
+| `GET` | `/health` | `{"status","protocol","crc32c"}` |
 
-Data and probe requests authenticate with the `X-MFUP-Token` header carrying the session's `resume_token` — the resume token doubles as the data-plane bearer token. Query parameters on the data endpoint are `?seq=<int>` (required), `?final=<0|1>`, and `?epoch=<int>`.
+Plus three admin routes (`GET /mfup/sessions`, `GET /mfup/sessions/{id}`, `POST /mfup/sweep`),
+disabled entirely unless `MFUP_ADMIN_TOKEN` is set. All non-WebSocket endpoints authenticate
+with the server-issued session token in the `X-MFUP-Token` header.
 
 ### 2.2 Binary frame envelope
 
 ```
-[u32 length (big-endian)][u8 tag][payload …]
+[u32 BE length][u8 tag][payload]        length covers tag + payload, not itself
 ```
 
-`length` covers the tag byte plus the payload (`1 + len(payload)`) and excludes itself. All multi-byte integers are big-endian. Strings are `[u16 length][UTF-8 bytes]`. Optional fields use a `u8` presence flag followed, if set, by the value.
+All multi-byte integers are big-endian. Strings are `[u16 length][UTF-8 bytes]`.
+The decoder caps a declared frame length at 1 MiB, so a corrupt 4-byte prefix cannot make
+the reader buffer indefinitely.
 
-There is **no version byte, magic number, or frame checksum in the envelope.** Version is negotiated once out of band via the `v` field of `HELLO`. Payload integrity is per-chunk only.
+| Tag | Value | Direction | Purpose |
+|---|---|---|---|
+| `NODE` | `0x01` | C→S | Declare a tree node: `(node_id, parent_id, kind, name, size?, mtime?)` |
+| `SUMMARY` | `0x02` | C→S | Progress counters for a node (root summary every 50 nodes) |
+| `FILE_OPEN` | `0x03` | C→S | Begin a file body |
+| `FILE_CHUNK` | `0x04` | C→S | `(node_id, offset, length, CRC-32C, payload)` |
+| `FILE_CLOSE` | `0x05` | C→S | End a file body, declaring `size_sent` |
+| `DIR_CLOSE` | `0x06` | C→S | Close a directory |
+| `SESSION_END` | `0x07` | C→S | Seal the scan and request commit |
+| `CLIENT_ABORT` | `0x08` | C→S | Defined in both codecs; the reference client aborts over the control channel instead |
 
-> The design note `docs/MFUP_RU.md` documents this envelope as `[tag:1][length:4][payload:N]`. That is incorrect — both implementations agree on length-first. Verified in `client/src/protocol.ts:290-298` (`view.setUint32(0, 1 + payloadSize); buf[4] = tag`) and `server/mfup/protocol.py:296-303` (`struct.unpack_from("!I", …, pos)` then `tag = self._buf[pos + 4]`).
+Structure travels as `(node_id, parent_id, name)` — never as a path string. The server
+rebuilds paths by walking the parent chain, validating every segment and asserting the
+result stays inside the payload root, with a cycle detector and a hard error on a broken
+chain. This is the containment boundary: no name can escape, because no path is ever
+transmitted.
 
-### 2.3 Frame types
+### 2.3 Control messages
 
-| Tag | Name | Payload layout |
-|---|---|---|
-| `0x01` | `NODE` | `u32 node_id`, `u32 parent_id`, `u8 kind`, `str name`, `u8 flag`+`[u64 size_hint]`, `u8 flag`+`[u64 mtime_ms]` |
-| `0x02` | `SUMMARY` | `u32 node_id`, `u64 scan_done_units`, `u64 scan_est_units`, `u64 body_done_bytes`, `u64 body_est_bytes`, `u8 sealed` |
-| `0x03` | `FILE_OPEN` | `u32 node_id`, `u64 size`, `u8 flag`+`[u64 mtime_ms]` |
-| `0x04` | `FILE_CHUNK` | `u32 node_id`, `u64 offset`, `u32 length`, `u8 checksum_kind`, `u32 checksum`, `length` payload bytes |
-| `0x05` | `FILE_CLOSE` | `u32 node_id`, `u64 size_sent` |
-| `0x06` | `DIR_CLOSE` | `u32 node_id` |
-| `0x07` | `SESSION_END` | `u64 scan_done_units`, `u64 scan_est_units`, `u64 body_done_bytes`, `u64 body_est_bytes`, `u8 sealed` |
-| `0x08` | `CLIENT_ABORT` | `str code`, `str reason` |
+Client → server (4):
 
-`SESSION_END` is session-scoped and carries no `node_id`. Supporting enums: `NodeKind` (`DIR = 0x00`, `FILE = 0x01`), `ChecksumKind` (`CRC32C = 0x01`, the only member), `NodeStatus` (`open`, `closed`, `rejected`, `pruned`), and `ROOT_NODE_ID = 0`.
-
-### 2.4 Control messages
-
-**Client → server (4):**
-
-| `t` | Fields |
+| `t` | Purpose |
 |---|---|
-| `HELLO` | `v`, `session_id`, `resume_token`, `leg_id`, `target_dir?` |
-| `RESUME` | `session_id`, `resume_token`, `leg_id`, `last_known_epoch` |
-| `CLIENT_ABORT` | `code`, `reason` |
-| `ACTION` | `action` ∈ {`merge_overwrite`, `cancel`} |
+| `HELLO` | Open a session: version, ids, `target_dir`, `meta` |
+| `RESUME` | Re-attach with the server-issued `resume_token` and a new `leg_id` |
+| `CLIENT_ABORT` | Terminal client-side abort |
+| `ACTION` | Answer an `ASK`: `merge_overwrite` or `cancel` |
 
-> `target_dir` is carried on `HELLO` only. The client sends `last_known_epoch` on `RESUME`, but the server never reads it (`app.py` reads only `session_id`, `resume_token`, `leg_id`) — the server's own persisted epoch is authoritative. Harmless, but the field is decorative.
+Server → client (12):
 
-**Server → client (12):**
-
-| `t` | Fields | Meaning |
-|---|---|---|
-| `HELLO_OK` | `epoch`, `expires_at`, `limits{max_chunk_bytes, max_open_files, max_pending_files}` | New session accepted |
-| `RESUME_OK` | `epoch`, `expires_at`, `root_summary`, `files[]`, `pruned_nodes[]`, `rejected_files[]` | Resumed; carries per-file `accepted_offset` |
-| `SESSION_ABORT` | `code`, `reason` | Handshake or session refused; WS closes |
-| `FILE_ACK` | `node_id`, `accepted_offset` | Bytes durably accepted (~every 256 KiB) |
-| `NACK_CHUNK` | `node_id`, `expected_offset`, `reason` | Chunk rejected; resync from `expected_offset` |
-| `ASK` | — | Target-directory conflict; answer with `ACTION` |
-| `PROBE_ACK` | `first_chunk_bytes` | Probe verdict input |
-| `PRUNE_NODE` | `node_id`, `code`, `reason` | Stop descending this subtree |
-| `REJECT_FILE` | `node_id`, `code`, `reason` | Drop this file |
-| `FLOW` | `paused`, `reason` | Server-initiated backpressure |
-| `COMMIT_RETRY` | `incomplete[{node_id, accepted_offset}]` | Pre-commit invariant failed; state reverted to `ACTIVE` |
-| `COMMIT_OK` | `files`, `bytes` | All files complete; safe to publish |
-
-`NACK_CHUNK.reason` ∈ {`bad_checksum`, `bad_offset`, `stale_epoch`, `server_policy`}. `FLOW.reason` ∈ {`backpressure`, `maintenance`, `storage_pressure`}. `SESSION_ABORT.code` ∈ {`bad_version`, `bad_target_dir`, `conflict`, `not_found`, `auth_failed`, `invalid_state`, `protocol_error`}.
-
-`PRUNE_NODE`, `REJECT_FILE`, and `FLOW` are fully implemented on both sides but **no server code path ever emits them** — see §7.2.
-
-### 2.5 Session lifecycle
-
-Both sides model the same eight-member state vocabulary (`active`, `paused_by_server`, `waiting_resume`, `committing`, `committed`, `aborted`, `expired`, `failed`), though each reaches only a subset. The protocol-level flow:
-
-```
-      HELLO                 SESSION_END              COMMIT_OK
-  ──────────────► ACTIVE ──────────────► COMMITTING ───────────► COMMITTED
-                    ▲  │                      │                       │
-        RESUME      │  │ disconnect /         │ COMMIT_RETRY          │ POST /publish
-                    │  │ idle timeout         │ (incomplete files)    ▼
-                    │  ▼                      │                  (deleted)
-              WAITING_RESUME ◄────────────────┘
-                    ▲          server restart
-                    │
-                    └── recover_session() reverts ACTIVE / PAUSED_BY_SERVER / COMMITTING
-
-  any state ──── CLIENT_ABORT / ACTION cancel ────► ABORTED ──► staging rmtree'd immediately
-```
-
-Epoch semantics: initialised to `1` by `init_session`, incremented by every `attach_leg()`, so the **first epoch a client sees in `HELLO_OK` is 2**. Echoed back as `?epoch=` on every data POST and enforced both before and during the request body. `COMMIT_RETRY` is the one flow that does not bump it.
-
-Sequence semantics: `?seq=` must equal `last_data_seq + 1` exactly. Duplicates and gaps both yield `409 seq_mismatch` before the body is read. `attach_leg()` and `try_commit()`'s retry branch both reset `last_data_seq = -1` and `final_seq_seen = False`.
-
-### 2.6 Transport probing
-
-Request streaming (`duplex: "half"`) is not universally available, so the client empirically probes it once per session against `POST /mfup/probe/{session_id}` before opening the data channel. Three gates must all pass: static `Request` feature detection, successful `fetch` construction, and a `PROBE_ACK` whose `first_chunk_bytes >= 1024` within 1500 ms.
-
-That last gate exists for a specific browser bug: Firefox stringifies a `ReadableStream` request body to the literal `"[object ReadableStream]"` (23 bytes) rather than streaming it. Comparing the server's observed first-chunk size against what was sent detects this without corrupting a real upload.
-
-The verdict selects between two **HTTP** data modes — never WebRTC:
-
-| Mode | Shape | Backpressure |
-|---|---|---|
-| Streaming | One long `POST` per leg with `duplex: "half"`, hard-coded `?seq=0&final=1` | `ByteLengthQueuingStrategy` 4 MiB high-water mark; `drain()` parks on `desiredSize <= 0` |
-| Batch | Sequential buffered `POST`s, 2 MiB flush threshold, monotonic `seq` | Promise chain guarantees never two POSTs in flight |
-
-A probe failure is never fatal — it forces batch mode and emits a non-fatal `probeError`.
-
----
-## 3. Server (Python)
-
-The MFUP/2 server is a FastAPI/ASGI application that accepts resumable, chunked multi-file uploads. A session is driven by two cooperating transports: a long-lived **WebSocket control channel** carrying JSON messages, and one or more **HTTP POST "data legs"** carrying a stream of length-prefixed binary frames. Received bytes land in a per-session *staging* directory that also holds a per-session SQLite database of all durable state; a separate explicit **publish** step renames the staged payload into the caller's target directory. A Redis sorted set indexes sessions by expiry so cleanup and restart-recovery never have to walk the filesystem.
-
-Package root: `server/mfup/`. `__init__.py` is empty (0 bytes) — a package marker only, exporting nothing.
-
-The server has no counterpart to client-side metadata buffering; its equivalent is `LiveSession.build_resume_ok()`, which replays *persisted* state to the client on RESUME.
-
----
-
-### 3.1 Application and endpoints (`app.py`)
-
-Module-level globals `_registry: SessionRegistry`, `_session_index: SessionIndex`, and `_sweep_task: asyncio.Task` are populated by the `lifespan` async context manager and read through `get_registry()` / `get_session_index()` (both `assert` non-None).
-
-#### Configuration
-
-All configuration is read at **import time** from environment variables. There is no runtime reload.
-
-| Constant | Env var | Default | Effect |
-|---|---|---|---|
-| `DEFAULT_BASE_DIR` | `MFUP_BASE_DIR` | `/tmp/mfup-uploads` | Root for staging dirs and relative target dirs; `mkdir(parents=True)` at startup |
-| `SESSION_RESUME_TTL` | `MFUP_SESSION_RESUME_TTL` | `3600` | Seconds a detached session stays resumable |
-| `LEG_IDLE_TIMEOUT` | `MFUP_LEG_IDLE_TIMEOUT` | `60` | Seconds of frame silence before the leg is force-detached |
-| `MAX_CHUNK_BYTES` | `MFUP_MAX_CHUNK_BYTES` | `262144` | Advertised in `HELLO_OK.limits` only — **never enforced** |
-| `MAX_OPEN_FILES` | `MFUP_MAX_OPEN_FILES` | `1` | Advertised only — **never enforced** |
-| `MAX_PENDING_FILES` | `MFUP_MAX_PENDING_FILES` | `64` | Advertised only — **never enforced** |
-| `SWEEP_INTERVAL` | `MFUP_SWEEP_INTERVAL` | `300` | Sweeper loop period in seconds |
-| `STAGING_PREFIX` | `MFUP_STAGING_PREFIX` | `.incoming` | Staging dir name prefix |
-| `REDIS_URL` | `REDIS_URL` | `redis://redis:6379/0` | Session index connection |
-
-Verified by grep: `MAX_CHUNK_BYTES`, `MAX_OPEN_FILES`, and `MAX_PENDING_FILES` appear only at their definition and inside the `HELLO_OK` payload. No code path compares a chunk length, an open-writer count, or a pending-file count against them.
-
-#### Lifespan
-
-`lifespan(app)` runs three things on startup, in order:
-
-1. Creates `DEFAULT_BASE_DIR` and constructs `SessionIndex(REDIS_URL)`.
-2. **Restart recovery** (wrapped in `try/except Exception` + `logger.exception`): queries `get_not_expired()` and `get_expired()`, then for each alive session id reads `get_meta(sid)` and calls `registry.recover_session(sid, Path(meta.staging_dir))`. Sessions with no Redis meta or no `staging_dir` are skipped with a warning. Each recovered session gets its `_on_expiry_change` callback wired to `SessionIndex.update_expiry`.
-3. Starts the `sweeper()` background task.
-
-`sweeper()` loops forever: `sleep(SWEEP_INTERVAL)` → `get_expired()` → for each expired id, `registry.remove(sid)`, resolve the staging dir from Redis meta (falling back to `staging_dir(base, sid, STAGING_PREFIX)` by convention), `shutil.rmtree(..., ignore_errors=True)`, then `index.remove(sid)`. The docstring and comments stress the design point: **no `iterdir`, no SQLite opens during cleanup**. The whole body is wrapped in `try/except Exception` so one bad session cannot kill the loop.
-
-On shutdown: cancel `_sweep_task`, await it swallowing `CancelledError`, then `await _session_index.close()`.
-
-#### Endpoint table
-
-Eight route decorators total: one `@app.websocket` and seven HTTP routes.
-
-| Method | Path | Query / headers | Success response | Error responses |
-|---|---|---|---|---|
-| WS | `/mfup/control` | — (first JSON message must be `HELLO` or `RESUME`) | `HELLO_OK` or `RESUME_OK` JSON, then an open control loop | `SESSION_ABORT` JSON + `ws.close()` with `code` ∈ `bad_version`, `bad_target_dir`, `conflict`, `not_found`, `auth_failed`, `invalid_state`, `protocol_error` |
-| POST | `/mfup/data/{session_id}/{leg_id}` | `?seq=<int>` (**required**), `?final=<0\|1>` (default `0`), `?epoch=<int>` (default `-1`); header `x-mfup-token` | `200` `{ok, bytes_received, frames}`, plus `commit: {files, bytes}` when a commit succeeded on this request | `410` session not found; `403` invalid token; `409` `stale leg` / `stale_epoch` / `session in state X` / `data_after_final` / `seq_mismatch`; `500` `data_stream_error`; `422` from FastAPI if `seq` is absent |
-| POST | `/mfup/probe/{session_id}` | header `x-mfup-token` | `200` `{ok: true, total_bytes}` | `410` not found or terminal state; `403` invalid token |
-| GET | `/mfup/sessions` | — | `200` array of `{session_id, state, epoch, leg_id, expires_at}` | — |
-| GET | `/mfup/sessions/{session_id}` | — | `200` `{session_id, state, epoch, leg_id, expires_at, root_summary}` | `404` `{"error": "not found"}` |
-| POST | `/mfup/sessions/{session_id}/publish` | — | `200` `{published: [names]}` | `404` not found / `FileNotFoundError`; `409` state ≠ `committed`, or `conflict_files` with `conflicting_files` count; `403` `target_dir escapes base directory` |
-| POST | `/mfup/sweep` | — | `200` `{removed: [session_ids]}` | — |
-| GET | `/health` | — | `200` `{status: "ok", protocol: "MFUP/2"}` | — |
-
-**The four admin routes (`GET /mfup/sessions`, `GET /mfup/sessions/{id}`, `POST /mfup/sessions/{id}/publish`, `POST /mfup/sweep`) perform no authentication or authorization** — no `x-mfup-token` check, no resume-token check, nothing. Read directly from the handler bodies. `POST .../publish` in particular moves files into an operator-visible directory and then deletes the staging dir.
-
-#### `control_endpoint(ws: WebSocket)` — WebSocket handshake and control loop
-
-**HELLO path.** Validates `msg["v"] == PROTOCOL_VERSION`; a mismatch aborts with `bad_version` and reason `f"expected {PROTOCOL_VERSION}"`. Reads `session_id`, `resume_token`, `leg_id` (all `msg[...]`, so a missing key raises `KeyError` into the outer handler) and `target_dir` (`msg.get("target_dir", ".")`). Runs `_is_safe_target(registry.base_dir, target_dir)` and aborts with `bad_target_dir` on failure. Computes `expires = now + SESSION_RESUME_TTL`, calls `registry.create(...)`, then `SessionIndex.register(session_id, expires, target_dir, str(staging_dir(...)))` and installs the `_on_expiry_change` callback. A `ValueError` from `create` (session id already live) becomes `SESSION_ABORT code="conflict"`. Replies:
-
-```json
-{"t": "HELLO_OK", "epoch": <int>, "expires_at": "<iso8601>",
- "limits": {"max_chunk_bytes": ..., "max_open_files": ..., "max_pending_files": ...}}
-```
-
-**RESUME path.** `registry.resume(session_id, resume_token, leg_id)` maps exceptions to abort codes: `KeyError` → `not_found`, `PermissionError` → `auth_failed`, `ValueError` → `invalid_state` (reason carries the offending state name). On success re-wires `_on_expiry_change` and sends `session.build_resume_ok()`.
-
-Any other first-message type → `SESSION_ABORT code="protocol_error"`.
-
-**Control loop.** Blocks on `ws.receive_json()` and handles exactly two client message types:
-
-| Message | Effect |
+| `t` | Purpose |
 |---|---|
-| `{"t": "CLIENT_ABORT"}` | `db.set_state(ABORTED)`, `detach_leg()`, break |
-| `{"t": "ACTION", "action": "merge_overwrite"}` | Sets `session.publish_action` (consumed later by `publish_session`) |
-| `{"t": "ACTION", "action": "cancel"}` | Sets `publish_action`, then `set_state(ABORTED)`, `detach_leg()`, break |
+| `HELLO_OK` | `epoch`, `expires_at`, **server-issued** `resume_token`, `limits` |
+| `RESUME_OK` | `epoch`, `expires_at`, `root_summary`, per-file `accepted_offset`, pruned/rejected ids |
+| `FILE_ACK` | Cumulative `accepted_offset` for a file (~every 256 KiB) |
+| `NACK_CHUNK` | `bad_checksum` \| `bad_offset` \| `stale_epoch` \| `server_policy` \| `unknown_node` |
+| `FLOW` | Pause/resume: `backpressure` \| `maintenance` \| `storage_pressure` |
+| `ASK` | Interactive question, currently `target_conflict` — carries the basename only |
+| `PRUNE_NODE` | Drop a subtree |
+| `REJECT_FILE` | Reject one file, session continues |
+| `COMMIT_RETRY` | Commit invariant failed; lists incomplete files and node counts |
+| `COMMIT_OK` | Committed: `files`, `bytes` |
+| `SESSION_ABORT` | Terminal: `storage_full`, `quota_exceeded`, `auth_failed`, `commit_failed`, … |
+| `PROBE_ACK` | How many bytes of the probe body actually arrived |
 
-Any other `action` value is silently ignored (the guard is `action in ("merge_overwrite", "cancel")`).
+The asymmetry is the point: the client asks for very little and the server narrates
+continuously, which is what lets the UI show real per-file state and lets the server
+interrupt with a question mid-flight.
 
-**`finally` block** — this is where several of the recent invariants live:
-1. If `session.state == COMMITTING`, `await session.try_commit()` — a disconnect that arrives after `SESSION_END` still gets a commit attempt.
-2. Clear `session.ws` if it is still this socket.
-3. If a leg is attached and state ∉ {`COMMITTED`, `ABORTED`}, `detach_leg()`.
-4. If state is `ABORTED`, immediately `registry.remove(sid)`, `rmtree` the staging dir (path from Redis meta, falling back to convention), and `index.remove(sid)`. Aborted sessions are not left for the sweeper.
+### 2.4 Session states
 
-#### `data_endpoint(session_id, leg_id, request, seq, final=0, epoch=-1)`
-
-Gate order matters — each check runs before the request body is touched:
-
-1. `registry.get(session_id)` is `None` → `410 GONE`.
-2. `x-mfup-token` header missing or ≠ `session.resume_token` → `403 FORBIDDEN`. The resume token doubles as the data-leg bearer token.
-3. `session.leg_id != leg_id` → `409` `{"error": "stale leg", "expected": <current leg>}`.
-4. **Epoch check:** `if epoch >= 0 and session.epoch != epoch` → `409` `{"error": "stale_epoch", "got", "expected"}`. The `epoch >= 0` guard means the default `-1` opts out entirely, so an old client that omits `?epoch=` bypasses stale-POST rejection.
-5. State must be `ACTIVE` or `PAUSED_BY_SERVER`; anything else → `409` `session in state <x>`.
-6. `session.final_seq_seen` already true → `409` `data_after_final`.
-7. `session.validate_and_advance_seq(seq)` false → `409` `{"error": "seq_mismatch", "got", "expected": last_data_seq + 1}`.
-8. If `final == 1`, set `session.final_seq_seen = True` **before** reading the body.
-
-Then it streams: `async for chunk in request.stream()` → `reader.feed(chunk)` → `reader.drain()` → `await session.process_frame(frame, leg_id)` per frame. **Inside the loop it re-checks leg and epoch on every chunk** and `break`s out mid-body if either has changed — an in-flight POST is abandoned the instant a newer leg attaches. Exceptions during streaming are caught, formatted as `error_detail`, and logged; they do not propagate.
-
-Commit is attempted only when `(final == 1 or session_end_seen) and session.state == COMMITTING`. If `error_detail` is set, the response is `500` `data_stream_error` with `bytes_received`; otherwise `200` with `frames` and the optional `commit` block.
-
-#### `probe_endpoint(session_id, request)`
-
-A connectivity/format probe. After the not-found (`410`), token (`403`), and terminal-state (`410` for `COMMITTED`/`ABORTED`/`EXPIRED`) checks, it drains the body and on the **first** chunk pushes `{"t": "PROBE_ACK", "first_chunk_bytes": len(chunk)}` over the control WebSocket. The inline comment states the purpose exactly: Firefox stringifies a `ReadableStream` request body to the literal `"[object ReadableStream]"` (23 bytes), so the client compares `first_chunk_bytes` against what it sent to detect the bug. Returns `{ok: true, total_bytes}`.
-
-#### `publish_endpoint(session_id)`
-
-Requires state `COMMITTED` (else `409`). Resolves `session.target_dir` against `base_dir` if relative, re-runs `_is_safe_target` as defense in depth (`403`), and calls `publish_session(base_dir, session_id, target, STAGING_PREFIX, action=session.publish_action)`. `ConflictError` → `409` with `conflicting_files`; `FileNotFoundError` → `404`. On success removes the session from both the in-memory registry and Redis.
-
-#### `_is_safe_target(base_dir: Path, target_dir: str) -> bool`
-
-Resolves `target_dir` (absolute as-is, relative against `base_dir`), then `resolved.relative_to(base_dir.resolve())` inside a `try`. `ValueError` → `False`. Called at HELLO and again at publish.
+`active` → `paused_by_server` → `waiting_resume` → `committing` → **`committed`**, with
+**`aborted`**, **`failed`** and **`expired`** as the other terminals. `committing` is
+resumable on purpose: commit is client-initiated, so a leg that drops mid-commit must be
+able to reconnect and re-send `SESSION_END`. Both the server (§3.3) and the client (§5.2)
+implement this machine; the client never assigns `expired`, which exists for parity.
 
 ---
 
-### 3.2 Session state machine (`session_manager.py`)
+## 3. mfup-core — Protocol Core
 
-#### States
+`mfup-core` is the framework-free engine of MFUP/2: the binary frame codec, the session state machine, a per-session SQLite journal in a staging directory, CRC-32C chunk verification, a Redis expiry index, the publish (staging → target `rename()`) step, and the consumer hook contracts. It speaks no HTTP — `mfup-fastapi` supplies the WebSocket control channel and HTTP data legs and drives these primitives. Package version `0.2.0`, `requires-python >=3.10`, built with hatchling, wheel packages `["mfup_core"]`. Runtime dependencies are exactly two: `redis>=5.0.0` and `crc32c>=2.7`. The package ships `py.typed`.
 
-`SessionState` (defined in `protocol.py`, a `str`-valued enum) has **eight** members. Their reachability in the current code:
+Source: `server/mfup-core/mfup_core/`
 
-| State | Value | Written by | Reachable? |
+### 3.1 Public API surface (`__init__.py`)
+
+`__all__` re-exports 26 names from five submodules. Everything else (`SessionDB`, `open_session_db`, `ensure_staging`, `resolve_payload_path`, `NodeStatus`, `NodeKind`, `ChecksumKind`, `FrameTag`, `ROOT_NODE_ID`, `crc32c`, `decode_frame_payload`, `SessionMeta`, the frame dataclasses) is reachable only via its submodule — `mfup-fastapi` imports several of those directly, e.g. `from mfup_core.redis_index import SessionIndex`.
+
+| Export | Kind | Origin | Description |
 |---|---|---|---|
-| `ACTIVE` | `"active"` | `init_session`, `attach_leg`, `send_flow(False)`, `try_commit` COMMIT_RETRY branch | Yes |
-| `PAUSED_BY_SERVER` | `"paused_by_server"` | `send_flow(True)` only | **No** — `send_flow` has zero callers (verified by grep) |
-| `WAITING_RESUME` | `"waiting_resume"` | `detach_leg`, `recover_session` | Yes |
-| `COMMITTING` | `"committing"` | `_handle_session_end` | Yes |
-| `COMMITTED` | `"committed"` | `try_commit` success branch | Yes |
-| `ABORTED` | `"aborted"` | `_handle_client_abort`, control-loop `CLIENT_ABORT`, control-loop `ACTION cancel` | Yes |
-| `EXPIRED` | `"expired"` | nothing | **No** — only *read*, in `probe_endpoint`'s terminal-state check |
-| `FAILED` | `"failed"` | nothing | **No** — never referenced outside the enum definition |
+| `PROTOCOL_VERSION` | `str` const | `protocol` | `"MFUP/2"` |
+| `CRC32C_IMPL` | `str` const | `protocol` | Always `"native"` — there is no other implementation |
+| `SessionState` | `str`-Enum | `protocol` | The 8 session states (§3.3) |
+| `FrameReader` | class | `protocol` | Incremental length-prefixed frame decoder |
+| `LiveSession` | class | `session_manager` | In-memory state + frame handlers for one session |
+| `SessionRegistry` | class | `session_manager` | Process-wide `dict[str, LiveSession]` with an `asyncio.Lock` |
+| `SessionIndex` | class | `redis_index` | Async Redis wrapper for the expiry ZSET + meta hash |
+| `staging_dir(base_dir, session_id, prefix)` | function | `storage` | Computes `<base_dir>/<prefix>.<session_id>` (pure, no I/O) |
+| `validate_node_name(name)` | function | `storage` | Raises `ValueError` on `""`, `"."`, `".."`, `/`, `\`, `NUL` |
+| `publish_session(...)` | function | `publish` | Rename payload entries into `target_dir` |
+| `publish_session_mapped(...)` | function | `publish` | Publish with a consumer-supplied per-file layout |
+| `list_payload_files(base_dir, session_id, prefix)` | function | `publish` | `list[tuple[str, int]]` of `(posix-relative path, size)` |
+| `ConflictError` | exception | `publish` | Carries `.conflicting_files: int` |
+| `MappingError` | exception | `publish` | Unusable `map_file` output (escape, illegal segment, collision) |
+| `AuthRequest` / `AuthResult` / `AuthorizeHook` | dataclass ×2, type alias | `hooks` | HELLO-time authorization contract |
+| `FileMapRequest` / `MapFileHook` | dataclass, type alias | `hooks` | Publish-time per-file relayout contract |
+| `CommitEvent` / `OnCommittedHook` | dataclass, type alias | `hooks` | Post-commit server-side decision contract |
+| `load_hook`, `load_authorize_hook`, `load_map_file_hook`, `load_on_committed_hook`, `resolve_hook` | functions | `hooks` | Dotted-path hook resolution |
 
-Expiry is therefore never modelled as a state transition: an expired session is deleted outright by the sweeper (registry removal + `rmtree` + Redis removal), so the `EXPIRED` value can only ever be observed if it were written externally into `state.sqlite`. `FAILED` is entirely vestigial.
+### 3.2 Protocol codec (`protocol.py`)
 
-State is **not** an in-memory attribute — `LiveSession.state` is a property that reads `SELECT state FROM sessions` through `db.get_state()` on every access, and every write goes through `db.set_state()` which commits immediately. State survives process restart by construction.
+Defines the wire vocabulary and the server-side decoder. Wire format is `[4-byte big-endian length][1-byte tag][payload]`, where the length covers tag + payload. All multi-byte integers are big-endian (`!H`, `!I`, `!Q`); strings are a `u16` byte length followed by UTF-8.
 
-#### Transition table
+**Eight frame tags**, each with a matching `@dataclass(slots=True)`:
 
-| From | To | Trigger | Implementation |
+| `FrameTag` | Value | Dataclass | Payload fields (in wire order) |
 |---|---|---|---|
-| *(none)* | `ACTIVE` | `HELLO` → `SessionRegistry.create()` | `db.init_session()` inserts `state='active', epoch=1`, then `attach_leg()` sets `ACTIVE` and increments epoch to **2** |
-| `WAITING_RESUME` / `ACTIVE` / `PAUSED_BY_SERVER` | `ACTIVE` | `RESUME` → `SessionRegistry.resume()` → `attach_leg(leg_id)` | Epoch incremented; `last_data_seq = -1`; `final_seq_seen = False`; all writers closed; idle timer reset |
-| `ACTIVE` / `PAUSED_BY_SERVER` | `WAITING_RESUME` | `detach_leg()` — from WS disconnect (`finally`), leg idle timeout `_on_idle`, `ACTION cancel`, `CLIENT_ABORT`, or `registry.remove()` | Also sets `expires_at = now + session_resume_ttl` and fires `_on_expiry_change` → `SessionIndex.update_expiry` via `asyncio.ensure_future` (fire-and-forget) |
-| `ACTIVE` | `PAUSED_BY_SERVER` | `send_flow(paused=True, reason)` | Unreachable — no caller |
-| `PAUSED_BY_SERVER` | `ACTIVE` | `send_flow(paused=False, reason)` | Unreachable — no caller |
-| `ACTIVE` | `COMMITTING` | `SESSION_END` frame (tag `0x07`) → `_handle_session_end` | Writes final root summary with `sealed=True`, closes all writers |
-| `COMMITTING` | `COMMITTED` | `try_commit()` with `db.get_incomplete_files()` empty | Sends `{"t":"COMMIT_OK","files","bytes"}` on the control WS and returns it |
-| `COMMITTING` | `ACTIVE` | `try_commit()` with incomplete files — **COMMIT_RETRY** | See below |
-| *any* | `ABORTED` | `CLIENT_ABORT` frame (`0x08`), control JSON `{"t":"CLIENT_ABORT"}`, or `{"t":"ACTION","action":"cancel"}` | Staging dir + Redis entry deleted in the WS `finally` block |
-| `ACTIVE` / `PAUSED_BY_SERVER` / `COMMITTING` | `WAITING_RESUME` | **Server restart** → `SessionRegistry.recover_session()` | See below |
-| `COMMITTED` | *(session deleted)* | `POST /mfup/sessions/{id}/publish` | `publish_session()` then registry + Redis removal |
+| `NODE` | `0x01` | `NodeFrame` | `node_id:u32`, `parent_id:u32`, `kind:u8`, `name:str`, `has_size:u8`+`size_hint:u64?`, `has_mtime:u8`+`mtime_ms:u64?` |
+| `SUMMARY` | `0x02` | `SummaryFrame` | `node_id:u32`, `scan_done_units:u64`, `scan_est_units:u64`, `body_done_bytes:u64`, `body_est_bytes:u64`, `sealed:u8` |
+| `FILE_OPEN` | `0x03` | `FileOpenFrame` | `node_id:u32`, `size:u64`, `has_mtime:u8`+`mtime_ms:u64?` |
+| `FILE_CHUNK` | `0x04` | `FileChunkFrame` | `node_id:u32`, `offset:u64`, `length:u32`, `checksum_kind:u8`, `checksum:u32`, `payload[length]` |
+| `FILE_CLOSE` | `0x05` | `FileCloseFrame` | `node_id:u32`, `size_sent:u64` |
+| `DIR_CLOSE` | `0x06` | `DirCloseFrame` | `node_id:u32` |
+| `SESSION_END` | `0x07` | `SessionEndFrame` | `scan_done_units:u64`, `scan_est_units:u64`, `body_done_bytes:u64`, `body_est_bytes:u64`, `sealed:u8` |
+| `CLIENT_ABORT` | `0x08` | `ClientAbortFrame` | `code:str`, `reason:str` |
 
-#### Epochs
+Supporting enums: `NodeKind.DIR = 0x00` / `NodeKind.FILE = 0x01`; `ChecksumKind.CRC32C = 0x01` (the only member); `ROOT_NODE_ID = 0`. `Frame` is the union of the eight dataclasses. `decode_frame_payload(tag, payload)` raises `ValueError(f"unknown frame tag: {tag:#04x}")` for anything else.
 
-The epoch is a monotonically increasing integer persisted in `sessions.epoch`, and is the mechanism for fencing off stale data legs.
-
-- Initialised to `1` by `init_session`; `attach_leg()` calls `db.increment_epoch()` on every leg attach, so the **first epoch a client ever sees in `HELLO_OK` is 2**.
-- Reported in `HELLO_OK.epoch` and `RESUME_OK.epoch`, and echoed back by the client as `?epoch=` on every data POST.
-- `data_endpoint` rejects `409 stale_epoch` when `epoch >= 0 and session.epoch != epoch`, and re-checks per streamed chunk so an already-running POST is torn down when a reconnect bumps the epoch.
-- Because each reconnect increments the epoch, an old TCP connection that survives a client-side reconnect cannot write into the new leg's file state.
-- **COMMIT_RETRY deliberately does not bump the epoch** — the client resends on the same epoch and the same leg.
-
-#### COMMIT_RETRY
-
-`try_commit()` is the pre-commit invariant gate:
-
-1. Returns `None` immediately unless state is `COMMITTING` (making it safe to call from both `data_endpoint` and the WS `finally` block).
-2. If `self.writers` is non-empty it logs a warning and closes them — stale writers must not hold the check open.
-3. Queries `db.get_incomplete_files()`, which returns every non-rejected, non-pruned file where `final_size IS NULL OR accepted_offset != final_size`. If any exist, it **reverts state to `ACTIVE`**, resets `final_seq_seen = False` and `last_data_seq = -1` so a fresh sequence of POSTs (including a new `final=1`) is accepted, and sends:
-
-```json
-{"t": "COMMIT_RETRY", "incomplete": [{"node_id": <int>, "accepted_offset": <int>}, ...]}
-```
-
-Note the client is told `accepted_offset` but **not** `final_size` — it must already know the expected size. Then returns `None` (so `data_endpoint` omits the `commit` key from its response).
-4. Otherwise `db.count_committed_files()` → `(file_count, total_bytes)`, state → `COMMITTED`, and `{"t":"COMMIT_OK","files","bytes"}` is both sent and returned.
-
-#### Restart-recovery revert (`recover_session`)
-
-```python
-async def recover_session(self, session_id: str, staging_path: Path) -> LiveSession | None
-```
-
-Opens `staging_path / "state.sqlite"` (returns `None` if missing or unopenable), reads the single `sessions` row (returns `None` if the table is empty), and refuses to recover any session already in a terminal state — only `ACTIVE`, `PAUSED_BY_SERVER`, `WAITING_RESUME`, and `COMMITTING` are recoverable. It then forces:
-
-```python
-if state in (ACTIVE, PAUSED_BY_SERVER, COMMITTING):
-    db.set_state(SessionState.WAITING_RESUME)
-```
-
-The comment states the reason for including `COMMITTING`: *"commit is client-initiated, so after server restart the client must reconnect and re-send SESSION_END."* Without this, a session frozen mid-commit at restart would sit in `COMMITTING`, which `data_endpoint` rejects with `409` and which `resume()` refuses with `invalid_state` — it would be permanently stuck. The revert makes it resumable again. The recovered `LiveSession` is registered with **no leg and no WebSocket**; the client must send `RESUME`.
-
-#### Observed gap in the detach guard
-
-`detach_leg()` only rewrites state when it is `ACTIVE` or `PAUSED_BY_SERVER`. The `data_endpoint` and WS `finally` paths always call `try_commit()` first, so `COMMITTING` normally resolves to `COMMITTED` or back to `ACTIVE` before detach. But `_on_idle()` — the `leg_idle_timeout` callback — calls `detach_leg()` directly. A session that reaches `COMMITTING` and then goes idle without a disconnect is left in `COMMITTING` with `leg_id = None` and **`expires_at` not refreshed**, since only the `ACTIVE`/`PAUSED_BY_SERVER` branch extends the TTL. It would then be swept at its original expiry. This is read from the control flow, not from a comment; I have not confirmed whether the timing window is reachable in practice.
-
-#### `LiveSession` API
+#### `FrameReader`
 
 | Member | Type | Description |
 |---|---|---|
-| `LiveSession(session_id, resume_token, base_dir, db, *, target_dir=".", staging_prefix=".incoming", session_resume_ttl=3600, leg_idle_timeout=60, publish_timeout=30)` | ctor | `publish_timeout` is stored and never read |
-| `state` | property → `SessionState` | Reads `db.get_state()` every access |
-| `expires_at` | property → `str` | Reads `db.get_expires_at()` every access |
-| `validate_and_advance_seq(seq: int) -> bool` | method | `True` and advances iff `seq == last_data_seq + 1`; `False` on any gap or duplicate |
-| `attach_leg(leg_id: str) -> int` | method | Closes writers, resets seq state, increments epoch, sets `ACTIVE`, arms idle timer, returns new epoch |
-| `detach_leg() -> None` | method | Closes writers, cancels idle timer, conditionally → `WAITING_RESUME` + TTL refresh, clears `leg_id` and `ws` |
-| `process_frame(frame: Frame, leg_id: str)` | async | Drops frames whose `leg_id` ≠ current leg with a warning; resets idle timer; dispatches by `isinstance` |
-| `prune_node(node_id, code, reason)` | async | Persists prune, closes writer, sends `PRUNE_NODE`. **No callers** |
-| `reject_file(node_id, code, reason)` | async | Persists rejection, closes writer, sends `REJECT_FILE`. **No callers** |
-| `send_flow(paused: bool, reason: str)` | async | Flips `PAUSED_BY_SERVER`/`ACTIVE` and sends `FLOW`. **No callers** |
-| `send_control(msg: dict)` | async | Best-effort `ws.send_json`; swallows and logs exceptions |
-| `try_commit() -> Optional[dict]` | async | Pre-commit invariant gate; see COMMIT_RETRY above |
-| `build_resume_ok() -> dict` | method | Builds the `RESUME_OK` payload from persisted state |
+| `DEFAULT_MAX_FRAME_LEN` | class const | `1024 * 1024` (1 MiB) — chosen to sit above `MAX_CHUNK_BYTES` (256 KiB) plus headers and long UTF-8 names |
+| `__init__(max_frame_len=DEFAULT_MAX_FRAME_LEN)` | ctor | Allocates a `bytearray` accumulation buffer |
+| `feed(data: bytes) -> None` | method | Appends to the buffer |
+| `drain() -> list[Frame]` | method | Decodes every complete frame, consumes them from the buffer, leaves the partial tail |
 
-Server-initiated flow control, pruning, and rejection are therefore **implemented but unwired** — the protocol supports `FLOW`, `PRUNE_NODE`, and `REJECT_FILE`, and the DB has `pruned`/`rejected` tables and `is_pruned`/`is_rejected` guards on every frame handler, but nothing in the current server ever decides to invoke them.
+`drain()` raises `ValueError(f"frame length {n} exceeds limit {m}")` when a declared length exceeds `max_frame_len` — without that bound, a corrupt or hostile 4-byte prefix would grow the buffer indefinitely while the reader waited for the "rest" of the frame. Each payload is copied into a fresh `bytes` before decoding so no `memoryview` keeps the buffer alive across the `del self._buf[:pos]` compaction.
 
-#### Frame handlers
+#### CRC-32C
 
-| Handler | Frame | Behavior |
-|---|---|---|
-| `_handle_node` | `NodeFrame` | Skips pruned nodes; runs `validate_node_name(f.name)` and **drops the node with a warning** on failure; `db.upsert_node(...)`. For `DIR` kind, `mkdir(parents=True, exist_ok=True)` at the resolved payload path. Runs `_check_conflict` for both kinds |
-| `_handle_file_open` | `FileOpenFrame` | Skips rejected/pruned; NACKs `bad_offset` if the node is unknown; reads `accepted_offset` from `files` and constructs a `FileWriter` (resume-aware) into `self.writers[node_id]` |
-| `_handle_file_chunk` | `FileChunkFrame` | Skips rejected/pruned; NACKs `bad_offset` if no writer; verifies CRC-32C (NACK `bad_checksum`); verifies `f.offset == writer.accepted_offset` (NACK `bad_offset`); writes; NACKs `server_policy` on write error; persists `accepted_offset`; read-modify-writes the root summary's `body_done_bytes`; sends `FILE_ACK` roughly every 256 KiB (`new_offset % 262144 < f.length or f.length == 0`) |
-| `_handle_file_close` | `FileCloseFrame` | Pops and closes the writer, `db.set_file_final(node_id, f.size_sent, path)`, node status → `CLOSED`, sends a final `FILE_ACK`. **`f.size_sent` is stored as `final_size` without being compared to `accepted_offset`** — the mismatch is what `get_incomplete_files()` later detects and turns into COMMIT_RETRY |
-| `_handle_dir_close` | `DirCloseFrame` | Node status → `CLOSED` |
-| `_handle_summary` | `SummaryFrame` | Merges monotonically: `max()` on scan/est counters, `sealed or`; **keeps the server's own `body_done_bytes`**, ignoring the client's claim |
-| `_handle_session_end` | `SessionEndFrame` | Trusts the client's scan/est values, keeps server `body_done_bytes`, forces `sealed=True`, closes all writers, state → `COMMITTING` |
-| `_handle_client_abort` | `ClientAbortFrame` | Closes all writers, state → `ABORTED` |
-
-#### Conflict FSM
-
-Separate from the session state machine, `LiveSession.conflict_state` is a three-value string FSM: `"clean"` → `"conflict_dir"` → `"conflict_files"`. `_check_conflict(node_id, is_dir)` resolves where the node *would* land in `target_dir` via `_resolve_target_path` and inspects the filesystem. A directory landing on an existing directory advances to `conflict_dir` silently (auto-merge). Anything else that already exists — file-on-file or a type mismatch — jumps straight to the terminal `conflict_files` and sends `{"t": "ASK"}` once to the client, which is expected to reply with an `ACTION`. `_resolve_target_path` walks the `parent_id` chain to `ROOT_NODE_ID` and returns `None` if any node is missing or if the resolved path escapes `base_dir`.
-
-#### `FileWriter`
+The `crc32c` C extension (SSE4.2 / ARMv8 accelerated) is imported at module scope and a failure is re-raised immediately:
 
 ```python
-class FileWriter:
-    def __init__(self, path: Path, node_id: int, accepted_offset: int = 0) -> None
-    async def write(self, data: bytes, offset: int) -> int
-    def close(self) -> None
+try:
+    import crc32c as _crc32c_native
+except ImportError as exc:
+    raise ImportError(
+        "MFUP/2 requires the C-accelerated 'crc32c' package: pip install crc32c"
+    ) from exc
+
+def crc32c(data: bytes | memoryview, initial: int = 0) -> int:
+    return _crc32c_native.crc32c(data, initial)
+
+CRC32C_IMPL = "native"
 ```
 
-Opens the **final payload path directly** — there is no per-file `.part` file. At `accepted_offset == 0` it opens `"wb"` (truncating); otherwise `"r+b"`, `seek(accepted_offset)`, `truncate()` — discarding any bytes past the last acknowledged offset so a resume can never leave a hole or duplicated tail. `write()` raises `ValueError` on any offset that is not exactly `accepted_offset`, and delegates the blocking write to `asyncio.to_thread(self._sync_write, data)`. `_sync_write` does `write()` + `flush()` — **no `fsync`**, so committed data is not durable against machine loss.
+There is **no** pure-Python fallback — one existed and was removed deliberately: it measured ~6 MB/s and blocked the event loop ~10 ms per 64 KiB chunk. Importing `mfup_core` at all fails if the extension is missing; `CRC32C_IMPL` is therefore a constant `"native"`, not a runtime probe.
 
-#### `SessionRegistry`
+### 3.3 Session state machine (`SessionState`)
 
-| Member | Signature | Description |
+Eight states, persisted as the `sessions.state` TEXT column (the enum is `str`-valued, so `.value` is the stored string):
+
+| State | Stored value | Meaning |
 |---|---|---|
-| `__init__` | `(base_dir: Path, staging_prefix=".incoming", **defaults)` | `defaults` are forwarded verbatim to every `LiveSession` |
-| `create` | `async (session_id, resume_token, leg_id, expires_at, target_dir=".") -> LiveSession` | Raises `ValueError` if the id is already live; opens the DB, `init_session`, `attach_leg` |
-| `resume` | `async (session_id, resume_token, leg_id) -> LiveSession` | `KeyError` if unknown, `PermissionError` on token mismatch, `ValueError` unless state ∈ {`WAITING_RESUME`, `ACTIVE`, `PAUSED_BY_SERVER`}; then `attach_leg` |
-| `get` | `(session_id) -> Optional[LiveSession]` | Sync dict lookup, **not** locked |
-| `remove` | `async (session_id) -> None` | Pops, `detach_leg()`, `db.close()` |
-| `recover_session` | `async (session_id, staging_path) -> LiveSession \| None` | Restart recovery; see above |
-| `all_sessions` | `() -> dict[str, LiveSession]` | Shallow copy |
+| `ACTIVE` | `active` | A leg is attached and frames are being ingested |
+| `PAUSED_BY_SERVER` | `paused_by_server` | Server sent `FLOW{paused:true}` |
+| `WAITING_RESUME` | `waiting_resume` | No leg attached; resumable until `expires_at` |
+| `COMMITTING` | `committing` | `SESSION_END` received, commit invariants pending |
+| `COMMITTED` | `committed` | Terminal — invariants passed, `COMMIT_OK` sent |
+| `ABORTED` | `aborted` | Terminal — client abort, storage failure, or quota violation |
+| `EXPIRED` | `expired` | Terminal — **never assigned inside `mfup-core`**; declared for the transport, which treats it as terminal |
+| `FAILED` | `failed` | Terminal — commit retries exhausted with no forward progress |
 
-The class docstring is explicit about the design choice: *"No startup scan — stale staging dirs are cleaned by the Redis-based sweeper."* Note that `resume()` looks only in the in-memory `_sessions` dict, so resumption depends entirely on the session having been recovered into memory at startup or created in this process lifetime.
+#### Transitions (all in `session_manager.py`)
 
----
+| From | To | Trigger | Side effects |
+|---|---|---|---|
+| — | `ACTIVE` | `SessionDB.init_session()` via `SessionRegistry.create()` | Row inserted with `epoch = 1` |
+| any | `ACTIVE` | `LiveSession.attach_leg(leg_id)` (from `create()` and `resume()`) | Closes stale writers; `last_data_seq = -1`; `final_seq_seen = False`; `commit_retries = 0`; re-seeds `files_seen`/`bytes_accepted` from `count_committed_files()`; `increment_epoch()`; resets the idle timer |
+| `ACTIVE` | `PAUSED_BY_SERVER` | `send_flow(paused=True, reason)` | Sends `{"t":"FLOW","paused":true,...}` |
+| `PAUSED_BY_SERVER` | `ACTIVE` | `send_flow(paused=False, reason)` | Only if currently paused |
+| `ACTIVE` / `PAUSED_BY_SERVER` / `COMMITTING` | `WAITING_RESUME` | `detach_leg()` — disconnect or `_on_idle` after `leg_idle_timeout` | Closes writers, cancels idle timer, sets `expires_at = now + session_resume_ttl`, fires `_on_expiry_change`, clears `leg_id` and `ws` |
+| `ACTIVE` | `COMMITTING` | `SESSION_END` frame (`_handle_session_end`) | Writes the client's final root summary with `sealed=True`, closes all writers |
+| `COMMITTING` | `COMMITTED` | `try_commit()` with both invariants satisfied | Sends `{"t":"COMMIT_OK","files":n,"bytes":n}` |
+| `COMMITTING` | `ACTIVE` | `try_commit()` invariant failure, retries not exhausted | Sends `COMMIT_RETRY`; resets `final_seq_seen`/`last_data_seq` so a new final POST is accepted |
+| `COMMITTING` | `FAILED` | `try_commit()` after `MAX_COMMIT_RETRIES` (5) consecutive no-progress retries | Sends `SESSION_ABORT{code:"commit_failed"}` |
+| any | `ABORTED` | `CLIENT_ABORT` frame (`_handle_client_abort`) | Closes writers, logs client code/reason |
+| any | `ABORTED` | `abort_storage_error(exc)` | Sends `SESSION_ABORT` with `code = "storage_full"` for `ENOSPC`/`EDQUOT`, else `"storage_error"` |
+| any | `ABORTED` | `abort_quota(reason)` | Sends `SESSION_ABORT{code:"quota_exceeded"}` |
+| `ACTIVE` / `PAUSED_BY_SERVER` / `COMMITTING` | `WAITING_RESUME` | `SessionRegistry.recover_session()` after a process restart | Forced because no leg exists post-restart |
 
-### 3.3 Wire protocol implementation (`protocol.py`)
-
-Two distinct encodings share one session:
-
-- **Control channel (WebSocket):** JSON objects, discriminated by a `"t"` field. Not defined by any schema in this module — the message shapes exist only as literal dicts scattered across `app.py` and `session_manager.py`. The only protocol constant here is `PROTOCOL_VERSION = "MFUP/2"`.
-- **Data legs (HTTP POST bodies):** a stream of length-prefixed binary frames, decoded by `FrameReader`.
-
-#### Binary framing
-
-```
-[u32 big-endian length][u8 tag][payload...]
-```
-
-`length` covers the tag byte plus the payload (`1 + len(payload)`). All multi-byte integers are big-endian (`struct` format `"!"`). Strings are `[u16 length][UTF-8 bytes]`. Optional fields are encoded as a `u8` presence flag followed, if set, by the value.
-
-There is **no version byte, magic number, or frame checksum in the envelope** — versioning is negotiated once, out of band, via the `v` field of the `HELLO` control message. Payload integrity is per-chunk only (`FILE_CHUNK` carries its own CRC-32C).
-
-#### Frame types
-
-The eight tags and their payload layouts are tabulated in §2.3. `SESSION_END` carries no `node_id` — it is session-scoped. All frame dataclasses use `@dataclass(slots=True)` and default every field, including `tag`.
-
-Supporting enums: `NodeKind` (`DIR = 0x00`, `FILE = 0x01`), `ChecksumKind` (`CRC32C = 0x01` — the only kind), `NodeStatus` (`open`, `closed`, `rejected`, `pruned`), and the constant `ROOT_NODE_ID = 0`.
-
-`Frame` is a union type alias over all eight dataclasses.
-
-#### Decoder
-
-| Symbol | Signature | Notes |
-|---|---|---|
-| `decode_frame_payload` | `(tag: int, payload: memoryview) -> Frame` | Raises `ValueError(f"unknown frame tag: {tag:#04x}")` on an unrecognised tag |
-| `FrameReader` | `class` | `feed(data: bytes) -> None` appends to an internal `bytearray`; `drain() -> list[Frame]` decodes every complete frame and deletes consumed bytes from the front |
-| `crc32c` | `(data: bytes \| memoryview, initial: int = 0) -> int` | Thin wrapper over the C-accelerated `crc32c` package (Castagnoli, `0x82F63B78`). **Hard dependency:** if the package is missing, import raises `ImportError("… pip install crc32c")` — the ~6 MB/s pure-Python fallback was removed deliberately (fail loud, not slow). `CRC32C_IMPL == "native"`, surfaced in `/health` |
-
-`FrameReader.drain()` breaks on the first incomplete frame and leaves the partial bytes buffered, so frames may be split arbitrarily across HTTP chunks. It deliberately copies each payload into a fresh `bytes` object before wrapping it in a `memoryview` — the comment notes this is so no memoryview keeps a reference into the mutable buffer that `del self._buf[:pos]` would then invalidate.
-
-`FrameReader(max_frame_len=DEFAULT_MAX_FRAME_LEN)` **caps the declared frame length** (default 1 MiB, above `MAX_CHUNK_BYTES` + headers): `drain()` raises `ValueError` when a prefix exceeds it, so a corrupt/malicious multi-gigabyte length can no longer grow the buffer unbounded. The exception propagates to `data_endpoint`, which returns `500 data_stream_error`.
-
-CRC-32C now runs in C (`crc32c` package) — the old pure-Python per-byte loop that blocked the event loop ~10 ms per 64 KiB chunk is gone.
-
-#### Control messages
-
-The 4 client→server and 12 server→client message shapes are tabulated in §2.4. They are not defined by any schema in this module — the shapes exist only as literal dicts across `app.py` and `session_manager.py`.
-
-`build_resume_ok()` maps each file's DB `NodeStatus` to a three-way client-facing string: `rejected` → `"rejected"`, `closed` → `"closed"`, everything else (including `pruned`) → `"open"`. Pruned nodes are additionally listed in `pruned_nodes`.
-
----
+`COMMITTING` is deliberately included in both the `detach_leg` and `recover_session` transitions: commit is client-initiated, so a session whose leg dropped mid-commit must be resumable and the client re-sends `SESSION_END` after `RESUME`. Correspondingly, `SessionRegistry.resume()` admits only `WAITING_RESUME`, `ACTIVE`, `PAUSED_BY_SERVER` and raises `ValueError(f"cannot resume session in state {state.value}")` otherwise (so a `COMMITTING` session must first pass through `detach_leg`). `recover_session()` returns `None` for the four terminal states.
 
 ### 3.4 Storage layer (`storage.py`)
 
@@ -712,1406 +362,2282 @@ The 4 client→server and 12 server→client message shapes are tabulated in §2
 
 ```
 <base_dir>/
-  .incoming.<session_id>/          # staging_prefix + "." + session_id
-    state.sqlite                   # (+ -wal, -shm from WAL mode)
-    payload/                       # mirrors the client's directory tree
-      <name>/<name>/<file>
-  <target_dir>/                    # final location, populated only by publish
+├── .incoming.<session_id>/          # staging_dir(); prefix = DEFAULT_STAGING_PREFIX = ".incoming"
+│   ├── state.sqlite                # the per-session journal (+ WAL/SHM sidecars)
+│   └── payload/                    # a 1:1 mirror of the client's tree
+│       └── <dir>/<dir>/<file>
+└── <target_dir>/                   # final destination (publish moves entries here)
 ```
 
-`base_dir` doubles as the parent for relative `target_dir` values, so staging and final trees are siblings — which is what makes `os.rename` at publish a same-filesystem, atomic-per-entry operation.
+There is no temp-suffix scheme: payload files are written at their **final relative names** inside `payload/`, and publish renames them (or their top-level ancestor directories) into `target_dir`. `AuthResult.base_dir` exists precisely so staging is created inside the user's own base — publish then stays a same-filesystem `rename()` even when homes live on separate mounts.
 
-| Helper | Signature | Description |
+| Helper | Signature | Behavior |
 |---|---|---|
-| `staging_dir` | `(base_dir, session_id, prefix=".incoming") -> Path` | Pure path construction: `base_dir / f"{prefix}.{session_id}"` |
-| `ensure_staging` | `(base_dir, session_id, prefix) -> Path` | `mkdir` the staging dir and its `payload/` subdir |
-| `open_session_db` | `(base_dir, session_id, prefix) -> SessionDB` | `ensure_staging` then `SessionDB(sd / "state.sqlite")` |
-| `validate_node_name` | `(name: str) -> None` | Raises `ValueError` on empty, `"."`, `".."`, or any name containing `/`, `\`, or NUL |
-| `resolve_payload_path` | `(base_dir, session_id, db, node_id, prefix) -> Path` | Walks the `parent_id` chain to `ROOT_NODE_ID`, validating each component, then verifies containment |
+| `staging_dir` | `(base_dir: Path, session_id: str, prefix=".incoming") -> Path` | Pure path join, `<base>/<prefix>.<sid>`; no I/O |
+| `ensure_staging` | `(base_dir, session_id, prefix) -> Path` | `mkdir(parents=True, exist_ok=True)` on staging and `payload/` |
+| `open_session_db` | `(base_dir, session_id, prefix) -> SessionDB` | `ensure_staging()` then opens `state.sqlite` |
+| `validate_node_name` | `(name: str) -> None` | Raises `ValueError` on empty, `"."`, `".."`, or a name containing `/`, `\`, or `\x00` |
+| `resolve_payload_path` | `(base_dir, session_id, db, node_id, prefix) -> Path` | Walks the `parent_id` chain to `ROOT_NODE_ID` building the relative path |
 
-The staging prefix is a configurable constant (`DEFAULT_STAGING_PREFIX = ".incoming"`, overridable via `MFUP_STAGING_PREFIX`) rather than a hardcoded literal, and the leading dot keeps staging dirs hidden from ordinary directory listings of `base_dir`.
-
-#### Path-traversal defenses
-
-Four independent layers, all read directly from the code:
-
-1. **Name validation at ingest** — `_handle_node` calls `validate_node_name(f.name)` before the node is ever written to the DB, dropping the frame on failure. `..`, absolute-ish names, separators, and NUL bytes never enter `nodes`.
-2. **Name validation at path construction** — `resolve_payload_path` calls `validate_node_name` again on every component it walks, so even a node that somehow reached the DB cannot produce a path.
-3. **Containment check after resolution** — `resolve_payload_path` ends with `if not result.resolve().is_relative_to(payload_root.resolve()): raise ValueError(f"path traversal detected: {result}")`, catching symlink-based escapes that name validation alone cannot (`resolve()` follows links).
-4. **Target-dir containment** — `app._is_safe_target` gates `target_dir` at HELLO and again at publish, and `LiveSession._resolve_target_path` independently returns `None` for any conflict-check path that escapes `base_dir`.
-
-The `resolve()`-based checks are TOCTOU-susceptible in principle (an attacker who can create symlinks inside the payload dir between the check and the open could redirect a write), but exploiting that requires filesystem write access to the staging directory, which the upload path itself does not grant beyond validated names. Flagged as inference — no comment in the code addresses it.
-
-#### Chunk assembly and commit atomicity
-
-Chunks are **not** staged as separate part files and later concatenated. `FileWriter` writes directly into the file's final payload path at strictly contiguous offsets; assembly is just sequential appending. Resume is handled by seek-and-truncate to `accepted_offset` (see `FileWriter` above), which guarantees the file on disk never contains bytes past the last durably-recorded offset.
-
-**Commit is a state flip, not a filesystem operation.** `try_commit()` verifies the invariant (`get_incomplete_files()` empty) and sets `state = COMMITTED`; nothing moves on disk. The actual materialization happens later in `publish.py`.
-
-**Publish is atomic per entry, not as a whole.** `publish_session` loops over `payload.iterdir()` calling `os.rename` (or `os.replace` for existing files in the merge path). Each individual rename is atomic on a POSIX filesystem, but there is no transaction spanning the loop and no rollback: a failure partway through leaves some entries published and the rest still staged, with `_cleanup_staging` not yet run. Stated as read from the code — there is no attempt at all-or-nothing semantics.
+`resolve_payload_path` applies three defenses: a `seen: set[int]` cycle detector (`ValueError("parent cycle detected at node …")`), a hard error on a missing ancestor (`ValueError("broken parent chain: node … unknown")` — a silent `break` would resolve a *shortened* path and write the file into the wrong directory), `validate_node_name` on every component, and finally a `result.resolve().is_relative_to(payload_root.resolve())` containment check.
 
 #### `SessionDB`
 
-One SQLite connection per session, opened with `timeout=5.0` and configured `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=3000`, `PRAGMA synchronous=NORMAL`. The schema is applied with `executescript` on every open (all statements are `IF NOT EXISTS` / `INSERT OR IGNORE`), so opening an existing DB is idempotent.
+Opens `sqlite3.connect(str(db_path), timeout=5.0)` and applies three pragmas — `journal_mode=WAL`, `busy_timeout=3000`, `synchronous=NORMAL` — then `executescript(_SCHEMA)`. Two additive columns are applied in place rather than via versioned migrations, because sessions are short-lived (TTL-bounded):
 
-Six tables:
-
-```sql
-sessions(session_id PK, resume_token, epoch DEFAULT 1, state DEFAULT 'active',
-         target_dir DEFAULT '.', expires_at, created_at, updated_at)
-nodes(node_id PK, parent_id, kind, name, size, mtime_ms, status DEFAULT 'open')
-files(node_id PK REFERENCES nodes, accepted_offset DEFAULT 0, final_size,
-      checksum_state BLOB, local_tmp_path)
-pruned(node_id PK)
-rejected(node_id PK, code, reason)
-root_summary(id PK CHECK (id = 1), scan_done_units, scan_est_units,
-             body_done_bytes, body_est_bytes, sealed)
+```python
+for col in ("meta_json", "auth_json"):
+    try:
+        self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 ```
 
-`files.checksum_state` is declared but never written or read anywhere — presumably reserved for whole-file rolling checksums (inferred).
+**One DB per session** falls out of the layout: the database lives *inside* the session's staging directory, so `_cleanup_staging()`'s single `shutil.rmtree` reclaims the journal together with the payload; a session is recovered by opening exactly one file (`recover_session` reads `staging_path / "state.sqlite"`); and each `LiveSession` owns one `SessionDB` connection with at most one active leg, so the write path has a single writer and never contends across sessions.
 
-| Method | Signature | Description |
+#### Schema — 6 tables, no secondary indices
+
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id   TEXT PRIMARY KEY,
+    resume_token TEXT NOT NULL,
+    epoch        INTEGER NOT NULL DEFAULT 1,
+    state        TEXT NOT NULL DEFAULT 'active',
+    target_dir   TEXT NOT NULL DEFAULT '.',
+    expires_at   TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);          -- plus meta_json TEXT, auth_json TEXT added by ALTER at open
+
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id    INTEGER PRIMARY KEY,
+    parent_id  INTEGER NOT NULL,
+    kind       TEXT NOT NULL,          -- 'dir' | 'file'
+    name       TEXT NOT NULL,
+    size       INTEGER,
+    mtime_ms   INTEGER,
+    status     TEXT NOT NULL DEFAULT 'open'   -- NodeStatus
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    node_id          INTEGER PRIMARY KEY REFERENCES nodes(node_id),
+    accepted_offset  INTEGER NOT NULL DEFAULT 0,
+    final_size       INTEGER,
+    checksum_state   BLOB,
+    local_tmp_path   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pruned (
+    node_id  INTEGER PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS rejected (
+    node_id  INTEGER PRIMARY KEY,
+    code     TEXT NOT NULL,
+    reason   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS root_summary (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    scan_done_units  INTEGER NOT NULL DEFAULT 0,
+    scan_est_units   INTEGER NOT NULL DEFAULT 0,
+    body_done_bytes  INTEGER NOT NULL DEFAULT 0,
+    body_est_bytes   INTEGER NOT NULL DEFAULT 0,
+    sealed           INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT OR IGNORE INTO root_summary (id) VALUES (1);
+```
+
+Constraints in force: `sessions.session_id`, `nodes.node_id`, `files.node_id`, `pruned.node_id`, `rejected.node_id` are PRIMARY KEYs; `files.node_id` carries a `REFERENCES nodes(node_id)` foreign key (declared, but `PRAGMA foreign_keys` is not enabled, so it is not enforced); `root_summary` is pinned to a single row by `CHECK (id = 1)`. **No `CREATE INDEX` statements exist** — every query is a PK lookup, a full scan of a small table, or a `files JOIN nodes` on the two PKs. `checksum_state BLOB` is declared but never read or written by any code in the package: no rolling whole-file checksum is persisted. `local_tmp_path` is written once by `set_file_final()` with the absolute payload path of the closed file.
+
+`NodeStatus` (also `str`-valued) has four members: `OPEN = "open"`, `CLOSED = "closed"`, `REJECTED = "rejected"`, `PRUNED = "pruned"`.
+
+#### `SessionDB` API
+
+Every mutating method ends in `_maybe_commit()`, which commits unless batch mode is active.
+
+| Method | Returns | Description |
 |---|---|---|
-| `init_session` | `(session_id, resume_token, expires_at, target_dir=".")` | `INSERT OR REPLACE` with `epoch=1`, `state='active'` |
-| `get_session` | `() -> Optional[sqlite3.Row]` | `SELECT * FROM sessions LIMIT 1` |
-| `get_target_dir` | `() -> str` | Defined; **no callers** |
-| `set_state` / `get_state` | `(SessionState)` / `-> SessionState` | Both commit/read immediately; `get_state` defaults to `ACTIVE` if the row is missing |
-| `increment_epoch` / `get_epoch` | `-> int` | `UPDATE ... epoch = epoch + 1` then re-`SELECT` (two statements, not atomic as a unit) |
-| `get_expires_at` / `set_expires_at` | `-> str` / `(str)` | ISO-8601 strings |
-| `upsert_node` | `(node_id, parent_id, kind, name, size=None, mtime_ms=None)` | `INSERT OR REPLACE` into `nodes`; for `FILE` kind also `INSERT OR IGNORE` a `files` row at offset 0 — so re-sending a `NODE` frame **does not reset `accepted_offset`**, which is what makes NODE replay on resume safe |
-| `get_node` / `set_node_status` | | |
-| `get_file` / `set_accepted_offset` / `set_file_final` | | `set_file_final` writes `final_size` and `local_tmp_path` |
-| `get_open_files` | `-> list[Row]` | Defined; **no callers** |
-| `get_all_files` | `-> list[Row]` | Feeds `build_resume_ok` |
-| `add_pruned` / `is_pruned` / `get_pruned_nodes` | | |
-| `add_rejected` / `is_rejected` / `get_rejected_files` | | `add_rejected` also sets node status to `REJECTED` |
-| `update_root_summary` / `get_root_summary` | | Single row, `id=1` |
-| `count_committed_files` | `-> tuple[int, int]` | `COUNT(*), COALESCE(SUM(accepted_offset), 0)` over files whose node status is not `rejected`/`pruned` — the `bytes` figure in `COMMIT_OK` |
-| `get_incomplete_files` | `-> list[dict]` | Non-rejected, non-pruned files where `final_size IS NULL OR accepted_offset != final_size` — the pre-commit invariant |
+| `conn` | `sqlite3.Connection` | Property exposing the raw connection |
+| `close()` | `None` | Closes the connection |
+| `begin_batch()` / `end_batch()` / `flush()` | `None` | Deferred-commit mode. A data POST carrying thousands of frames wraps its work in `begin_batch`/`end_batch` so mutations land in one transaction — 10–100× cheaper for many-small-files uploads. `flush()` commits without leaving the mode |
+| `init_session(session_id, resume_token, expires_at, target_dir=".", meta_json=None)` | `None` | `INSERT OR REPLACE` with an explicit column list (positional VALUES would break under the additive ALTERs), `epoch=1`, state `active` |
+| `set_auth_json(auth_json)` | `None` | Persists authorize-hook quotas + context so they survive restart / lazy-resume on another worker |
+| `get_session()` | `sqlite3.Row \| None` | Full session row |
+| `get_target_dir()` / `get_expires_at()` / `set_expires_at(s)` | `str` / `str` / `None` | Target dir and expiry accessors |
+| `get_state()` | `SessionState` | Defaults to `ACTIVE` when the row is missing |
+| `set_state(state)` | `None` | Also bumps `updated_at` |
+| `get_epoch()` / `increment_epoch()` | `int` | Leg fencing counter |
+| `upsert_node(node_id, parent_id, kind, name, size=None, mtime_ms=None)` | `bool` | `INSERT OR REPLACE` into `nodes`; for FILE kind also `INSERT OR IGNORE` into `files`. Returns `True` **iff a new `files` row was created**, letting the caller keep the file-count quota without SQL aggregates |
+| `get_node(node_id)` / `set_node_status(node_id, status)` | `Row \| None` / `None` | Node accessors |
+| `get_file(node_id)` | `Row \| None` | File progress row |
+| `set_accepted_offset(node_id, offset)` | `None` | Durable resume point |
+| `set_file_final(node_id, final_size, local_path)` | `None` | Records the client-declared final size and the on-disk path at FILE_CLOSE |
+| `get_open_files()` | `list[Row]` | `files JOIN nodes` where `n.status IN ('open')` |
+| `get_all_files()` | `list[Row]` | `(node_id, accepted_offset, status)` for every file — feeds `RESUME_OK` |
+| `add_pruned` / `is_pruned` / `get_pruned_nodes` | `None` / `bool` / `list[int]` | Server-initiated subtree drops |
+| `add_rejected(node_id, code, reason)` / `is_rejected` / `get_rejected_files` | `None` / `bool` / `list[int]` | `add_rejected` also sets the node status to `rejected` |
+| `update_root_summary(scan_done, scan_est, body_done, body_est, sealed)` | `None` | Writes the single `id=1` row |
+| `get_root_summary()` | `dict` | Five keys; returns all-zero defaults if the row is somehow absent |
+| `count_nodes()` | `int` | `COUNT(*) FROM nodes` — the commit node-count invariant |
+| `count_committed_files()` | `tuple[int, int]` | `(count, COALESCE(SUM(accepted_offset),0))` over `status NOT IN ('rejected','pruned')` |
+| `get_incomplete_files()` | `list[dict]` | Non-rejected/pruned files where `final_size IS NULL OR accepted_offset != final_size` |
 
-`sqlite3.Row` is assigned as `row_factory` lazily inside each reading method rather than once in `__init__`, so methods that return raw tuples (`get_epoch`, `get_state`, `get_target_dir`, `count_committed_files`) index positionally regardless. `set_state`, `set_expires_at`, and `increment_epoch` all issue `UPDATE sessions SET ...` **without a `WHERE` clause** — correct only because each DB is single-session by construction.
+### 3.5 Session manager (`session_manager.py`)
 
-Every mutating method calls `self._conn.commit()` individually, so a single `FILE_CHUNK` performs at least two synchronous SQLite commits (`set_accepted_offset` plus the root-summary update) plus a read of the summary — three round-trips per chunk.
+#### `FileWriter`
 
----
+One open file handle per in-flight file, keyed by `node_id` in `LiveSession.writers`.
 
-### 3.5 Redis index (`redis_index.py`)
+| Member | Description |
+|---|---|
+| `__init__(path, node_id, accepted_offset=0)` | `mkdir(parents=True, exist_ok=True)` on the parent. `accepted_offset == 0` → `open(path, "wb")`; otherwise `open(path, "r+b")`, `seek(accepted_offset)`, `truncate()` — a resume discards any bytes past the last durably-recorded offset |
+| `async write(data, offset) -> int` | Raises `ValueError(f"bad offset: expected {…}, got {…}")` on mismatch; otherwise `await asyncio.to_thread(self._sync_write, data)` and returns the new `accepted_offset` |
+| `_sync_write(data)` | `write()` + `flush()` — no `fsync`; durability against power loss is not claimed, only against process crash |
+| `close()` | Closes the handle |
 
-An async wrapper over `redis.asyncio` holding session expiry and path metadata, so cleanup and startup recovery never need to scan the filesystem or open any SQLite file. The module docstring states the sweeper flow explicitly: *"ZRANGEBYSCORE → HGETALL meta → rmtree(staging_dir) → ZREM + DEL meta. No iterdir. No SQLite opens for cleanup."*
+#### `LiveSession`
 
-#### Key schema
+Constructor keywords and their defaults: `target_dir="."`, `staging_prefix=DEFAULT_STAGING_PREFIX`, `session_resume_ttl=3600`, `leg_idle_timeout=60`, `publish_timeout=30`, `max_chunk_bytes=262144` (256 KiB), `conflict_check=True`.
 
-| Key | Type | Contents |
+At construction it restores state that must survive a restart or a lazy-resume on a different worker: `meta_json` → `client_meta`, and `auth_json` → `quota_max_bytes`, `quota_max_files`, `auth_context` (unparseable JSON is logged as a warning and ignored, not fatal). Running quota totals `files_seen` / `bytes_accepted` are then seeded from `db.count_committed_files()`.
+
+| Member | Type | Description |
 |---|---|---|
-| `mfup:sessions` (`SESSIONS_KEY`) | sorted set | member = `session_id`, score = `expires_at` as a Unix timestamp (float) |
-| `mfup:meta:{session_id}` (`META_PREFIX + id`) | hash | fields `target_dir`, `staging_dir` (both absolute path strings) |
+| `state` | property → `SessionState` | Reads through to SQLite every access (never cached) |
+| `expires_at` | property → `str` | Reads through to SQLite |
+| `epoch` | `int` | Leg fencing counter, mirrored from the DB |
+| `writers` | `dict[int, FileWriter]` | One writer per open file |
+| `ws` | `Any` | Duck-typed control channel; only `send_json(dict)` is ever called — the core never imports FastAPI |
+| `conflict_state` | `str` | FSM: `"clean"` → `"conflict_dir"` → `"conflict_files"` |
+| `dropped_nodes` | `set[int]` | Nodes rejected at ingest (illegal name); counted in the commit node-count invariant so a tree with a few bad names can still commit |
+| `publish_action` | `str \| None` | Set by the client's ACTION message |
+| `validate_seq(seq)` / `advance_seq(seq)` / `validate_and_advance_seq(seq)` | methods | `seq == last_data_seq + 1`. `advance_seq` is called only after the POST body is fully handled, so a client may safely retry a failed POST with the same seq (a genuine duplicate then gets `seq_mismatch`) |
+| `attach_leg(leg_id) -> int` | method | See §3.3; returns the new epoch |
+| `detach_leg()` | method | See §3.3 |
+| `async process_frame(frame, leg_id)` | method | **Leg fence**: frames whose `leg_id` differs from `self.leg_id` are logged and dropped. Resets the idle timer, then dispatches on frame type |
+| `async prune_node(node_id, code, reason)` | method | Marks pruned, closes the writer, sends `PRUNE_NODE` |
+| `async reject_file(node_id, code, reason)` | method | Marks rejected, closes the writer, sends `REJECT_FILE` |
+| `async send_flow(paused, reason)` | method | Flips state and sends `FLOW` |
+| `apply_auth(max_total_bytes, max_files, context)` | method | Sets quotas and persists them via `set_auth_json`. A non-JSON-serializable `context` is kept in memory but persisted as `{}` with a warning |
+| `async abort_quota(reason)` / `async abort_storage_error(exc)` | methods | Terminal aborts (§3.3) |
+| `async try_commit() -> dict \| None` | method | The commit gate (below) |
+| `build_resume_ok() -> dict` | method | `{t, epoch, expires_at, root_summary, files[{node_id, accepted_offset, status}], pruned_nodes, rejected_files}`; per-file status is normalized to `"rejected"` / `"closed"` / `"open"` |
+| `send_control(msg)`, `_send_file_ack`, `_send_nack` | methods | All wrap `ws.send_json` in try/except — a dead control channel logs but never raises into the ingest path |
 
-Neither key carries a Redis-native TTL — expiry is expressed purely as the sorted-set score, so entries persist until the sweeper (or an explicit `remove`) deletes them. This is deliberate: the server needs to *find* expired sessions in order to `rmtree` their staging directories, which native key expiry would make impossible.
+#### Frame handlers
 
-#### API
-
-`SessionMeta` is a two-slot value object (`target_dir`, `staging_dir`).
-
-| Method | Signature | Redis operations |
+| Handler | Frame | Behavior |
 |---|---|---|
-| `__init__` | `(redis_url="redis://redis:6379/0")` | `aioredis.from_url(..., decode_responses=True)` |
-| `register` | `async (session_id, expires_at: datetime, target_dir: str, staging_dir: str)` | Pipelined `ZADD` + `HSET` — one round trip |
-| `update_expiry` | `async (session_id, expires_at: datetime)` | `ZADD` (re-scores the existing member) |
-| `get_expired` | `async (now=None) -> list[str]` | `ZRANGEBYSCORE key -inf <now>` |
-| `get_not_expired` | `async (now=None) -> list[str]` | `ZRANGEBYSCORE key <now> +inf` |
-| `all_sessions` | `async () -> list[str]` | `ZRANGE key 0 -1` |
-| `get_meta` | `async (session_id) -> SessionMeta \| None` | `HGETALL`; `None` on an empty hash |
-| `remove` | `async (session_id)` | Pipelined `ZREM` + `DEL` |
-| `close` | `async ()` | `aclose()` |
+| `_handle_node` | `NODE` | Skips pruned nodes. Illegal name → adds to `dropped_nodes` and `reject_file(…, "illegal_name", …)` (rejecting rather than ignoring stops an `unknown_node` NACK storm). Unknown non-root parent → `NACK_CHUNK{reason:"unknown_node"}` and **the node is not stored** (its payload path could not be resolved, or would silently resolve short). Otherwise upserts; a newly created file row increments `files_seen` and may trip `abort_quota`. DIR nodes are `mkdir`-ed immediately; an `OSError`/`ValueError` there (e.g. a sibling FILE node already claimed the path) rejects just that node with `fs_conflict` rather than failing the upload |
+| `_handle_file_open` | `FILE_OPEN` | Skips rejected/pruned. Unknown node or unresolvable path → `unknown_node` NACK. A duplicate `FILE_OPEN` pops and closes the previous writer first so the handle cannot leak. An `OSError` in `_FATAL_STORAGE_ERRNOS` aborts the session; any other `OSError` rejects the single file with `fs_conflict` so the rest of the tree still commits |
+| `_handle_file_chunk` | `FILE_CHUNK` | The ordered validation gate — see below |
+| `_handle_file_close` | `FILE_CLOSE` | Pops and closes the writer, `set_file_final(node_id, f.size_sent, path)`, status → `closed`, sends a final `FILE_ACK` |
+| `_handle_dir_close` | `DIR_CLOSE` | Status → `closed` |
+| `_handle_summary` | `SUMMARY` | Merges monotonically: `max()` of each scan/estimate counter, `sealed` OR-ed, and **`body_done_bytes` is kept server-side** — the client's number is ignored |
+| `_handle_session_end` | `SESSION_END` | Writes the client's final scan counters with `sealed=True`, closes all writers, state → `COMMITTING` |
+| `_handle_client_abort` | `CLIENT_ABORT` | Closes writers, state → `ABORTED` |
 
-#### Is Redis required?
+`_handle_file_chunk` performs its checks in a fixed order, and every rejection path leaves `accepted_offset` untouched:
 
-**Yes — required, not optional.** There is no in-memory fallback, no feature flag, and no `try`/`except` around the calls that matter:
+1. Rejected/pruned node → silently ignored.
+2. No writer → `NACK_CHUNK` with `reason = "unknown_node"` if the node is unknown, else `"bad_offset"`, carrying the DB's `accepted_offset`.
+3. `f.length > self.max_chunk_bytes` → `NACK_CHUNK{reason:"server_policy"}`.
+4. `bytes_accepted + f.length > quota_max_bytes` → `abort_quota` (checked **before** writing).
+5. **Checksum**: when `f.checksum_kind == ChecksumKind.CRC32C`, `crc32c(f.payload)` (initial `0`) must equal `f.checksum`, else `NACK_CHUNK{reason:"bad_checksum"}` — nothing is written and the offset does not advance, so the client simply re-sends from `expected_offset`.
+6. `f.offset != writer.accepted_offset` → `NACK_CHUNK{reason:"bad_offset"}`.
+7. Write. An `OSError` whose errno is in `_FATAL_STORAGE_ERRNOS = {ENOSPC, EDQUOT, EROFS, EFBIG}` calls `abort_storage_error` (retrying cannot clear a capacity failure — a client that kept resending would just spin); any other exception yields `NACK_CHUNK{reason:"server_policy"}`.
+8. On success: `set_accepted_offset`, `bytes_accepted += f.length`, `body_done_bytes` incremented in `root_summary`, and a cumulative `FILE_ACK` is emitted roughly every 256 KiB (`new_offset % (256*1024) < f.length or f.length == 0`).
 
-- `SessionIndex(REDIS_URL)` is constructed unconditionally in `lifespan`.
-- In the HELLO path, `await idx.register(...)` sits inside a `try` that catches only `ValueError`. A `redis.ConnectionError` propagates out to the WS handler's `except Exception`, so **`HELLO_OK` is never sent and session creation appears to fail** — even though `registry.create` already succeeded and left a live in-memory session behind.
-- `publish_endpoint` and `sweep_endpoint` both await Redis calls with no error handling.
+CRC-32C is therefore verified in exactly one place, per chunk, at ingest — and never recomputed at close, commit, or publish.
 
-The two places that *do* tolerate a Redis outage are startup recovery (wrapped in `try/except Exception` — a failure just means zero sessions are recovered) and the sweeper loop body (logs and continues to the next interval). So a Redis outage degrades gracefully at boot and during cleanup, but hard-fails every new upload.
+#### Commit invariants (`try_commit`)
 
-`register()` also boundary-crosses in one direction only: expiry updates flow *server → Redis* through the `_on_expiry_change` callback via `asyncio.ensure_future` (fire-and-forget, no result awaited, no error surfaced). A failed expiry update is silently lost, leaving the sorted-set score stale — the sweeper could then delete a session that is actually still alive.
+Returns `None` unless the state is `COMMITTING`. Any surviving writers are closed with a warning first. Then two invariants:
 
----
+1. **Node count** — `db.get_root_summary()["scan_done_units"]` (the client's final scan total from `SESSION_END`) must equal `db.count_nodes() + len(self.dropped_nodes)`. This closes the hole where NODE frames lost with a failed data POST would make whole files invisible to the completeness check below.
+2. **Completeness** — `db.get_incomplete_files()` must be empty; the retry payload lists `{node_id, accepted_offset}` for each.
+
+Either failure calls `_commit_retry_exhausted()`, which compares the tuple `(count_nodes(), accepted_bytes)` against `_commit_progress`. If it grew, the counter resets to 0 and the loop continues; only `MAX_COMMIT_RETRIES = 5` *consecutive no-progress* rounds trip the guard. A large-file resume that legitimately needs many rounds keeps progressing and is never falsely killed, while a genuinely stuck file (ENOSPC, unsatisfiable write) stalls and fails. Non-exhausted → state back to `ACTIVE`, `final_seq_seen = False`, `last_data_seq = -1`, `COMMIT_RETRY` sent. Exhausted → state `FAILED` plus `SESSION_ABORT{code:"commit_failed"}`. On success → `COMMITTED` and `{"t": "COMMIT_OK", "files": file_count, "bytes": total_bytes}` is both sent and returned.
+
+#### Conflict pre-check (ingest-time)
+
+`_check_conflict(node_id, is_dir)` runs on every NODE frame when `conflict_check` is true. `_resolve_target_path` rebuilds where the node *would* land under `target_dir` (resolving a relative `target_dir` against `base_dir`) and returns `None` if the resolved path escapes `base_dir`. A dir-vs-dir match advances `"clean" → "conflict_dir"` silently; anything else jumps to the terminal `"conflict_files"` and sends `{"t":"ASK","code":"target_conflict","node_id":…,"name":…}` exactly once — `name` is the conflicting basename only, never a server-side path, and `code`/`node_id`/`name` are additive fields older clients ignore. When a `map_file` hook is configured the transport passes `conflict_check=False`, because the ingest check inspects the *client's* layout which no longer predicts the final one; conflicts then surface at publish instead.
+
+#### `SessionRegistry`
+
+An in-process `dict[str, LiveSession]` guarded by an `asyncio.Lock`, with **no startup scan** — stale staging directories are reclaimed by the Redis-driven sweeper in the transport.
+
+| Method | Description |
+|---|---|
+| `__init__(base_dir, staging_prefix=".incoming", **defaults)` | `defaults` are forwarded verbatim to every `LiveSession` constructor |
+| `async create(session_id, resume_token, leg_id, expires_at, target_dir=".", base_dir=None, meta_json=None)` | Raises `ValueError` if the id already exists. `base_dir` overrides the registry base for this one session (per-user home from the authorize hook) so staging lives inside it and publish stays a same-filesystem rename. Opens the DB, `init_session`, constructs the `LiveSession`, `attach_leg` |
+| `async resume(session_id, resume_token, leg_id)` | `KeyError` if unknown, `PermissionError("invalid resume token")` on token mismatch, `ValueError` for a non-resumable state; otherwise `attach_leg` |
+| `get(session_id)` | Non-locking dict lookup |
+| `async remove(session_id)` | Pops, `detach_leg()`, `db.close()` |
+| `async recover_session(session_id, staging_path)` | Opens `staging_path / "state.sqlite"`; returns `None` if missing, unopenable, the sessions table is empty, or the state is terminal. Forces `ACTIVE`/`PAUSED_BY_SERVER`/`COMMITTING` → `WAITING_RESUME`. Derives the session's base dir as `staging_path.parent` — correct by construction (`staging = <base>/<prefix>.<sid>`) and the reason per-user base dirs need not be persisted anywhere else. If the id raced into the registry meanwhile, the freshly opened DB is closed and the existing session returned |
+| `all_sessions()` | Shallow copy of the registry dict |
 
 ### 3.6 Publish (`publish.py`)
 
-Moves a committed session's `payload/` contents into the caller's target directory using renames.
+Two publish strategies plus the helpers they share.
 
-| Symbol | Signature | Description |
+| Export | Signature | Description |
 |---|---|---|
-| `ConflictError` | `Exception` with `conflicting_files: int` | Raised when conflicts exist and no `action` was supplied |
-| `detect_conflicts` | `(target_dir: Path, payload: Path) -> int` | Counts file-vs-file collisions and type mismatches; dir-vs-dir pairs are recursed into, not counted |
-| `publish_session` | `(base_dir, session_id, target_dir, prefix=".incoming", action: str \| None = None) -> list[str]` | Main entry point |
-| `_merge_tree` | `(src, dst) -> list[str]` | Recursive overwrite-merge |
-| `_cleanup_staging` | `(sd) -> None` | `shutil.rmtree(..., ignore_errors=True)`, itself wrapped in try/except |
+| `ConflictError` | `__init__(conflicting_files: int)` | Message `"{n} conflicting file(s)"`; `.conflicting_files` is read by the transport to build the client ASK |
+| `MappingError` | `Exception` | Escape attempt, illegal segment, or two files mapped to one destination |
+| `list_payload_files` | `(base_dir, session_id, prefix) -> list[tuple[str, int]]` | `os.walk` over `payload/`, POSIX-relative paths and `st_size`, sorted. `FileNotFoundError` if `payload/` is absent |
+| `validate_mapped_path` | `(rel: str) -> None` | Must be relative and non-empty; each `/`-separated segment passes `validate_node_name` |
+| `detect_conflicts` | `(target_dir, payload) -> int` | Recursive count. Dir-vs-dir recurses (auto-merge, not a conflict); file-vs-file counts 1; a type mismatch counts 1 |
+| `publish_session` | `(base_dir, session_id, target_dir, prefix, action=None) -> list[str]` | Whole-tree publish |
+| `publish_session_mapped` | `(base_dir, session_id, target_dir, mapping, prefix, action=None) -> list[str]` | Per-file publish driven by the `map_file` hook |
 
-`publish_session` flow: resolve `staging_dir/payload` (raises `FileNotFoundError` if absent) → `target_dir.mkdir(parents=True, exist_ok=True)` → `detect_conflicts`. If conflicts exist and `action is None`, raise `ConflictError`. If conflicts exist and `action == "merge_overwrite"`, run `_merge_tree`. Otherwise take the clean path: a flat loop of `os.rename(entry, target/entry.name)` over the payload's top-level entries — moving whole subtrees by a single rename each. Finally `_cleanup_staging` removes the entire staging dir including `state.sqlite`.
+**`publish_session`** creates `target_dir`, counts conflicts, and raises `ConflictError` if any exist while `action is None`. With `action == "merge_overwrite"` it runs `_merge_tree`, which recurses into matching directories, `os.replace`s colliding files, `unlink`s a file standing where a directory must go, and `os.rename`s everything else. With no conflicts it takes the fast path: one `os.rename` per **top-level entry** of `payload/`, so an entire uploaded directory moves with a single syscall. Returns the published entry names.
 
-`_merge_tree` handles three cases per entry: dir-onto-dir recurses; dir-onto-file unlinks the file then renames; file-onto-anything uses `os.replace` (atomic overwrite) or `os.rename` (create).
+**`publish_session_mapped`** takes `mapping: dict[str, str]` (payload-relative source → target-relative destination); sources absent from the mapping keep their client layout. It builds and fully validates the plan **before moving anything** — per-segment validation, a `dest.resolve().is_relative_to(target_dir.resolve())` containment check, and a `seen` dict that raises `MappingError(f"two files map to {dest_rel!r}: …")` on collision — so a consumer-hook bug cannot leave the publish half-applied. It then counts conflicts against the plan and raises `ConflictError` if `action is None`. It materializes **files only**: parent directories are created on demand and empty client directories are not preserved.
 
-Two behaviors worth calling out, both read directly:
+Both paths finish with `_cleanup_staging(sd)`, a `shutil.rmtree(..., ignore_errors=True)` that removes `state.sqlite`, the now-empty `payload/`, and the staging directory itself.
 
-- **`detect_conflicts` has its argument order inverted in the recursive call.** The signature is `(target_dir, payload)`, but the recursion is `detect_conflicts(dest, entry)` where `dest` is the *target* side and `entry` is the *payload* side — i.e. `(target, payload)`, matching the signature. The naming inside the loop (`entry` from `payload.iterdir()`, `dest` in `target_dir`) is consistent. No defect here, but the local names read backwards at a glance.
-- **A conflict value of `action` other than `"merge_overwrite"` silently falls through to the clean path.** The `else` branch runs bare `os.rename` even when `conflicts > 0` — and `os.rename` onto an existing *directory* raises `OSError`, while onto an existing *file* it silently overwrites on POSIX. The only other `action` the control loop accepts is `"cancel"`, which aborts the session before publish is reachable, so this is not currently exploitable through the control channel. But `publish_endpoint` passes `session.publish_action` straight through with no validation of its own.
+**Atomicity.** Each individual file lands via `os.rename` (or `os.replace` when overwriting), which is atomic on a POSIX filesystem — a reader never sees a partial file at the destination. The publish *as a whole* is not transactional: it is a loop of renames, so a crash midway leaves some entries published and the rest in staging. The design mitigations are (a) full plan validation before the first move in mapped mode, and (b) `AuthResult.base_dir`, which keeps staging and target on one filesystem so `rename` cannot degrade into a copy.
 
-Publish is fully synchronous and blocking — `publish_endpoint` is an `async def` that calls `publish_session` directly, so a large `_merge_tree` blocks the event loop for its duration.
+### 3.7 Hooks (`hooks.py`)
 
----
+Three extension points, resolved from dotted `pkg.module:attr` strings (env-driven) or passed as callables (library embedding). The referenced module only has to be importable — no plugin packaging.
 
-### 3.7 Concurrency and safety invariants
+| Hook | Type alias | Fires | Return contract |
+|---|---|---|---|
+| `authorize` (`MFUP_AUTHORIZE`) | `AuthorizeHook = Callable[[AuthRequest], Awaitable[Optional[AuthResult]]]` | Once per HELLO, **before the session is created** | `AuthResult(...)` allows (optionally constraining); `None` **vetoes** → client gets `SESSION_ABORT(auth_failed)`. Raising is treated as a deny (logged server-side, generic reason to the client) |
+| `map_file` (`MFUP_MAP_FILE`) | `MapFileHook = Callable[[FileMapRequest], Awaitable[Optional[str]]]` | Once per file at **publish** time | `str` — new path relative to `target_dir`; `None` — keep the client's layout for that file. Two files mapping to one destination, or an escaping/absolute/illegal path, fails publish with `mapping_conflict` / `MappingError`. Because it runs at publish, it need not be deterministic across transfer retries |
+| `on_committed` (`MFUP_ON_COMMITTED`) | `OnCommittedHook = Callable[[CommitEvent], Awaitable[Optional[str]]]` | Right after a session commits | `"publish"` — server publishes immediately (the browser's own publish call then 404s, harmlessly); `None` — do nothing, publish stays client-driven. Raising is logged and treated as `None` so a broken hook cannot strand committed sessions |
 
-**Locking.** There are exactly two `asyncio.Lock` instances. `SessionRegistry._lock` (line 548) guards `create`, `resume`, `remove`, and `recover_session` — it protects the `_sessions` dict against interleaved creation/removal. `SessionRegistry.get()` is deliberately unlocked and synchronous.
+`authorize` is the only hook that can veto. `map_file` cannot block a publish but can fail it by returning an unusable path. `on_committed` can only *add* a server-side publish.
 
-`LiveSession._lock` (line 131) **is created and never acquired** — verified by grep: all four `async with self._lock` sites are in `SessionRegistry`. There is therefore **no per-session mutual exclusion**. Serialization of a session's work instead rests on two protocol-level invariants:
+#### Hook payloads
 
-1. **One active leg per session.** `attach_leg` overwrites `leg_id` and closes all writers. Every data POST checks `session.leg_id == leg_id` up front and again on each streamed chunk; `process_frame` re-checks and drops frames from a stale leg.
-2. **One epoch per leg.** Every `attach_leg` bumps the persisted epoch, and data POSTs carrying a stale `?epoch=` are rejected with `409` — including mid-stream, so an in-flight body is abandoned.
+```python
+@dataclass(frozen=True)
+class AuthRequest:
+    session_id: str
+    target_dir: str
+    headers: Mapping[str, str]   # WebSocket handshake headers (cookies, Authorization, …)
+    client: str                  # ASGI-reported "ip:port" or ""
+    query: Mapping[str, str]     # WebSocket URL query parameters
+    meta: Any = None             # HELLO.meta — UNTRUSTED client JSON; the hook validates it
 
-**Concurrent POSTs on the same leg are still possible.** `validate_and_advance_seq` is a pure synchronous function, so its check-and-advance cannot interleave, but everything after it is `await`-heavy. Two POSTs sent back-to-back with `seq=N` and `seq=N+1` both pass the gate and then interleave their frame processing at every `await`. In that case the safety net is `FileWriter.write`'s offset assertion: a chunk arriving at the wrong offset produces `NACK_CHUNK bad_offset` (or, if it raced past the writer's check, a `ValueError` caught and turned into `NACK_CHUNK server_policy`) rather than a corrupt file. Data integrity holds; throughput does not. This is inferred from the control flow — no comment addresses it and there is no test.
+@dataclass(frozen=True)
+class AuthResult:
+    max_total_bytes: Optional[int] = None   # exceeded → SESSION_ABORT(quota_exceeded)
+    max_files: Optional[int] = None         # exceeded → SESSION_ABORT(quota_exceeded)
+    base_dir: Optional[str] = None          # absolute per-session base (e.g. user home); created if missing
+    target_dir: Optional[str] = None        # override / rewrite of the client request
+    context: dict[str, Any] = field(default_factory=dict)
 
-A related and more consequential race: `_handle_file_chunk` does a read-modify-write of the root summary (`get_root_summary()` → `update_root_summary(... body_done_bytes + len(payload) ...)`) with an `await` boundary in between. Interleaved chunk handling can lose byte counts. Since `body_done_bytes` is only a progress figure — `COMMIT_OK`'s `bytes` comes from `count_committed_files()` summing `accepted_offset` — the damage is cosmetic. Inferred, not documented in the code.
+@dataclass(frozen=True)
+class FileMapRequest:
+    session_id: str
+    path: str          # "/"-separated path inside the uploaded tree, as the client sent it
+    name: str          # last segment of `path`
+    size: int          # actual size on disk
+    target_dir: str    # already authorized/mapped at HELLO
+    meta: Any          # client session meta
+    context: Mapping[str, Any]   # AuthResult.context
 
-**Idempotency and duplicate handling.**
+@dataclass(frozen=True)
+class CommitEvent:
+    session_id: str
+    target_dir: str
+    base_dir: str
+    staging_dir: str   # absolute staging dir holding the committed payload
+    files: int         # as sent in COMMIT_OK
+    bytes: int
+    meta: Any
+    context: Mapping[str, Any]
+```
 
-| Situation | Server behavior |
+`AuthResult.base_dir` overrides `MFUP_BASE_DIR` for that session: staging is created inside it, a relative `target_dir` resolves against it, and the containment check confines the session to it. `AuthResult.target_dir` may prefix or rewrite the client's request (`target_dir=f"incoming/{req.target_dir}"`); escapes remain impossible because the resolved target must stay within the session's `base_dir` or HELLO is refused with `bad_target_dir`. `AuthResult.context` is a free-form correlation bag, never sent to the client.
+
+#### Loaders
+
+| Function | Behavior |
 |---|---|
-| Duplicate POST (same `seq` replayed) | `409 seq_mismatch` before the body is read — the request is cheap to reject and writes nothing |
-| Out-of-order POST (`seq` gap) | `409 seq_mismatch` with `expected: last_data_seq + 1` |
-| POST after `final=1` on the same leg | `409 data_after_final` |
-| POST from a superseded connection | `409 stale leg` or `409 stale_epoch`, and mid-stream `break` if the leg/epoch changes after the body started |
-| Duplicate `FILE_CHUNK` (offset already written) | `NACK_CHUNK` with `reason: "bad_offset"` and `expected_offset: accepted_offset` — **not** silently accepted, so the client resyncs from the acknowledged offset |
-| Corrupt `FILE_CHUNK` | CRC-32C mismatch → `NACK_CHUNK reason: "bad_checksum"`; nothing is written |
-| Duplicate `NODE` frame | `INSERT OR REPLACE` into `nodes` but `INSERT OR IGNORE` into `files` — replaying node metadata on resume does not reset `accepted_offset` |
-| Duplicate `FILE_OPEN` | Constructs a fresh `FileWriter` at the persisted `accepted_offset` and overwrites `self.writers[node_id]`, leaking the previous file handle (the old writer is replaced, not closed) |
-| Truncated upload → `SESSION_END` anyway | Caught by the pre-commit invariant → `COMMIT_RETRY` with the incomplete list, state back to `ACTIVE`, seq counters reset |
-| Server restart mid-transfer | `recover_session` reverts `ACTIVE`/`PAUSED_BY_SERVER`/`COMMITTING` to `WAITING_RESUME`; client resumes and `build_resume_ok` reports per-file `accepted_offset` |
-| Leg goes silent | `LEG_IDLE_TIMEOUT` (60s) fires `_on_idle` → `detach_leg` → `WAITING_RESUME` with the TTL refreshed |
-| Session never resumed | `SESSION_RESUME_TTL` (3600s) elapses, sweeper `rmtree`s the staging dir and drops both Redis keys |
+| `load_hook(dotted) -> Callable` | Splits on `":"`; raises `ImportError(f"invalid hook path {dotted!r}: expected 'package.module:callable'")` when either half is missing, then `importlib.import_module` + `getattr`. Import/attribute errors propagate loudly — a misconfigured hook must fail at startup rather than silently run allow-all |
+| `load_authorize_hook(dotted \| None)` | `None` → returns `None` **and logs a warning**: "running WITHOUT authorization (allow-all). Do not do this in production." |
+| `load_map_file_hook(dotted \| None)` | `None` → identity layout |
+| `load_on_committed_hook(dotted \| None)` | `None` → client-driven publish |
+| `resolve_hook(ref)` | Accepts a callable (library embedding, `MfupConfig(authorize=my_func)`) or a dotted string (env-driven); `None` passes through |
 
-**Durability.** `FileWriter._sync_write` flushes but never `fsync`s, and SQLite runs at `synchronous=NORMAL` under WAL. A `COMMIT_OK` therefore guarantees the invariants held and the bytes reached the OS page cache — not that they survive a power loss. Read from the pragma settings and the write path; no comment claims otherwise.
+### 3.8 Redis expiry index (`redis_index.py`)
 
-**Unbounded resources.** No cap on `FrameReader` buffer growth, no enforcement of `MAX_CHUNK_BYTES` / `MAX_OPEN_FILES` / `MAX_PENDING_FILES`, no limit on the number of concurrent sessions in `SessionRegistry._sessions` (each holding an open SQLite connection), and no cap on total staged bytes.
+A thin `redis.asyncio` wrapper over exactly two key patterns:
 
----
-
-### 3.8 Entry point and packaging
-
-**`server/mfup/__main__.py`** — `python -m mfup` runs `uvicorn.run("mfup.app:app", host="0.0.0.0", port=8070, log_level="info")`. Host, port, and worker count are hardcoded; there is no CLI argument parsing. Note that the design is inherently **single-process**: `SessionRegistry` is in-memory, so a second worker would not see sessions created by the first (`registry.get()` returning `None` → `410` on data POSTs, `resume()` raising `KeyError` → `not_found`). Redis indexes sessions but does not share the live registry.
-
-**`server/pyproject.toml`** — package `mfup-server` 0.1.0, `requires-python = ">=3.10"`.
-
-| Dependency | Constraint | Used for |
+| Key | Redis type | Contents |
 |---|---|---|
-| `fastapi` | `>=0.115.0` | ASGI app, routing, WebSocket |
-| `uvicorn[standard]` | `>=0.30.0` | ASGI server |
-| `websockets` | `>=13.0` | WebSocket transport for uvicorn |
-| `redis` | `>=5.0.0` | `redis.asyncio` session index |
+| `mfup:sessions` (`SESSIONS_KEY`) | sorted set | member = `session_id`, score = `expires_at.timestamp()` (float unix seconds) |
+| `mfup:meta:{session_id}` (`META_PREFIX = "mfup:meta:"`) | hash | fields `target_dir` and `staging_dir`, both full paths |
 
-Optional `dev` extra: `pytest`, `pytest-asyncio`, `httpx`. `sqlite3` comes from the standard library. Note that `Path.is_relative_to` (used in `resolve_payload_path`) requires Python 3.9+, satisfied by the 3.10 floor; `dataclass(slots=True)` requires 3.10 exactly, so the floor is tight.
+**No Redis-native TTL is ever set on either key** — `EXPIRE`/`SETEX` are not used. Expiry is entirely score-based and swept: `ZRANGEBYSCORE → HGETALL meta → rmtree(staging_dir) → ZREM + DEL meta`. That design is the whole point of the index: cleanup needs no `iterdir` of the base directory and no SQLite opens.
 
----
+| Method | Redis commands | Description |
+|---|---|---|
+| `__init__(redis_url="redis://redis:6379/0")` | — | `aioredis.from_url(..., decode_responses=True)`, so all reads return `str` |
+| `async register(session_id, expires_at, target_dir, staging_dir)` | `ZADD` + `HSET` in one pipeline | Single round-trip registration |
+| `async update_expiry(session_id, expires_at)` | `ZADD` | Re-scores an existing member. Wired to `LiveSession._on_expiry_change` by the transport, so each `detach_leg()` pushes the new resume deadline |
+| `async get_expired(now=None)` | `ZRANGEBYSCORE(-inf, now)` | Sweeper input; `now` defaults to `datetime.now(timezone.utc)` |
+| `async get_not_expired(now=None)` | `ZRANGEBYSCORE(now, +inf)` | Still-alive sessions |
+| `async is_registered(session_id)` | `ZSCORE` | `True` iff a score exists |
+| `async get_meta(session_id)` | `HGETALL` | `SessionMeta \| None`; missing fields default to `target_dir="."`, `staging_dir=""` |
+| `async all_sessions()` | `ZRANGE(0, -1)` | Every id regardless of expiry |
+| `async remove(session_id)` | `ZREM` + `DEL` in one pipeline | Full deregistration |
+| `async close()` | — | `await self._redis.aclose()` |
 
-### 3.9 Tests (`tests/test_protocol.py`)
+`SessionMeta` is a `__slots__ = ("target_dir", "staging_dir")` value object.
 
-The **only** test file in the server (verified by `find`; `tests/__init__.py` is the sole other file in the directory). It contains **8 test functions**, all synchronous, all exercising `protocol.py` in isolation with no fixtures, no I/O, and no app instantiation. Two module-local helpers build wire bytes: `_encode_string(s)` and `_build_frame(tag, payload)`.
+**Failure behavior.** Every method awaits the Redis client directly with no try/except, no retry, and no in-process fallback — an unreachable Redis surfaces as `redis.ConnectionError` to the caller. The transport treats the index as mandatory (`MfupEngine._require_index()` at HELLO, at publish, and in the sweeper loop), so with Redis down: new sessions cannot be registered, the expiry sweeper cannot enumerate anything, and stale staging directories accumulate until it returns. In-flight ingest itself does not touch Redis — chunk writes, offsets, and commit invariants all run against the per-session SQLite, so an already-established session keeps transferring; only registration, expiry re-scoring, and cleanup are blocked.
 
-| Test | Verifies |
-|---|---|
-| `test_crc32c_empty` | `crc32c(b"") == 0` |
-| `test_crc32c_known` | `crc32c(b"hello") == 0x9A71BB4C` — one known-answer vector |
-| `test_decode_node_frame` | Full `NODE` round-trip including the `has_size=1` / `has_mtime=0` optional-field encoding; asserts all six fields |
-| `test_decode_file_chunk_frame` | `FILE_CHUNK` decode: `node_id`, `offset`, `length`, `checksum`, and payload bytes |
-| `test_decode_dir_close` | Minimal `DIR_CLOSE` decode |
-| `test_decode_session_end` | `SESSION_END` decode: `scan_done_units`, `body_done_bytes`, `sealed` |
-| `test_incremental_feed` | Feeds a `DIR_CLOSE` frame **one byte at a time**, asserting `drain()` yields nothing until the final byte — the core streaming-reassembly guarantee |
-| `test_multiple_frames` | Two frames in a single `feed()` yield two decoded frames in order |
+### 3.9 Concurrency, failure handling, and retention
 
-**Coverage of the binary decoder: 4 of 8 frame types.** Covered: `NODE` (0x01), `FILE_CHUNK` (0x04), `DIR_CLOSE` (0x06), `SESSION_END` (0x07). **Not covered: `SUMMARY` (0x02), `FILE_OPEN` (0x03), `FILE_CLOSE` (0x05), `CLIENT_ABORT` (0x08)** — notably `CLIENT_ABORT` is the only frame that exercises the two-string `_read_string` path back to back.
+**Locking.** `SessionRegistry._lock` (an `asyncio.Lock`) guards the four mutating paths — `create`, `resume`, `remove`, `recover_session` — so registry-dict races and duplicate DB opens are impossible. `LiveSession._lock` is constructed but never acquired anywhere in the package; per-session serialization comes instead from the leg invariant ("each session has at most one active leg", enforced by the `leg_id` fence in `process_frame` and by `attach_leg` closing all writers) plus the single-writer-per-file rule (`writers` is keyed by `node_id`, and a duplicate `FILE_OPEN` closes the prior handle before replacing it). SQLite itself runs in WAL mode with `busy_timeout=3000` and a 5-second connect timeout.
 
-**What is not tested at all.** Every module except `protocol.py` has zero test coverage:
+**Fencing.** Two independent counters: `epoch`, bumped in SQLite on every `attach_leg`, and `last_data_seq`, a strictly-incrementing per-leg POST sequence reset to `-1` on attach. `advance_seq` is deliberately called only after a POST body is fully processed, so retrying a failed POST with the same seq is safe.
 
-- **`app.py`** — no route is exercised. No test for any HTTP status path: the `403` token checks, `409 stale leg`, `409 stale_epoch`, `409 seq_mismatch`, `409 data_after_final`, `410 GONE`, `500 data_stream_error`, or the `422` from a missing `seq`. No WebSocket handshake test — `bad_version`, `bad_target_dir`, `conflict`, `not_found`, `auth_failed`, `invalid_state`, and `protocol_error` are all unverified. No lifespan, recovery, or sweeper test.
-- **`session_manager.py`** — the state machine, which the batch context calls "the heart of the system," has no tests. No transition is verified. `try_commit`'s COMMIT_RETRY branch, `recover_session`'s `COMMITTING → WAITING_RESUME` revert, `attach_leg`'s epoch increment, `detach_leg`'s TTL refresh, `validate_and_advance_seq`, the conflict FSM, and `build_resume_ok` are all untested. `FileWriter`'s seek-and-truncate resume path — the mechanism preventing duplicated or missing bytes on reconnect — is untested.
-- **`storage.py`** — no SQLite test. `get_incomplete_files` (the pre-commit invariant) and `count_committed_files` (the `COMMIT_OK` figures) are unverified. **Critically, none of the path-traversal defenses have a test**: `validate_node_name` is never called with `".."`, a `/`, a `\`, or a NUL byte, and `resolve_payload_path`'s containment check is never driven with an escaping input.
-- **`publish.py`** — `detect_conflicts`, `_merge_tree`, `ConflictError`, and the clean-rename path are untested.
-- **`redis_index.py`** — untested; no fakeredis or integration fixture.
-- **`app._is_safe_target`** — untested despite being the outermost target-directory guard.
-- **Decoder robustness** — no test feeds an unknown tag (the `ValueError` branch of `decode_frame_payload`), a truncated payload (which would raise `struct.error` out of `_read_*`), a `FILE_CHUNK` whose declared `length` exceeds the remaining payload (currently silently short-reads via slicing), or an oversized `frame_len`.
-- **Async** — `pytest-asyncio` and `httpx` are declared as dev dependencies but no `async def` test and no HTTP client test exist. Both extras are currently unused.
+**Partial writes.** Bytes reach disk with `write()` + `flush()` (no `fsync`) and `accepted_offset` is committed to SQLite only *after* the write returns, so the persisted offset is never ahead of the data. On resume, `FileWriter` opens `r+b`, seeks to `accepted_offset` and `truncate()`s — any bytes written past the last recorded offset are discarded rather than trusted. A chunk that fails CRC, offset, or size validation is never written at all.
 
-The net effect is that the test suite validates the pure, deterministic decoding layer and nothing else: every stateful, security-relevant, and concurrency-sensitive behavior described in the sections above is unverified by automated tests.
----
-## 4. Client SDK (TypeScript)
+**Crash recovery.** No startup directory scan. The transport hands `recover_session(session_id, staging_path)` a staging path; the core reopens `state.sqlite`, refuses terminal states, forces resumable ones to `WAITING_RESUME`, and derives the base dir as `staging_path.parent`. Quotas and client meta are rehydrated from `auth_json` / `meta_json`, and `files_seen` / `bytes_accepted` are recounted from the DB so quota accounting stays accurate across the restart. A session caught mid-`COMMITTING` is recovered too — the client reconnects and re-sends `SESSION_END`.
 
-`@mfup/client` is the browser-side implementation of MFUP/2, a resumable multi-file upload protocol. A session pairs a JSON control channel (WebSocket) with a binary data channel (HTTP `POST`), walks a directory tree from any of four browser file-access APIs, streams file bodies as CRC32C-checksummed chunks, and drives a commit handshake at the end. Disconnects are recovered by reconnecting with a `RESUME` message and replaying only the bytes the server has not yet accepted.
+**Fatal vs. transient failures.** `_FATAL_STORAGE_ERRNOS = {ENOSPC, EDQUOT, EROFS, EFBIG}` is the dividing line. Those errno values abort the session (state `ABORTED`, `SESSION_ABORT` with `storage_full` or `storage_error`) because retrying cannot clear them. Every other `OSError` produces a `NACK_CHUNK{reason:"server_policy"}` and lets the client retry, bounded client-side. Failures scoped to a single node — an illegal name, a file/directory path collision — call `reject_file` so the remainder of the tree still commits.
 
-Source root: `client/src`. Eight modules, ~2,300 lines. `session.ts` (1,002 lines) is the orchestrator; every other module is a leaf it composes.
+**Retention / GC.** Three mechanisms compose: `session_resume_ttl` (default 3600 s) sets the new `expires_at` on every `detach_leg`, propagated to the Redis ZSET score via `_on_expiry_change`; `leg_idle_timeout` (default 60 s) is an `asyncio` `call_later` timer reset on every processed frame that calls `detach_leg()` on expiry; and the Redis sweeper reclaims expired staging directories by path without touching the filesystem index or SQLite. A successful publish removes the staging directory itself through `_cleanup_staging`'s `shutil.rmtree(..., ignore_errors=True)`, and an `ABORTED` session is left for the transport's cleanup path to reclaim.
 
 ---
 
-### 4.1 Package surface (`client/src/index.ts`)
+## 4. mfup-fastapi — Transport Layer
 
-`index.ts` is a pure re-export barrel — 82 lines, no logic. It re-exports from six of the eight modules. `MfupSession` is the intended entry point; the lower-level pieces (`ControlChannel`, `DataChannel`, the frame encoders, `probeStreaming`) are exported so a consumer can build a custom orchestrator.
+`mfup-fastapi` binds the storage/session engine of `mfup-core` to FastAPI. It exposes one class, `MfupEngine`, that owns all mutable state (session registry, Redis index, sweeper task, consumer hooks) and publishes an `APIRouter` carrying every MFUP/2 endpoint under a fixed `/mfup/*` namespace plus `/health`. There is no module-level state: two engines in one process are two independent instances. A host application mounts the router at any prefix and drives `startup()`/`shutdown()` from its own lifespan; the standalone server (`python -m mfup_fastapi`, or `uvicorn mfup_fastapi.app:app`) is `create_app(MfupConfig.from_env())`. Control traffic (session negotiation, per-file ACK/NACK, flow control, commit) runs over a WebSocket; payload bytes run over HTTP POSTs of length-prefixed binary frames.
 
-Note that every export path uses an explicit `.js` extension (`from "./protocol.js"`), consistent with `"type": "module"` and native ESM resolution.
+Source: `server/mfup-fastapi/mfup_fastapi/`
 
-#### Value exports
+### 4.1 Package surface (`__init__.py`)
 
-| Export | Kind | Source | Description |
+| Export | Type | Description |
+|--------|------|-------------|
+| `create_app(config=None)` | function | Builds a standalone `FastAPI(title="MFUP/2 Server", lifespan=engine.lifespan)`, includes `engine.router` at root, stores the engine on `app.state.mfup_engine`, returns the app. Defaults to `MfupConfig.from_env()`. Imports `fastapi` lazily so importing the package never reads the environment. |
+| `MfupConfig` | dataclass | All configuration (§4.7). |
+| `MfupEngine` | class | The engine + router. |
+| `PublishError` | exception | Base class for typed publish failures. |
+| `SessionNotFound` | exception | `publish()` called for an unknown session id. |
+| `NotCommitted` | exception | Session is not in `COMMITTED`; carries `.state` (str). |
+| `TargetEscapes` | exception | `target_dir` resolves outside the session base dir. |
+| `MapFileHookError` | exception | The `map_file` hook raised; carries `.path` (the payload-relative path). |
+| `reconcile_orphans(...)` | async function | Filesystem retention safety net (§4.6). |
+
+Integration in a host app:
+
+```python
+engine = MfupEngine(MfupConfig(base_dir=Path("/srv/uploads"),
+                               redis_url="redis://localhost:6379/0",
+                               authorize=my_authorize))
+app = FastAPI(lifespan=engine.lifespan)
+app.include_router(engine.router, prefix="/api/uploads")
+```
+
+The router's paths are relative to the mount prefix, so the browser client's `serverUrl` must point at that same prefix (`https://host/api/uploads`). Consumers with their own lifespan call `engine.startup()` / `engine.shutdown()` from it instead of using `engine.lifespan`.
+
+### 4.2 Standalone entry points (`app.py`, `__main__.py`)
+
+`app.py` is the only module that builds an app at import time — `app = create_app()` for uvicorn's `module:attr` convention — and calls `logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")`. Library consumers never import it.
+
+`__main__.py` runs `uvicorn.run("mfup_fastapi.app:app", host=..., port=..., log_level="info")`.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `MFUP_HOST` | `0.0.0.0` | uvicorn bind host |
+| `MFUP_PORT` | `8070` | uvicorn bind port |
+
+All other configuration for the standalone path comes from `MfupConfig.from_env()`.
+
+### 4.3 Routes (`engine.py` — `MfupEngine._build_router`)
+
+Seven HTTP routes and one WebSocket endpoint. Paths are shown relative to the router mount prefix.
+
+| Method | Path | Auth | Request | Success response | Error responses |
+|--------|------|------|---------|------------------|-----------------|
+| `WEBSOCKET` | `/mfup/control` | `authorize` hook on `HELLO`; `resume_token` on `RESUME` | JSON control messages | JSON control messages | `SESSION_ABORT` frame then close |
+| `POST` | `/mfup/data/{session_id}/{leg_id}?seq=&final=&epoch=` | header `x-mfup-token` = session `resume_token` | binary body of length-prefixed frames | `200 {"ok": true, "bytes_received": int, "frames": int}`, plus `"commit": {"files": int, "bytes": int}` when a commit succeeded on this POST | `400 {"error":"epoch_required"}`, `403 {"error":"invalid token"}`, `409 {"error":"stale leg","expected":<leg>}`, `409 {"error":"stale_epoch","got":int,"expected":int}`, `409 {"error":"session in state <s>"}`, `409 {"error":"data_after_final","detail":...}`, `409 {"error":"seq_mismatch","got":int,"expected":int}`, `410 {"error":"session not found"}`, `413 {"error":"body_too_large"}`, `500 {"error":"body_read_failed"}`, `500 {"error":"data_stream_error","detail":str,"bytes_received":int}` |
+| `POST` | `/mfup/probe/{session_id}` | header `x-mfup-token` | arbitrary streamed body | `200 {"ok": true, "total_bytes": int}` | `403 {"error":"invalid token"}`, `410 {"error":"session not found"}`, `410 {"error":"session in terminal state <s>"}` |
+| `GET` | `/mfup/sessions` | admin token | — | `200` JSON array of `{session_id, state, epoch, leg_id, expires_at}` | `403 {"error":"admin routes disabled"}` / `403 {"error":"forbidden"}` |
+| `GET` | `/mfup/sessions/{session_id}` | admin token | — | `200 {session_id, state, epoch, leg_id, expires_at, root_summary}` | `403` (as above), `404 {"error":"not found"}` |
+| `POST` | `/mfup/sessions/{session_id}/publish` | header `x-mfup-token` (NOT admin) | — | `200 {"published": [str, ...]}` | `403 {"error":"invalid token"}`, `403 {"error":"target_dir escapes base directory"}`, `404 {"error":"not found"}`, `404 {"error": <FileNotFoundError text>}`, `409 {"error":"cannot publish session in state <s>"}`, `409 {"error":"mapping_error","detail":str}`, `409 {"error":"conflict_files","conflicting_files":[...]}`, `500 {"error":"map_file_hook_error","path":str}` |
+| `POST` | `/mfup/sweep` | admin token | — | `200 {"removed": [session_id, ...]}` | `403` (as above) |
+| `GET` | `/health` | none | — | `200 {"status":"ok","protocol": PROTOCOL_VERSION, "crc32c": CRC32C_IMPL}` | — |
+
+`PROTOCOL_VERSION` is `"MFUP/2"` and `CRC32C_IMPL` is `"native"`, both imported from `mfup_core.protocol`. Note `/health` sits outside the `/mfup/*` namespace.
+
+**Admin gate** — `_admin_denied(request)` is a local helper applied to `GET /mfup/sessions`, `GET /mfup/sessions/{session_id}` and `POST /mfup/sweep`. It returns `403 {"error":"admin routes disabled"}` when `cfg.admin_token` is empty (the default — admin routes are off unless configured), and `403 {"error":"forbidden"}` when header `x-mfup-admin-token` does not match. `POST /mfup/sessions/{id}/publish` is deliberately not admin-gated: it is authenticated by the session's own `resume_token`, the same bearer as the data plane, because publishing moves files and destroys staging on behalf of that session.
+
+### 4.4 Control channel — WebSocket `/mfup/control`
+
+The socket is accepted immediately; the first message must be `HELLO` or `RESUME`, anything else gets `SESSION_ABORT/protocol_error` and a close. After the handshake the endpoint loops on `receive_json()` handling `CLIENT_ABORT` and `ACTION`; all other server→client traffic on this socket is emitted by the `LiveSession` (from `mfup-core`) as data frames are processed on the HTTP channel — `session.ws` is set to this socket during the handshake.
+
+#### Client → server
+
+| `t` | Fields | Effect |
+|-----|--------|--------|
+| `HELLO` | `v` (must equal `"MFUP/2"`), `session_id`, `leg_id`, `target_dir` (optional, default `"."`), `meta` (optional, arbitrary JSON) | Creates the session. Version mismatch → `SESSION_ABORT/bad_version`. `meta` is JSON-encoded and rejected with `SESSION_ABORT/protocol_error` if it exceeds `max_meta_bytes`; it is untrusted and is passed to `authorize` and `map_file`. |
+| `RESUME` | `session_id`, `resume_token`, `leg_id` | Re-attaches to an existing session, transferring leg ownership to this socket. |
+| `CLIENT_ABORT` | — | Sets state `ABORTED`, detaches the leg, breaks the loop (staging + Redis entry are then reclaimed in the `finally` block). |
+| `ACTION` | `action` ∈ `"merge_overwrite"` \| `"cancel"` | Sets `session.publish_action`. `"cancel"` additionally sets `ABORTED`, detaches the leg and breaks the loop. Any other `action` value is ignored. |
+
+`HELLO` handling in order: version check → `meta` size cap → `authorize` hook → per-session `base_dir` resolution → `target_dir` containment check → `registry.create(...)` → Redis registration → `apply_auth` → `HELLO_OK`.
+
+- The **resume token is server-issued**: `secrets.token_urlsafe(32)`, generated during `HELLO` and returned in `HELLO_OK`. A client-chosen token would be a self-signed credential and useless as an authenticator for the data/probe/publish endpoints.
+- The `authorize` hook receives `AuthRequest(session_id, target_dir, headers=dict(ws.headers), client="{host}:{port}", query=dict(ws.query_params), meta=client_meta)`. Returning `None` — or raising, which is caught and logged — yields `SESSION_ABORT/auth_failed`. A returned `target_dir` overrides the client's request (pin or map) but is still subject to containment. A returned `base_dir` must be absolute; a relative one is a misconfiguration and yields `SESSION_ABORT/auth_failed` with reason `"authorization misconfigured (relative base_dir)"`. The per-session base dir is `mkdir(parents=True, exist_ok=True)`'d and staging is created *inside* it, so publish stays a same-filesystem rename even when users live on separate mounts. `auth_result.max_total_bytes`, `max_files` and `context` are pushed into the session via `session.apply_auth(...)` and persisted so they survive restarts and lazy resume.
+- Containment is checked by the module-level `_is_safe_target(base_dir, target_dir)`, which resolves the target (absolute as-is, relative against `base_dir`) and requires `relative_to(base_dir.resolve())` to succeed.
+- `registry.create` raising `ValueError` (session id already exists) → `SESSION_ABORT/conflict`.
+- Redis registration failure is **rolled back explicitly**: the in-memory session is removed and the staging dir `rmtree`'d, then `SESSION_ABORT/server_error` — otherwise a retried `HELLO` would hit `conflict` and the staging dir would be invisible to the zset-driven sweeper forever. On success the absolute staging path is stored in Redis meta (what makes the sweeper and lazy resume work with per-user base dirs) and `session._on_expiry_change` is wired to `index.update_expiry`.
+
+`RESUME` handling: `registry.resume(session_id, resume_token, leg_id)`; on `KeyError` the engine attempts **lazy recovery** — it reads Redis meta for the session, and if a `staging_dir` is recorded, calls `registry.recover_session(...)` and retries the resume. This is what lets a session survive a deploy or failover onto a different worker: ownership transfers to whichever worker holds the WebSocket. Failure modes map to `SESSION_ABORT` codes `not_found` (`KeyError`), `auth_failed` (`PermissionError`, i.e. bad token) and `invalid_state` (`ValueError`, reason is the exception text).
+
+#### Server → client
+
+Emitted directly by `engine.py`:
+
+| `t` | Fields | When |
+|-----|--------|------|
+| `HELLO_OK` | `epoch`, `expires_at`, `resume_token`, `limits: {max_chunk_bytes, max_open_files, max_pending_files}` | Successful `HELLO`. |
+| `RESUME_OK` | `epoch`, `expires_at`, `root_summary`, `files: [{node_id, accepted_offset, status}]` (status ∈ `"open"`/`"closed"`/`"rejected"`), `pruned_nodes`, `rejected_files` | Successful `RESUME`. Built by `LiveSession.build_resume_ok()` from persisted SQLite state. |
+| `PROBE_ACK` | `first_chunk_bytes` | Sent on the control socket when the first body chunk of a `POST /mfup/probe/{session_id}` arrives. |
+| `SESSION_ABORT` | `code`, `reason` | Handshake failures (table below). Always followed by `ws.close()`. |
+
+`SESSION_ABORT` codes raised by the transport layer:
+
+| `code` | Cause |
+|--------|-------|
+| `bad_version` | `HELLO.v` ≠ `"MFUP/2"`; reason `"expected MFUP/2"` |
+| `protocol_error` | `meta` exceeds `max_meta_bytes`, or first message is neither `HELLO` nor `RESUME` (reason `"expected HELLO or RESUME, got <t>"`) |
+| `auth_failed` | `authorize` returned `None`/raised, hook returned a relative `base_dir`, or `RESUME` presented an invalid token |
+| `bad_target_dir` | `target_dir` escapes the session base directory |
+| `conflict` | Session id already exists in the registry |
+| `server_error` | Redis registration failed (`"session index unavailable, retry later"`) |
+| `not_found` | `RESUME` for an unknown/expired session |
+| `invalid_state` | `RESUME` rejected by session state machine |
+
+Emitted on the same socket by `mfup_core.session_manager.LiveSession` while HTTP data frames are processed (detailed in §3.5; listed here because they are part of this wire):
+
+| `t` | Fields |
+|-----|--------|
+| `FILE_ACK` | `node_id`, `accepted_offset` |
+| `NACK_CHUNK` | `node_id`, `expected_offset`, `reason` |
+| `ASK` | `code` (`"target_conflict"`), `node_id`, `name` (conflicting basename only, never a server path) |
+| `PRUNE_NODE` | `node_id`, `code`, `reason` |
+| `REJECT_FILE` | `node_id`, `code`, `reason` |
+| `FLOW` | `paused` (bool), `reason` |
+| `COMMIT_RETRY` | `incomplete: [{node_id, accepted_offset}]`, and for the node-count invariant also `nodes_expected`, `nodes_seen` |
+| `COMMIT_OK` | `files`, `bytes` |
+| `SESSION_ABORT` | `code` ∈ `storage_full`, `storage_error`, `quota_exceeded`, `commit_failed`; `reason` |
+
+The `ASK`/`ACTION` pair is the conflict negotiation: the server asks once when a target file already exists, and the client answers with `ACTION` (`merge_overwrite` or `cancel`).
+
+### 4.5 Data channel — `POST /mfup/data/{session_id}/{leg_id}`
+
+**Framing.** The body is a stream of MFUP/2 binary frames, `[4-byte big-endian length][1-byte tag][payload]` where the length covers tag + payload, decoded incrementally by `mfup_core.protocol.FrameReader` (`feed()` / `drain()`, 1 MiB max declared frame length). Attribution is carried inside the frames, not in the HTTP envelope: `FILE_CHUNK` frames carry `node_id` + absolute `offset`, `NODE` frames establish the `node_id` → name/parent tree, and `FILE_OPEN`/`FILE_CLOSE`/`DIR_CLOSE`/`SUMMARY`/`SESSION_END`/`CLIENT_ABORT` complete the vocabulary. The HTTP path and query only identify *which session and which leg* the frames belong to and where they sit in the POST ordering.
+
+**Query/header envelope.**
+
+| Parameter | Location | Required | Description |
+|-----------|----------|----------|-------------|
+| `session_id` | path | yes | Session to attribute frames to |
+| `leg_id` | path | yes | Must equal the session's current `leg_id`, else `409 stale leg` with `"expected"` |
+| `seq` | query (int) | yes | Monotonic POST sequence for this leg |
+| `final` | query (int, default `0`) | no | `1` marks the last POST of the leg |
+| `epoch` | query (int, default `-1`) | effectively yes | Fencing token; `< 0` → `400 epoch_required`. Mandatory by design so an old client omitting it cannot silently bypass stale-POST fencing |
+| `x-mfup-token` | header | yes | Session `resume_token` |
+
+**Validation order** (each short-circuits): session exists (else `410`) → token match (`403`) → leg match (`409`) → epoch present (`400`) → epoch match (`409 stale_epoch`) → state ∈ {`ACTIVE`, `PAUSED_BY_SERVER`} (`409`) → `final` not already seen for this leg (`409 data_after_final`) → `session.validate_seq(seq)` (`409 seq_mismatch` with `got`/`expected`).
+
+**Two body strategies.** `buffered = content-length is present and ≤ cfg.max_buffered_body`.
+
+- *Buffered (atomic)* — the whole body is accumulated first (aborting with `413 body_too_large` if it grows past the cap despite the declared length), then leg/epoch freshness is **re-checked after the awaited read**, then frames are fed and processed inside `session.db.begin_batch()` / `end_batch()`. `seq` advances (and `final_seq_seen` is set when `final=1`) only after the whole body processed without error. A body that never fully arrives returns `500 body_read_failed` with nothing applied and `seq` not advanced, so the client may retry the identical POST. Because advancing is deferred, a duplicate of an already-processed POST gets `seq_mismatch` with `expected == seq + 1`, which the client reads as "already delivered".
+- *Streaming* — used for chunked or oversized bodies (the `duplex: "half"` long POST). `seq` advances and `final_seq_seen` is set **immediately**, before reading; frames apply as they arrive. Each loop iteration re-checks leg/epoch and breaks out on staleness. `session.db.flush()` runs every 500 frames. There is no retry-by-seq here: a broken stream recovers through `RESUME`, which allocates a new leg and epoch.
+
+**Failure mid-POST.** Exceptions during frame processing are caught, recorded as `error_detail = "<ExcType>: <msg>"`, logged with a traceback, and `session.db.end_batch()` still runs in `finally`. The response is `500 {"error":"data_stream_error","detail":..., "bytes_received":...}`. In the buffered path an error means `seq` is not advanced, keeping the POST retryable.
+
+**Commit.** A commit is attempted only when `final == 1` or a `SessionEndFrame` was seen *and* the session is in `COMMITTING`. It goes through `engine._try_commit(session)`, whose result (when non-`None`) is echoed as `"commit": {"files", "bytes"}` in the 200 response. Every request logs one line: bytes received, frame count, `final`, and any error.
+
+### 4.6 Probe, publish, and lifecycle
+
+#### Probe channel — `POST /mfup/probe/{session_id}`
+
+A liveness/compatibility probe for the streaming upload path. It consumes the request body and, on the **first** chunk, pushes `PROBE_ACK {first_chunk_bytes}` down the session's control socket so the client can verify that real binary data reached the server — Firefox stringifies a `ReadableStream` body into 23 bytes of `"[object ...]"`, which this catches. A failure to send `PROBE_ACK` is logged, not fatal. Sessions in `COMMITTED`, `ABORTED` or `EXPIRED` are rejected with `410`.
+
+#### Programmatic publish
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `MfupEngine.publish(session_id) -> list[str]` | async method | Publishes a `COMMITTED` session server-side. Used by `POST /mfup/sessions/{id}/publish`, by consumer backends directly, and by the `on_committed` auto-publish path. |
+
+Behavior: resolves the session (`SessionNotFound` if absent), requires `SessionState.COMMITTED` (`NotCommitted(state)`), resolves `target_dir` against `session.base_dir` when relative, and re-runs `_is_safe_target` as defense in depth (`TargetEscapes`). With no `map_file` hook it calls `publish_session` via `asyncio.to_thread` (the renames/merge walk are synchronous filesystem work and must stay off the event loop). With a `map_file` hook it first lists payload files (`list_payload_files`, also off-loop), awaits the hook per file with `FileMapRequest(session_id, path, name, size, target_dir, meta, context)`, collects non-`None` results into a mapping, and calls `publish_session_mapped`. A raising hook is logged and re-raised as `MapFileHookError(rel)` with the original traceback suppressed. On success the session is removed from both the registry and the Redis index, and the list of published paths is returned. `ConflictError` and `MappingError` from `mfup-core` propagate to the caller (the HTTP endpoint maps both to `409`).
+
+#### Commit hook wiring
+
+| Member | Description |
+|--------|-------------|
+| `_try_commit(session)` | Wraps `session.try_commit()` and fires `_after_commit` when the result is non-`None` and the state reached `COMMITTED`, so no call site can forget the hook. Used by the data endpoint and by the WebSocket `finally` block. |
+| `_after_commit(session, result)` | Invokes `on_committed` once per commit with `CommitEvent(session_id, target_dir, base_dir, staging_dir, files, bytes, meta, context)`. A raising hook is logged and swallowed — it must never damage the session. A return value of `"publish"` triggers `engine.publish(...)` immediately; a failure there is logged, not raised. |
+
+#### Lifecycle
+
+| Member | Description |
+|--------|-------------|
+| `startup()` | `mkdir` the base dir; construct `SessionIndex(redis_url)` and `SessionRegistry(base_dir, staging_prefix, session_resume_ttl, leg_idle_timeout, max_chunk_bytes, conflict_check=(map_file is None))`; recover sessions; reconcile orphans; start the sweeper task. |
+| `shutdown()` | Cancel and await the sweeper task (absorbing `CancelledError`), then `await index.close()`. |
+| `lifespan(app)` | `@asynccontextmanager` calling `startup()` then `shutdown()` in a `finally`. Drop-in for `FastAPI(lifespan=engine.lifespan)`. |
+| `_require_registry()` / `_require_index()` | Assert that `startup()` has run; used by every endpoint. |
+
+**Hook resolution happens in `__init__`, not at startup.** Callables pass through; dotted `"pkg.mod:func"` strings are imported eagerly via `resolve_hook` so a misconfigured hook fails at construction and never boots. When `config.authorize` is `None`, `load_authorize_hook(None)` is used, which logs the allow-all warning.
+
+`conflict_check` is disabled whenever a `map_file` hook is present: with per-file mapping the client's layout no longer predicts final paths, so the ingest-time conflict `ASK` would be noise — publish-time conflict handling (`409` → client `ACTION`) takes over.
+
+**Startup recovery.** Redis is queried for alive and expired session ids; for each alive id with recorded meta the registry re-opens the on-disk SQLite state via `recover_session(sid, Path(meta.staging_dir))` and re-wires `_on_expiry_change` to `index.update_expiry`. Sessions without meta are skipped with a warning. The whole recovery block is wrapped in `try/except` with `logger.exception` — a recovery failure does not prevent the server from booting.
+
+**Sweeper** (`_sweeper`, background `asyncio.Task`). Every `sweep_interval` seconds: fetch expired ids from Redis, and for each `registry.remove(sid)`, `rmtree` the staging dir (taken from Redis meta, falling back to `staging_dir(base_dir, sid, staging_prefix)`), then `index.remove(sid)`. Every `reconcile_every` sweeps it additionally runs `reconcile_orphans`. All exceptions are logged and the loop continues. `POST /mfup/sweep` performs the same expired-session pass on demand (without the reconciliation) and returns the removed ids.
+
+**`reconcile_orphans(base, registry, index, prefix, grace_seconds=600)`** is a free function (tests exercise it directly) and the retention safety net. The zset-driven sweeper can only clean what Redis still knows about; a staging dir becomes unreachable when cleanup was interrupted between `rmtree` and `ZREM`, when `rmtree` silently failed under `ignore_errors`, or when Redis lost the entry. It scans `base` for directories named `{prefix}.{session_id}` and deletes one only when **all three** hold: not in the in-memory registry, not registered in Redis, and last modified at least `grace_seconds` ago. If Redis is unreachable it skips the directory rather than delete something it cannot verify. After `rmtree` it also attempts `index.remove(sid)` as belt and braces, and returns the list of removed session ids.
+
+**WebSocket disconnect and in-flight sessions.** `WebSocketDisconnect` and any other exception are caught and logged (never re-raised), then the `finally` block runs:
+
+1. If the session is no longer the one in the registry (`registry.get(sid) is not session`), the local reference is dropped after clearing `session.ws`, and nothing else is touched. This is the publish race: `publish()` removes the session and **closes its SQLite handle** while the socket is still open, and touching `session.state`/`session.db` afterwards raises `sqlite3.ProgrammingError` inside `finally`, surfacing as a bogus ASGI exception after a perfectly good upload.
+2. Otherwise: if the state is `COMMITTING`, one last `_try_commit(session)` is attempted — a client that disconnects right after its final POST still gets committed.
+3. `session.ws` is cleared if it is still this socket, and `detach_leg()` runs when a leg is attached and the state is neither `COMMITTED` nor `ABORTED` (so a later `RESUME` can claim a fresh leg).
+4. If the state is `ABORTED`, cleanup is immediate rather than deferred to the sweeper: `registry.remove(sid)`, `rmtree` of the staging dir (from Redis meta when available, else computed from `session.base_dir` — the per-session one, not the global base — and `staging_prefix`), and `index.remove(sid)`.
+
+### 4.7 Configuration (`config.py`)
+
+`MfupConfig` is a `@dataclass` with two construction paths: direct instantiation for library embedding (hooks as callables) and `MfupConfig.from_env(env=None)` for standalone/container deployment (hooks as dotted `"pkg.module:callable"` paths). No environment variable is read at import time anywhere in the package — only `from_env()` touches `os.environ`, and it accepts an explicit mapping for tests. Integer fields go through a local `_int(name, default)` helper. `HookRef = Union[str, Callable[..., Any]]`.
+
+| Field | Type | Default | Env var | Effect |
+|-------|------|---------|---------|--------|
+| `base_dir` | `Path` | `Path("/tmp/mfup-uploads")` | `MFUP_BASE_DIR` | Global base directory for staging + publish; a per-session `base_dir` from the `authorize` hook overrides it for that session |
+| `redis_url` | `str` | `"redis://redis:6379/0"` | `REDIS_URL` | Backing store for the session index (TTL zset + meta) |
+| `session_resume_ttl` | `int` | `3600` | `MFUP_SESSION_RESUME_TTL` | Seconds a session stays resumable; sets `expires_at` at `HELLO` |
+| `leg_idle_timeout` | `int` | `60` | `MFUP_LEG_IDLE_TIMEOUT` | Seconds of leg inactivity before the leg is detached |
+| `max_chunk_bytes` | `int` | `262144` | `MFUP_MAX_CHUNK_BYTES` | Largest accepted chunk; advertised in `HELLO_OK.limits` |
+| `max_open_files` | `int` | `1` | `MFUP_MAX_OPEN_FILES` | Concurrently open files per session; advertised in `HELLO_OK.limits` |
+| `max_pending_files` | `int` | `64` | `MFUP_MAX_PENDING_FILES` | Pending-file window; advertised in `HELLO_OK.limits` |
+| `sweep_interval` | `int` | `300` | `MFUP_SWEEP_INTERVAL` | Seconds between sweeper passes |
+| `staging_prefix` | `str` | `".incoming"` | `MFUP_STAGING_PREFIX` | Prefix of per-session staging dir names (`{prefix}.{session_id}`) |
+| `reconcile_every` | `int` | `4` | `MFUP_RECONCILE_EVERY` | Run filesystem-orphan reconciliation every Nth sweep |
+| `orphan_grace_seconds` | `int` | `600` | `MFUP_ORPHAN_GRACE` | Minimum staging-dir age before it may be reconciled as an orphan |
+| `max_buffered_body` | `int` | `16 * 1024 * 1024` | `MFUP_MAX_BUFFERED_BODY` | Threshold below which a data POST is buffered and applied atomically; also the hard cap that produces `413 body_too_large` |
+| `max_meta_bytes` | `int` | `16384` | `MFUP_MAX_META_BYTES` | Cap on the JSON size of `HELLO.meta` |
+| `admin_token` | `str` | `""` | `MFUP_ADMIN_TOKEN` | Bearer for `x-mfup-admin-token`; empty disables the admin routes entirely |
+| `authorize` | `Optional[HookRef]` | `None` | `MFUP_AUTHORIZE` | Per-session authorization; `None` means allow-all (logged as a warning) |
+| `map_file` | `Optional[HookRef]` | `None` | `MFUP_MAP_FILE` | Per-file destination mapping at publish; its presence also disables ingest-time conflict checks |
+| `on_committed` | `Optional[HookRef]` | `None` | `MFUP_ON_COMMITTED` | Post-commit notification; returning `"publish"` auto-publishes |
+
+Empty strings for the three hook env vars are normalized to `None` (`e.get(...) or None`).
+
+### 4.8 Package metadata and cross-package dependencies
+
+`mfup-fastapi` 0.2.0, hatchling build backend, MIT, `requires-python >= 3.10`, wheel packages `["mfup_fastapi"]`.
+
+| Dependency | Constraint |
+|------------|-----------|
+| `mfup-core` | `==0.2.0` (pinned) |
+| `fastapi` | `>=0.115.0` |
+| `uvicorn[standard]` | `>=0.30.0` |
+| `websockets` | `>=13.0` |
+
+Optional `dev` extra: `pytest`, `pytest-asyncio`, `httpx`. `[tool.pytest.ini_options] asyncio_mode = "auto"`.
+
+`engine.py` imports from `mfup_core` only: `hooks` (`AuthRequest`, `AuthorizeHook`, `CommitEvent`, `FileMapRequest`, `MapFileHook`, `OnCommittedHook`, `load_authorize_hook`, `resolve_hook`), `protocol` (`CRC32C_IMPL`, `PROTOCOL_VERSION`, `FrameReader`, `SessionEndFrame`, `SessionState`), `session_manager` (`SessionRegistry`, `LiveSession`), `publish` (`ConflictError`, `MappingError`, `list_payload_files`, `publish_session`, `publish_session_mapped`), `redis_index` (`SessionIndex`), and `storage` (`staging_dir`). All durable state — SQLite session DBs, chunk writers, commit invariants, the Redis index — lives in `mfup-core`; this package contributes the HTTP/WebSocket surface, request validation and fencing, the lifecycle wiring, and the hook invocation points.
+
+---
+
+## 5. @mfup/client — Browser Client
+
+`@mfup/client` (v0.2.3, MIT) is the browser-side reference implementation of MFUP/2. It has **zero runtime dependencies** — the only declared dependency is `typescript ^5.5.0` as a devDependency. It is an ESM-only package (`"type": "module"`, `"sideEffects": false`) compiled with `target/module: ES2022`, `moduleResolution: bundler`, `strict: true`, `isolatedModules: true`, and `lib: ["ES2022", "DOM", "DOM.Iterable"]`. Because `isolatedModules` is on, every enum-like construct is a plain `as const` object plus a value-union type alias — never a `const enum` — so consumers building with esbuild/swc/vite are not broken.
+
+The client speaks two transports to the `mfup-fastapi` server:
+
+| Endpoint | Method | Purpose | Built in |
+|----------|--------|---------|----------|
+| `{ws(s)://host}/mfup/control` | WebSocket | JSON control messages (HELLO/RESUME, ACKs, flow, ASK, commit) | `session.ts:483`, `control.ts` |
+| `{base}/mfup/probe/{sessionId}` | POST | Streaming-capability probe with a `ReadableStream` body | `probe.ts:29` |
+| `{base}/mfup/data/{sessionId}/{legId}?seq=&final=&epoch=` | POST | Binary frame payload (`Content-Type: application/x-mfup`) | `data-channel.ts:81` |
+| `{base}/mfup/sessions/{sessionId}/publish` | POST | Move staged files into the target directory | `session.ts:696` |
+
+All non-WebSocket requests carry the server-issued bearer token in the `X-MFUP-Token` header. The WebSocket URL is derived from `serverUrl` by `.replace(/^http/, "ws")`; page-relative `serverUrl` values (e.g. `"/api/uploads"`) are first resolved against `location.origin`.
+
+Source files (`/workspace/packages/client/src/`), by size: `session.ts` (1604 lines), `protocol.ts` (466), `data-channel.ts` (422), `ingestion.ts` (330), `errors.ts` (329), `control.ts` (237), `progress.ts` (187), `probe.ts` (140), `index.ts` (92), `dnd.ts` (87).
+
+---
+
+### 5.1 Public API surface (`index.ts`)
+
+`index.ts` is a pure re-export barrel — it contains no logic. It exports 2 constants, 13 protocol values, 26 protocol types, and 8 modules' worth of classes/functions/types.
+
+**Constants and protocol values**
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `PROTOCOL_VERSION` | `const "MFUP/2"` | Sent as `HELLO.v` |
+| `ROOT_NODE_ID` | `const 0` | Parent id of every top-level ingested node |
+| `FrameTag` | const object + type | 8 single-byte frame discriminators |
+| `NodeKind` | const object + type | `DIR: 0x00`, `FILE: 0x01` |
+| `ChecksumKind` | const object + type | `CRC32C: 0x01` (only member) |
+| `crc32c(data, initial = 0)` | function | Castagnoli CRC-32C over a `Uint8Array`, returns `number` |
+| `encodeFrame(f)` | function | Dispatches on `f.tag` to the specific encoder |
+| `encodeNodeFrame(f)` | function | Serialises a `NodeFrame` |
+| `encodeSummaryFrame(f)` | function | Serialises a `SummaryFrame` |
+| `encodeFileOpenFrame(f)` | function | Serialises a `FileOpenFrame` |
+| `encodeFileChunkFrame(f)` | function | Serialises a `FileChunkFrame` |
+| `encodeFileCloseFrame(f)` | function | Serialises a `FileCloseFrame` |
+| `encodeDirCloseFrame(f)` | function | Serialises a `DirCloseFrame` |
+| `encodeSessionEndFrame(f)` | function | Serialises a `SessionEndFrame` |
+| `encodeClientAbortFrame(f)` | function | Serialises a `ClientAbortFrame` |
+
+All 9 encoders return `Uint8Array`. There is no decoder in the client — MFUP/2 binary frames are strictly client→server.
+
+**Classes and functions**
+
+| Export | Kind | Module | Description |
 |--------|------|--------|-------------|
-| `MfupSession` | class | `session.js` | Main orchestrator; see §4.2 |
-| `ControlChannel` | class | `control.js` | WebSocket control-plane wrapper |
-| `DataChannel` | class | `data-channel.js` | Dual-mode HTTP data-plane writer |
-| `ProgressTracker` | class | `progress.js` | Progress aggregation + listener bus |
-| `NodeIdAllocator` | class | `ingestion.js` | Monotonic node-id counter |
-| `MfupError` | class | `errors.js` | Structured error type |
-| `MfupErrorCode` | const enum | `errors.js` | 22 string error codes |
-| `MfupErrorLayer` | const enum | `errors.js` | 5 layer tags |
-| `FrameTag` | const enum | `protocol.js` | 8 frame discriminators |
-| `NodeKind` | const enum | `protocol.js` | `DIR = 0x00`, `FILE = 0x01` |
-| `ChecksumKind` | const enum | `protocol.js` | `CRC32C = 0x01` (sole member) |
-| `PROTOCOL_VERSION` | const | `protocol.js` | `"MFUP/2"` |
-| `ROOT_NODE_ID` | const | `protocol.js` | `0` |
-| `crc32c` | function | `protocol.js` | `(data: Uint8Array, initial = 0) => number` |
-| `encodeFrame` | function | `protocol.js` | Tag-dispatching encoder |
-| `encodeNodeFrame` | function | `protocol.js` | `(f: NodeFrame) => Uint8Array` |
-| `encodeSummaryFrame` | function | `protocol.js` | `(f: SummaryFrame) => Uint8Array` |
-| `encodeFileOpenFrame` | function | `protocol.js` | `(f: FileOpenFrame) => Uint8Array` |
-| `encodeFileChunkFrame` | function | `protocol.js` | `(f: FileChunkFrame) => Uint8Array` |
-| `encodeFileCloseFrame` | function | `protocol.js` | `(f: FileCloseFrame) => Uint8Array` |
-| `encodeDirCloseFrame` | function | `protocol.js` | `(f: DirCloseFrame) => Uint8Array` |
-| `encodeSessionEndFrame` | function | `protocol.js` | `(f: SessionEndFrame) => Uint8Array` |
-| `encodeClientAbortFrame` | function | `protocol.js` | `(f: ClientAbortFrame) => Uint8Array` |
-| `ingestFromHandles` | function | `ingestion.js` | File System Access API adapter |
-| `ingestFromEntries` | function | `ingestion.js` | `webkitGetAsEntry()` adapter |
-| `ingestFromFileList` | function | `ingestion.js` | `<input webkitdirectory>` adapter |
-| `ingestFromFiles` | function | `ingestion.js` | Flat `File[]` adapter |
-| `probeStreaming` | function | `probe.js` | Duplex-streaming capability probe |
+| `MfupSession` | class | `session.ts` | Main entry point; owns the state machine and all channels |
+| `ControlChannel` | class | `control.ts` | WebSocket wrapper with a typed 14-event bus |
+| `DataChannel` | class | `data-channel.ts` | Dual-mode (streaming/batch) binary uploader |
+| `ProgressTracker` | class | `progress.ts` | Merges scan units and body bytes into a monotonic fraction |
+| `NodeIdAllocator` | class | `ingestion.ts` | Monotonic node id source, starts at 1 (0 is root) |
+| `ingestFromHandles` | function | `ingestion.ts` | Walk `FileSystemHandle[]` roots |
+| `ingestFromEntries` | function | `ingestion.ts` | Walk `FileSystemEntry[]` roots (`webkitGetAsEntry`) |
+| `ingestFromFileList` | function | `ingestion.ts` | Rebuild a tree from `webkitRelativePath` |
+| `ingestFromFiles` | function | `ingestion.ts` | Flat `File[]` — all children of root |
+| `probeStreaming` | function | `probe.ts` | Detect `duplex:"half"` support |
+| `sourceFromDataTransfer` | function | `dnd.ts` | Synchronously extract an `UploadSource` from a drop event |
+| `sourceFromInput` | function | `dnd.ts` | Extract an `UploadSource` from `<input type=file>` |
+| `MfupError` | class | `errors.ts` | Structured error with `code`/`layer`/`action`/`fatal` |
+| `MfupErrorCode` | const object + type | `errors.ts` | 25 error codes |
+| `MfupErrorLayer` | const object + type | `errors.ts` | 5 layers |
 
-The five enums are declared `export const enum`. Under `isolatedModules: true` with TypeScript ≥ 5.0 (the package pins `^5.5.0`), `const enum` is emitted as a regular runtime enum object, so these are usable as values by JS consumers — *this is an inference from the compiler configuration, not something asserted in the source.*
+**Exported types**
 
-#### Type-only exports
+`DataFrame`, `NodeFrame`, `SummaryFrame`, `FileOpenFrame`, `FileChunkFrame`, `FileCloseFrame`, `DirCloseFrame`, `SessionEndFrame`, `ClientAbortFrame`, `ClientControlMsg`, `ServerControlMsg`, `HelloMsg`, `ResumeMsg`, `HelloOkMsg`, `ResumeOkMsg`, `FileAckMsg`, `NackChunkMsg`, `FlowMsg`, `PruneNodeMsg`, `RejectFileMsg`, `SessionAbortMsg`, `CommitOkMsg`, `ServerLimits`, `RootSummary`, `ResumeFileStatus`, `SessionState` (26 from `protocol.ts`), plus `ControlChannelOpts`, `ControlEventMap`, `DataChannelOpts`, `DataCommitResult`, `DiscoveredNode`, `IngestCallback`, `IngestFilter`, `ProgressSnapshot`, `ProgressListener`, `ProbeResult`, `UploadSource`, `MfupSessionConfig`, `MfupSessionEvents`, `MfupSessionSnapshot`, `MfupAsk`, `MfupAskAction`, `MfupFileRef`.
 
-35 type exports total, all re-exported with `export type`:
-
-| Group | Types |
-|-------|-------|
-| Data frames (`protocol.js`) | `DataFrame`, `NodeFrame`, `SummaryFrame`, `FileOpenFrame`, `FileChunkFrame`, `FileCloseFrame`, `DirCloseFrame`, `SessionEndFrame`, `ClientAbortFrame` |
-| Control messages (`protocol.js`) | `ClientControlMsg`, `ServerControlMsg`, `HelloMsg`, `ResumeMsg`, `HelloOkMsg`, `ResumeOkMsg`, `FileAckMsg`, `NackChunkMsg`, `FlowMsg`, `PruneNodeMsg`, `RejectFileMsg`, `SessionAbortMsg`, `CommitOkMsg` |
-| Supporting (`protocol.js`) | `ServerLimits`, `RootSummary`, `ResumeFileStatus`, `SessionState` |
-| Channels | `ControlChannelOpts`, `ControlEventMap`, `DataChannelOpts`, `DataCommitResult` |
-| Ingestion | `DiscoveredNode`, `IngestCallback`, `IngestFilter` |
-| Progress / probe / session | `ProgressSnapshot`, `ProgressListener`, `ProbeResult`, `MfupSessionConfig`, `MfupSessionEvents` |
-
-**Declared in `protocol.ts` but *not* re-exported from `index.ts`:** `ClientAbortMsg`, `ActionMsg`, `ProbeAckMsg`, `AskMsg`, `CommitRetryMsg`. The first two are reachable via the `ClientControlMsg` union and the last three via `ServerControlMsg`, but their individual names are internal. `sessionAbortedByServer`, `dataHttpError` and the other 11 error factory functions in `errors.ts` are likewise not re-exported — consumers receive `MfupError` instances but cannot construct them through the public API.
+Not re-exported despite being defined in `protocol.ts`: `ClientAbortMsg`, `ActionMsg`, `ProbeAckMsg`, `AskMsg`, `CommitRetryMsg`. The 17 error factory functions in `errors.ts` (`wsConnectFailed`, `nackChunk`, `publishConflict`, …) are also internal — consumers get `MfupError` instances but construct none.
 
 ---
 
-### 4.2 Session orchestrator (`session.ts`)
+### 5.2 `MfupSession` (session.ts)
 
-`MfupSession` owns session identity, both channels, the file queue, reconnect policy, and the commit handshake. It is the only module that mutates protocol state.
+The session orchestrator. It owns the control channel, the data channel, ingestion, per-file tracking, progress, reconnect/resume, and the commit loop. It exposes both a typed event bus (`on`) and a `useSyncExternalStore`-compatible snapshot store (`subscribe` + `getSnapshot`).
 
 #### Configuration
 
 ```ts
 export interface MfupSessionConfig {
-  /** Server base URL (http(s)://host) */
   serverUrl: string;
-  /** Relative target directory on the server where files will be placed */
   targetDir?: string;
-  /** Existing session_id for resume, or omit for new session */
+  meta?: unknown;
   sessionId?: string;
-  /** Existing resume_token for resume */
   resumeToken?: string;
-  /** Last known epoch (for resume) */
   lastKnownEpoch?: number;
-  /** Default chunk size in bytes (default 256 KiB) */
   chunkSize?: number;
-  /** Auto-reconnect attempts (default: unlimited). Set null/undefined for infinite retry. */
   maxReconnectAttempts?: number | null;
-  /** Reconnect delay base in ms (default 1000, caps at 20s) */
   reconnectDelayMs?: number;
 }
 ```
 
-| Field | Default | Constructor handling |
-|-------|---------|----------------------|
-| `serverUrl` | — (required) | Trailing `/` stripped via `.replace(/\/$/, "")` |
-| `targetDir` | `"."` | Sent verbatim in `HELLO.target_dir` |
-| `sessionId` | `crypto.randomUUID()` | |
-| `resumeToken` | `crypto.randomUUID()` | Sent as `X-MFUP-Token` on data/probe POSTs |
-| `lastKnownEpoch` | `undefined` | If non-null, seeds `epoch`, which forces `connect()` down the RESUME path |
-| `chunkSize` | `262144` (256 KiB) | Effective chunk is `Math.min(chunkSize, limits.max_chunk_bytes)` |
-| `maxReconnectAttempts` | `null` (infinite) | |
-| `reconnectDelayMs` | `1000` | Exponential base |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `serverUrl` | `string` | — (required) | `http(s)://host` or a page-relative path; resolved via `new URL(serverUrl, location.origin)` and stripped of a trailing `/` |
+| `targetDir` | `string` | `"."` | Relative destination on the server; sent as `HELLO.target_dir` |
+| `meta` | `unknown` | `undefined` | Arbitrary JSON sent as `HELLO.meta`; omitted from the message entirely when `undefined`. Fed to the server's `authorize`/`map_file` hooks |
+| `sessionId` | `string` | `genUUID()` | Reuse to resume an existing session |
+| `resumeToken` | `string` | `""` | Server-issued; empty for a new session, overwritten by `HELLO_OK.resume_token` |
+| `lastKnownEpoch` | `number` | `undefined` | When set, seeds `epoch`; `connect()` then sends `RESUME` instead of `HELLO` |
+| `chunkSize` | `number` | `262144` (256 KiB) | Effective chunk size is `Math.min(chunkSize, limits.max_chunk_bytes)` |
+| `maxReconnectAttempts` | `number \| null` | `null` (infinite) | Reconnect budget |
+| `reconnectDelayMs` | `number` | `1000` | Base for exponential backoff `delay = min(base * 2^(n-1), 20_000)` |
 
-`legId` is always freshly generated with `crypto.randomUUID()` in the constructor and again at the top of every `connect()` — each connection leg gets a new id.
+Server limits default to `{ max_chunk_bytes: 262144, max_open_files: 1, max_pending_files: 64 }` until `HELLO_OK` replaces them.
 
-#### Public API
+#### Public members
 
-| Member | Signature | Description |
-|--------|-----------|-------------|
-| `constructor` | `(config: MfupSessionConfig)` | Pure initialization; opens nothing |
-| `state` | `get (): SessionState` | Current client-side state |
-| `id` | `get (): string` | `sessionId` |
-| `token` | `get (): string` | `resumeToken` |
-| `currentEpoch` | `get (): number` | Last epoch from `HELLO_OK`/`RESUME_OK` |
-| `streamingMode` | `get (): boolean \| null` | `null` until probed; then the probe verdict |
-| `connect()` | `async (): Promise<void>` | Opens control, probes, opens data channel |
-| `uploadHandles(handles)` | `async (handles: FileSystemHandle[]): Promise<void>` | Scan + upload + commit |
-| `uploadEntries(entries)` | `async (entries: FileSystemEntry[]): Promise<void>` | Scan + upload + commit |
-| `uploadFileList(files)` | `async (files: FileList): Promise<void>` | Scan + upload + commit |
-| `uploadFiles(files)` | `async (files: File[]): Promise<void>` | Scan + upload + commit |
-| `abort(code?, reason?)` | `(code = "client_cancel", reason = "user cancelled"): void` | Synchronous teardown |
-| `sendAction(action)` | `(action: "merge_overwrite" \| "cancel"): void` | Answers a server `ASK` |
-| `on(event, fn)` | `<K extends keyof MfupSessionEvents>(event: K, fn: (ev: MfupSessionEvents[K]) => void) => () => void` | Returns an unsubscribe closure |
-| `onProgress(fn)` | `(fn: ProgressListener) => () => void` | Delegates to the internal `ProgressTracker` |
-| `getProgress()` | `(): ProgressSnapshot` | Synchronous snapshot |
-| `getResumeState()` | `(): { sessionId: string; resumeToken: string; epoch: number }` | Persist this to resume in another tab/reload |
-
-All four `upload*` methods share one shape: build an `IngestFilter`, run the matching adapter with `ROOT_NODE_ID` as parent, wrap any non-`MfupError` throw in `ingestError(source, label, err)`, emit it, rethrow, and otherwise tail-call `finalizeScan()`. The `(source, label)` pairs are `("handles","FileSystemHandle[]")`, `("entries","FileSystemEntry[]")`, `("filelist","FileList")`, `("files","File[]")`. The returned promise resolves when `COMMIT_OK` (or a batch-mode commit result) lands.
-
-#### Events
-
-```ts
-export interface MfupSessionEvents {
-  progress: ProgressSnapshot;
-  state: SessionState;
-  committed: { files: number; bytes: number };
-  ask: void;
-  error: MfupError;
-  reconnecting: { attempt: number; delay: number; maxAttempts: number | null };
-}
-```
-
-`state`, `committed`, `ask`, `error`, and `reconnecting` are emitted through `MfupSession.emit`. The `progress` key is declared in the map but the session never calls `emit("progress", …)` — progress flows exclusively through `onProgress()` / `ProgressTracker`. Subscribing via `on("progress", …)` therefore yields nothing; *this is an observation from tracing every `emit` call site, not a documented caveat.*
+| Member | Type | Description |
+|--------|------|-------------|
+| `state` | getter → `SessionState` | Current state |
+| `id` | getter → `string` | Session id |
+| `token` | getter → `string` | Current resume token (server-issued after `HELLO_OK`) |
+| `currentEpoch` | getter → `number` | Current epoch |
+| `streamingMode` | getter → `boolean \| null` | `null` until the probe (or its cache) resolves |
+| `connect()` | `Promise<void>` | Opens the WS, awaits `HELLO_OK`/`RESUME_OK`, probes streaming, opens the data channel. Throws if state is `aborted`/`failed` |
+| `upload(source)` | `Promise<void>` | Accepts `UploadSource \| FileList \| File[]`; dispatches to the four specific uploaders |
+| `uploadHandles(handles)` | `Promise<void>` | `FileSystemHandle[]` roots |
+| `uploadEntries(entries)` | `Promise<void>` | `FileSystemEntry[]` roots |
+| `uploadFileList(files)` | `Promise<void>` | `ArrayLike<File>` with `webkitRelativePath` |
+| `uploadFiles(files)` | `Promise<void>` | Flat `File[]` |
+| `settleAsks()` | `Promise<MfupAskAction \| null>` | Waits until no ask is pending; returns `"cancel"` if any answer was cancel, `"merge_overwrite"` if asks were raised and none cancelled, `null` if none was ever raised. Resolves early on a terminal state |
+| `publish()` | `Promise<{ published: string[] }>` | POSTs the publish endpoint; throws `PUBLISH_CONFLICT` on a 409 `conflict_files` body, `PUBLISH_FAILED` otherwise |
+| `abort(code = "client_cancel", reason = "user cancelled")` | `void` | Instant teardown (see below) |
+| `sendAction(action)` | `void` | Sends `ACTION`; settles every pending ask with `action`; `"cancel"` also calls `abort()` |
+| `on(event, fn)` | `() => void` | Typed event subscription; returns an unsubscribe function |
+| `onProgress(fn)` | `() => void` | Shorthand for `ProgressTracker.on` |
+| `subscribe(fn)` | `() => void` | Snapshot-store subscribe (`useSyncExternalStore`) |
+| `getSnapshot()` | `MfupSessionSnapshot` | Referentially stable until a version bump |
+| `getProgress()` | `ProgressSnapshot` | Current progress snapshot |
+| `getResumeState()` | `{ sessionId; resumeToken; epoch }` | Persist this to resume in a later page load |
 
 #### State machine
 
-`SessionState` is defined in `protocol.ts` with eight members:
+`SessionState` is declared in `protocol.ts` with 8 members. The client assigns 7 of them; **`"expired"` is part of the union but is never set by any client code path** — it exists for parity with the server's session model.
+
+| State | Entered from | Trigger | Emitted / side effects |
+|-------|--------------|---------|------------------------|
+| `active` | initial, `waiting_resume`, `paused_by_server`, `committing` | Field initialiser; end of `connect()`; `FLOW{paused:false}`; `COMMIT_RETRY` handling | `state`; clears `_reconnectInfo`, resets `reconnectCount` |
+| `paused_by_server` | `active` | `FLOW{paused:true}` | `state`; `waitIfPaused()` blocks the pump and the chunk writer |
+| `waiting_resume` | `active`, `paused_by_server`, `committing` | `handleDisconnect()` (WS close, `DATA_WRITE_FAILED`, `DATA_HTTP_ERROR`, data-open rejection) | `state`, then one `reconnecting` + one `error` per attempt; data channel aborted; metadata frames buffered into `_pendingMeta` |
+| `committing` | `active` | `finalizeScan()` after writing `SESSION_END` | `state`; `data.close()` flushes the final POST |
+| `committed` | `committing` | `COMMIT_OK`, or a `commit` object in the final batch POST response | `state` + `committed{files,bytes}`; clears `_reconnectInfo` and `_currentFileRef` |
+| `aborted` | any non-terminal | `abort()`, `sendAction("cancel")`, `SESSION_ABORT` | `state` + `abort{by:"client"\|"server",code,reason}`; terminal |
+| `failed` | `waiting_resume` | Reconnect budget exhausted, or a `fatal` `MfupError` from `connect()` during reconnect | `state` + `error`; terminal |
+| `expired` | — | never assigned by the client | — |
+
+`setState()` enforces terminality: once `_state` is `aborted` or `failed`, any further transition to a different state is silently ignored. This prevents an in-flight reconnect that completes after `abort()` from resurrecting the session.
+
+**Instant cancel.** `abort()` does, in order: clear the reconnect timer, resolve `_reconnectResolve` and `_scanGateResolve` (so `finalizeScan` and ingestion unblock), `setState("aborted")` *first* (every loop keys off state), `control.sendAbort(code, reason)`, `data.abort(reason)` — the hard path, which discards the batch buffer rather than flushing megabytes — `control.close()`, `abortCtrl.abort()` (kills the in-flight XHR/fetch), emit `abort`, and reject any pending commit wait. The chunk writer additionally checks `_state === "aborted" || "failed"` on every chunk and returns immediately. Note that the session never emits a `CLIENT_ABORT` *data frame*; `ClientAbortFrame` is imported but unused — aborts travel over the control WebSocket. `DIR_CLOSE` frames are likewise never written (the tag appears only in the `_pendingMeta` buffering allow-list).
+
+#### Events (`MfupSessionEvents`)
+
+12 events, all emitted from `session.ts`:
+
+| Event | Payload | Emitted when |
+|-------|---------|--------------|
+| `progress` | `ProgressSnapshot` | Every `ProgressTracker` mutation (send-progress is rate-limited inside the tracker) |
+| `state` | `SessionState` | Every accepted `setState()` |
+| `committed` | `{ files: number; bytes: number }` | `markCommitted()` — from `COMMIT_OK` or the final batch POST body |
+| `published` | `{ published: string[] }` | `publish()` succeeded |
+| `ask` | `MfupAsk` | Server `ASK` arrived |
+| `ask:answered` | `MfupAsk` | A pending ask was settled by `sendAction()` (including via `ask.respond()`) |
+| `file:start` | `MfupFileRef` | `streamFile()` begins a file body |
+| `file:ack` | `MfupFileRef & { acceptedBytes: bigint; complete: boolean }` | `FILE_ACK`; `complete` is `status === "sent" && acceptedOffset >= size` |
+| `file:reject` | `MfupFileRef & { code: string; reason: string }` | Server `REJECT_FILE`, or the local NACK budget fired (`code: "nack_budget"`) |
+| `abort` | `{ by: "client" \| "server"; code: string; reason: string }` | `abort()` or `SESSION_ABORT` |
+| `error` | `MfupError` | Every `emitError()` call |
+| `reconnecting` | `{ attempt: number; delay: number; maxAttempts: number \| null }` | Before each backoff sleep in `handleDisconnect()` |
 
 ```ts
+export interface MfupFileRef {
+  nodeId: number;
+  /** Client-relative path ("dir/sub/name.ext"), reconstructed from the scan. */
+  path: string;
+  size: bigint;
+}
+```
+
+`path` is reconstructed by `nodePath()`, walking `nodeMeta` parent links up to `ROOT_NODE_ID` and joining with `/`; it falls back to `String(nodeId)` when the chain is unavailable. The path is resolved *before* a completed file is dropped from `nodeMeta`.
+
+#### Interactive asks
+
+```ts
+export type MfupAskAction = "merge_overwrite" | "cancel";
+
+export interface MfupAsk {
+  readonly id: number;          // monotonic per session, usable as a React key
+  readonly code: string;        // "target_conflict" (default when the server omits it)
+  readonly nodeId: number | null;
+  readonly name: string | null;
+  readonly answered: MfupAskAction | null;
+  respond(action: MfupAskAction): void;
+}
+```
+
+`respond()` is a no-op once `answered` is non-null; otherwise it routes through `sendAction()`. Because `ACTION` is session-wide, `sendAction()` settles **every** pending ask with the same answer and emits one `ask:answered` per settled ask. The transfer keeps running while a question is pending.
+
+#### Snapshot store
+
+```ts
+export interface MfupSessionSnapshot {
+  sessionId: string;
+  state: SessionState;
+  epoch: number;
+  streaming: boolean | null;
+  progress: ProgressSnapshot;
+  fraction: number | null;
+  asks: readonly MfupAsk[];
+  pendingAsks: number;
+  reconnect: { attempt: number; delay: number; maxAttempts: number | null } | null;
+  committed: { files: number; bytes: number } | null;
+  published: readonly string[] | null;
+  currentFile: MfupFileRef | null;
+  recentErrors: readonly MfupError[];   // ring of 20, newest last
+  fatalError: MfupError | null;         // first fatal error only
+}
+```
+
+`getSnapshot()` caches by an internal `_snapVersion` counter, so the returned object is referentially stable until something changes. `markSnapshotDirty(immediate)` bumps the version and either flushes immediately (state, ask, committed, abort, fatal errors) or coalesces through a `SNAPSHOT_THROTTLE_MS = 33` timer (progress ticks). If nobody is subscribed, no timer is armed.
+
+#### Scan, pump, and per-file tracking
+
+Ingestion callbacks arrive in `onDiscover()`, which: builds and records a `NodeFrame` in `nodeMeta`, writes it, increments `scanDone`/`scanEst`, and for files creates a `TrackedFile` (`{nodeId, size, acceptedOffset, openBody, status, nacked, nackCount}` with `status: "pending" | "streaming" | "sent" | "acked" | "rejected"`), pushes it onto `fileQueue`, and adds its size to the body estimate. A root `SUMMARY` frame is written every 50 discovered nodes.
+
+Scan backpressure: ingestion awaits a gate promise once `fileQueue.length >= SCAN_HIGH_WATER` (10 000) and is released when the pump drains it below `SCAN_LOW_WATER` (5 000).
+
+`pumpFiles()` runs concurrently with the scan and processes **one file at a time** (`activeFile`, matching the default `max_open_files: 1`). Per file it writes `FILE_OPEN`, iterates `openBody(startOffset)`, re-slices each 64 KiB read into `min(chunkSize, limits.max_chunk_bytes)` pieces, computes `crc32c(piece)`, writes a `FILE_CHUNK`, awaits `data.drain()`, and finally writes `FILE_CLOSE` with `sizeSent`. The writer bails out on terminal state, on the file being rejected mid-stream, and on `data.failed`. If `file.nacked` was set by the NACK handler, the file is requeued and `streamFile` returns.
+
+`MAX_FILE_NACKS = 8` — the NACK budget counts *consecutive* failures (`nackCount` is reset to 0 on any forward `FILE_ACK`). Exceeding it adds the node to `rejectedFiles` and emits `file:reject` with `code: "nack_budget"`, keeping the session alive.
+
+#### Recovery: lost NODE metadata
+
+Three mechanisms re-send node metadata the server may never have received (a data POST that dies in transit takes its `NODE` frames with it):
+
+1. `NACK_CHUNK{reason:"unknown_node"}` → `resendNodeChain(nodeId)` re-writes the node's parent chain root→leaf before the body re-stream.
+2. On reconnect, `requeuePendingFiles()` replays `_pendingMeta` (buffered `NODE`/`SUMMARY`/`DIR_CLOSE`), then re-writes **the entire** `nodeMeta` map (idempotent server-side), then requeues every non-acked, non-rejected file whose `acceptedOffset < size`.
+3. `COMMIT_RETRY` with `nodes_expected !== nodes_seen` sets `_resendAllMeta`, which replays all of `nodeMeta` on the fresh data channel before bodies.
+
+`nodeMeta` entries for files are deleted once the file is fully acked (the server durably knows them); directory entries live for the session.
+
+#### Commit loop
+
+`finalizeScan()` seals the scan, emits a final `SUMMARY`, awaits `pumpDone`, then loops while `waiting_resume` or `fileQueue.length > 0` (awaiting `_reconnectPromise` and re-kicking the pump). It then enters a `while (true)` commit loop: write `SESSION_END` with the root summary, `setState("committing")`, `await data.close()`. In batch mode the final POST response may already carry `{commit: {files, bytes}}` — that short-circuits to committed. Otherwise it awaits `COMMIT_OK` (resolve) or `COMMIT_RETRY` (set `_commitRetry`, abort the old data channel, `setState("active")`, construct a fresh `DataChannel`, replay metadata if flagged, re-pump, and loop).
+
+#### Probe verdict cache
+
+`connect()` reads `localStorage["mfup:streaming-probe:" + serverUrl]` (JSON `{v: boolean, ts: number}`) and uses it if younger than 24 hours; otherwise it runs `probeStreaming()` and writes the verdict back. Both reads and writes are wrapped in try/catch so private mode and worker contexts fall through to probing. A probe throw sets `_streamingMode = false` and emits a non-fatal error.
+
+`genUUID()` uses `crypto.randomUUID()` when available and otherwise builds an RFC 4122 v4 from `crypto.getRandomValues` — plain-HTTP intranet origins are not secure contexts and lack `randomUUID`.
+
+---
+
+### 5.3 `protocol.ts` — wire types and codec
+
+#### Constants
+
+```ts
+export const PROTOCOL_VERSION = "MFUP/2";
+export const ROOT_NODE_ID = 0;
+
+export const FrameTag = {
+  NODE:         0x01,
+  SUMMARY:      0x02,
+  FILE_OPEN:    0x03,
+  FILE_CHUNK:   0x04,
+  FILE_CLOSE:   0x05,
+  DIR_CLOSE:    0x06,
+  SESSION_END:  0x07,
+  CLIENT_ABORT: 0x08,
+} as const;
+export type FrameTag = (typeof FrameTag)[keyof typeof FrameTag];
+
+export const NodeKind = { DIR: 0x00, FILE: 0x01 } as const;
+export type NodeKind = (typeof NodeKind)[keyof typeof NodeKind];
+
+export const ChecksumKind = { CRC32C: 0x01 } as const;
+export type ChecksumKind = (typeof ChecksumKind)[keyof typeof ChecksumKind];
+```
+
+A comment records that `HashKind` was removed: per-chunk CRC32C is sufficient and SHA-256 was never verified server-side.
+
+#### Data frames (client → server)
+
+```ts
+export interface NodeFrame {
+  tag: typeof FrameTag.NODE;
+  nodeId: number;
+  parentId: number;
+  kind: NodeKind;
+  name: string;
+  sizeHint: bigint | null;
+  mtimeMs: bigint | null;
+}
+
+export interface SummaryFrame {
+  tag: typeof FrameTag.SUMMARY;
+  nodeId: number;
+  scanDoneUnits: bigint;
+  scanEstUnits: bigint;
+  bodyDoneBytes: bigint;
+  bodyEstBytes: bigint;
+  sealed: boolean;
+}
+
+export interface FileOpenFrame {
+  tag: typeof FrameTag.FILE_OPEN;
+  nodeId: number;
+  size: bigint;
+  mtimeMs: bigint | null;
+}
+
+export interface FileChunkFrame {
+  tag: typeof FrameTag.FILE_CHUNK;
+  nodeId: number;
+  offset: bigint;
+  length: number;
+  checksumKind: ChecksumKind;
+  checksum: number;
+  payload: Uint8Array;
+}
+
+export interface FileCloseFrame {
+  tag: typeof FrameTag.FILE_CLOSE;
+  nodeId: number;
+  sizeSent: bigint;
+}
+
+export interface DirCloseFrame {
+  tag: typeof FrameTag.DIR_CLOSE;
+  nodeId: number;
+}
+
+export interface SessionEndFrame {
+  tag: typeof FrameTag.SESSION_END;
+  rootSummary: {
+    scanDoneUnits: bigint;
+    scanEstUnits: bigint;
+    bodyDoneBytes: bigint;
+    bodyEstBytes: bigint;
+    sealed: true;
+  };
+}
+
+export interface ClientAbortFrame {
+  tag: typeof FrameTag.CLIENT_ABORT;
+  code: string;
+  reason: string;
+}
+
+export type DataFrame =
+  | NodeFrame | SummaryFrame | FileOpenFrame | FileChunkFrame
+  | FileCloseFrame | DirCloseFrame | SessionEndFrame | ClientAbortFrame;
+```
+
+#### Binary layout
+
+Every frame is `[u32 BE length][u8 tag][payload]`, where `length` covers tag + payload but not itself. All multi-byte integers are big-endian (`DataView` defaults). Strings inside `CLIENT_ABORT` use a `[u16 len][utf8 bytes]` segment; the `NODE` name uses the same `u16`-prefixed form inline.
+
+| Frame | Payload layout | Payload size |
+|-------|----------------|--------------|
+| `NODE` | `node_id(u32) parent_id(u32) kind(u8) name_len(u16) name(bytes) size_flag(u8) [size(u64)] mtime_flag(u8) [mtime(u64)]` | variable |
+| `SUMMARY` | `node_id(u32) scan_done(u64) scan_est(u64) body_done(u64) body_est(u64) sealed(u8)` | 37 |
+| `FILE_OPEN` | `node_id(u32) size(u64) mtime_flag(u8) [mtime(u64)]` | 13 or 21 |
+| `FILE_CHUNK` | `node_id(u32) offset(u64) length(u32) checksum_kind(u8) checksum(u32) payload(bytes)` | 21 + payload |
+| `FILE_CLOSE` | `node_id(u32) size_sent(u64)` | 12 |
+| `DIR_CLOSE` | `node_id(u32)` | 4 |
+| `SESSION_END` | `scan_done(u64) scan_est(u64) body_done(u64) body_est(u64) sealed(u8=1)` | 33 |
+| `CLIENT_ABORT` | `code_len(u16) code(bytes) reason_len(u16) reason(bytes)` | variable |
+
+`crc32c(data, initial = 0)` is a table-driven Castagnoli implementation (polynomial `0x82F63B78` reflected), with a 256-entry `Uint32Array` built at module load. It returns an unsigned 32-bit `number` and accepts an `initial` value for incremental use.
+
+#### Control messages (JSON over WebSocket)
+
+Client → server:
+
+```ts
+export interface HelloMsg {
+  t: "HELLO";
+  v: typeof PROTOCOL_VERSION;
+  session_id: string;
+  leg_id: string;
+  target_dir: string;
+  meta?: unknown;   // size-capped server-side (default 16 KiB)
+}
+
+export interface ResumeMsg {
+  t: "RESUME";
+  session_id: string;
+  resume_token: string;
+  leg_id: string;
+  last_known_epoch: number | null;
+}
+
+export interface ClientAbortMsg { t: "CLIENT_ABORT"; code: string; reason: string; }
+
+export interface ActionMsg { t: "ACTION"; action: "merge_overwrite" | "cancel"; }
+
+export type ClientControlMsg = HelloMsg | ResumeMsg | ClientAbortMsg | ActionMsg;
+```
+
+Server → client:
+
+```ts
+export interface ServerLimits {
+  max_chunk_bytes: number;
+  max_open_files: number;
+  max_pending_files: number;
+}
+
+export interface HelloOkMsg {
+  t: "HELLO_OK";
+  epoch: number;
+  expires_at: string;
+  /** SERVER-issued bearer token for data/probe/publish and future RESUMEs. */
+  resume_token: string;
+  limits: ServerLimits;
+}
+
+export interface RootSummary {
+  scan_done_units: number;
+  scan_est_units: number;
+  body_done_bytes: number;
+  body_est_bytes: number;
+  sealed: boolean;
+}
+
+export interface ResumeFileStatus {
+  node_id: number;
+  accepted_offset: number;
+  status: "open" | "closed" | "rejected";
+}
+
+export interface ResumeOkMsg {
+  t: "RESUME_OK";
+  epoch: number;
+  expires_at: string;
+  root_summary: RootSummary;
+  files: ResumeFileStatus[];
+  pruned_nodes: number[];
+  rejected_files: number[];
+}
+
+export interface FileAckMsg { t: "FILE_ACK"; node_id: number; accepted_offset: number; }
+
+export interface NackChunkMsg {
+  t: "NACK_CHUNK";
+  node_id: number;
+  expected_offset: number;
+  reason: "bad_checksum" | "bad_offset" | "stale_epoch" | "server_policy" | "unknown_node";
+}
+
+export interface FlowMsg {
+  t: "FLOW";
+  paused: boolean;
+  reason: "backpressure" | "maintenance" | "storage_pressure";
+}
+
+export interface PruneNodeMsg  { t: "PRUNE_NODE";  node_id: number; code: string; reason: string; }
+export interface RejectFileMsg { t: "REJECT_FILE"; node_id: number; code: string; reason: string; }
+export interface SessionAbortMsg { t: "SESSION_ABORT"; code: string; reason: string; }
+export interface CommitOkMsg   { t: "COMMIT_OK"; files: number; bytes: number; }
+export interface ProbeAckMsg   { t: "PROBE_ACK"; first_chunk_bytes?: number; }
+
+export interface AskMsg {
+  t: "ASK";
+  code?: string;      // currently only "target_conflict"; absent on older servers
+  node_id?: number;
+  name?: string;
+}
+
+export interface CommitRetryMsg {
+  t: "COMMIT_RETRY";
+  incomplete: { node_id: number; accepted_offset: number }[];
+  nodes_expected?: number;   // present when the node-count invariant failed
+  nodes_seen?: number;
+}
+
+export type ServerControlMsg =
+  | HelloOkMsg | ResumeOkMsg | FileAckMsg | NackChunkMsg | FlowMsg
+  | PruneNodeMsg | RejectFileMsg | SessionAbortMsg | CommitOkMsg
+  | CommitRetryMsg | ProbeAckMsg | AskMsg;
+
 export type SessionState =
   | "active" | "paused_by_server" | "waiting_resume" | "committing"
   | "committed" | "aborted" | "expired" | "failed";
 ```
 
-The session initializes `_state = "active"` at field-declaration time (before `connect()` runs). Every transition:
+Note the asymmetry: 4 client message kinds, 12 server message kinds.
 
-| To | Site | Trigger |
-|----|------|---------|
-| `active` | end of `connect()` | control ready + data channel opened; also resets `reconnectCount = 0` |
-| `active` | `flow` handler | `FLOW{paused:false}` while state was `paused_by_server` |
-| `active` | `finalizeScan()` commit loop | after `COMMIT_RETRY`, before re-opening the data channel |
-| `paused_by_server` | `flow` handler | `FLOW{paused:true}` |
-| `waiting_resume` | `handleDisconnect()` | control `close` while active/paused, or a `DATA_WRITE_FAILED`/`DATA_HTTP_ERROR` from the data channel |
-| `committing` | `finalizeScan()` | immediately after writing `SESSION_END` |
-| `committed` | `finalizeScan()` | batch-mode commit parsed from the final POST body |
-| `committed` | `commit_ok` handler | `COMMIT_OK` over the control channel |
-| `aborted` | `abort()` | caller-initiated |
-| `aborted` | `session_abort` handler | server `SESSION_ABORT` |
-| `failed` | `handleDisconnect()` | `reconnectCount >= maxReconnectAttempts` |
+---
 
-`"expired"` is never assigned anywhere in the client — grep across `src/` finds it only in the `SessionState` union and in an unrelated HTTP-410 hint string in `errors.ts`. Expiry surfaces instead as a fatal `DATA_HTTP_ERROR` with `status: 410`. Server-side expiry mapping is outside this batch.
+### 5.4 `control.ts` — WebSocket control channel
 
-**Mapping to server states.** `SessionState` is the client's mirror of the server vocabulary. Two mappings are visible from the wire handling: `COMMIT_RETRY` carries a comment stating the server "reverted to ACTIVE," so the client mirrors it by calling `setState("active")`; and `commit_retry`'s handler notes "Epoch stays the same — only `attach_leg()` (reconnect) bumps epoch," naming a server function. The full server state table is documented in the server section.
-
-#### Connect sequence (`connect()`)
-
-1. Mint a fresh `legId`. `isResume = this.epoch > 0`.
-2. Derive the WS URL: `serverUrl.replace(/^http/, "ws") + "/mfup/control"` (so `https://` → `wss://`).
-3. Construct `ControlChannel`, wire ~13 event handlers via `wireControlEvents()`, call `open()`.
-4. `await control.ready()` — resolves on `HELLO_OK`/`RESUME_OK`, rejects on WS close or `SESSION_ABORT`. On rejection, wrap in `wsConnectFailed(wsUrl, err)`, emit, and throw.
-5. Replace `abortCtrl` with a fresh `AbortController` for this leg.
-6. **Probe once per session:** if `_streamingMode === null`, `await probeStreaming({...})`. On throw, force `_streamingMode = false` and emit `probeError(err)` — a probe failure is never fatal.
-7. Construct the `DataChannel` with `epoch`, the leg's `AbortSignal`, and `streaming: _streamingMode`.
-8. Register `data.onError`, guarded by a captured `dc` reference so a stale channel's late error cannot trigger a reconnect on the current one. `DATA_WRITE_FAILED` and `DATA_HTTP_ERROR` escalate to `handleDisconnect(err)`; other codes are emitted only.
-9. Fire `data.open()` without awaiting. Both settlement paths re-check `this.data !== openDc` and bail if stale. A resolved non-`ok` `Response` becomes `dataHttpError(url, status, statusText, body)`; a rejection becomes `dataOpenFailed(url, err)` unless it is already an `MfupError`. Both escalate to `handleDisconnect`, but only if `abortCtrl.signal.aborted` is false.
-10. `setState("active")`, `reconnectCount = 0`.
-
-#### Scan → queue → pump
-
-`onDiscover(node)` is the `IngestCallback` passed to every adapter:
-
-- Writes a `NODE` frame (`sizeHint` = node size, `mtimeMs` passed through).
-- Increments both `scanDone` and `scanEst` by 1 — the "estimate" tracks discovered count exactly, so `scanFrac` is always 1.0 during scan. *Inferred consequence, not stated in source.*
-- For files with an `openBody`, creates a `TrackedFile`, indexes it in `trackedFiles`, pushes it onto `fileQueue`, and adds its size to `bodyEstTotal` and to the progress tracker.
-- Emits a root `SUMMARY` frame every 50 discovered nodes.
-- Calls `kickPump()` — scan and upload run concurrently.
-- **Scan backpressure:** if `fileQueue.length >= SCAN_HIGH_WATER` (10,000), awaits a promise stored in `_scanGateResolve`, halting ingestion. The pump releases the gate when the queue drains below `SCAN_LOW_WATER` (5,000). `abort()` also releases it so ingestion cannot hang.
+`ControlChannel` wraps a single `WebSocket`, sends the opening handshake, parses inbound JSON, and dispatches onto a typed event bus. It holds no upload state.
 
 ```ts
-interface TrackedFile {
-  nodeId: number;
-  size: bigint;
-  acceptedOffset: bigint;
-  openBody: (offsetBytes?: number) => AsyncIterable<Uint8Array>;
-  status: "pending" | "streaming" | "sent" | "acked" | "rejected";
-  /** Set by NACK handler — signals streamFile to abort and requeue. */
-  nacked: boolean;
+export interface ControlChannelOpts {
+  url: string;                    // ws(s)://host/mfup/control
+  sessionId: string;
+  resumeToken: string;
+  legId: string;
+  targetDir: string;              // relative path on the server
+  meta?: unknown;                 // HELLO.meta
+  lastKnownEpoch?: number | null; // if set, send RESUME instead of HELLO
 }
 ```
 
-`kickPump()` is a no-op if `pumping` is already true; otherwise it assigns `pumpDone = pumpFiles()`. `pumpFiles()` loops while `fileQueue.length > 0 && _state === "active"`:
+| Member | Type | Description |
+|--------|------|-------------|
+| `epoch` | getter → `number` | Set from `HELLO_OK`/`RESUME_OK`, `0` before |
+| `limits` | getter → `ServerLimits \| null` | Set from `HELLO_OK` only |
+| `expiresAt` | getter → `string \| null` | Set from `HELLO_OK`/`RESUME_OK` |
+| `ready()` | `Promise<void>` | Resolves on `HELLO_OK`/`RESUME_OK`; rejects on WS close or `SESSION_ABORT` |
+| `open()` | `void` | Constructs the socket and wires `onopen`/`onmessage`/`onerror`/`onclose` |
+| `close(code = 1000, reason = "")` | `void` | Closes the socket |
+| `send(msg: ClientControlMsg)` | `void` | JSON-stringifies and sends (no-op when the socket is null) |
+| `sendAbort(code, reason)` | `void` | Sends `CLIENT_ABORT` |
+| `sendAction(action)` | `void` | Sends `ACTION` |
+| `on(event, fn)` | `() => void` | Subscribe; returns unsubscribe |
 
-- `await waitIfPaused()` — blocks on `pauseResolve` while `FLOW{paused:true}` is in effect.
-- Breaks if `data.failed || data.closed`, leaving recovery to `handleDisconnect`.
-- Drops the head file if it is in `rejectedFiles` or `prunedNodes`, marking it `"rejected"` and calling `progress.skipFile()`.
-- Shifts the file, releases the scan gate if the queue is now under the low-water mark, sets `activeFile`, and `await streamFile(file)`.
-- If `streamFile` throws while the channel is dead, breaks silently; otherwise wraps in `ingestError("stream", "node N", err)`, emits, and rethrows.
+`onopen` sends `RESUME` when `lastKnownEpoch != null`, otherwise `HELLO`. `HELLO` deliberately carries **no** `resume_token` — the token is server-issued and arrives in `HELLO_OK`. `meta` is added to `HELLO` only when not `undefined`.
 
-#### `streamFile(file)`
+`ControlEventMap` has 14 keys: the 12 server message kinds mapped to lowercase snake names (`hello_ok`, `resume_ok`, `file_ack`, `nack_chunk`, `flow`, `prune_node`, `reject_file`, `session_abort`, `commit_ok`, `commit_retry`, `probe_ack`, `ask`) plus `error: MfupError` and `close: { code: number; reason: string }`.
 
-1. `status = "streaming"`; write `FILE_OPEN{nodeId, size, mtimeMs: null}` — mtime is deliberately null on open even though the `NODE` frame carried it.
-2. `chunks = file.openBody(Number(file.acceptedOffset))` — resume starts the read at the server's accepted offset, not at zero.
-3. `offset = file.acceptedOffset`; `maxChunk = Math.min(this.chunkSize, this.limits.max_chunk_bytes)`.
-4. For each raw chunk from the iterator, sub-slice into `maxChunk` pieces. Per piece: `waitIfPaused()`; bail to `"rejected"` if a `REJECT_FILE` arrived mid-stream; compute `crc32c(piece)`; write `FILE_CHUNK{nodeId, offset, length, checksumKind: CRC32C, checksum, payload}`; advance `offset`; `await data.drain()` (the backpressure gate); return early if the channel died; and if `file.nacked` is set, clear the flag, set `status = "pending"`, push the file back onto `fileQueue`, and return.
-5. On normal completion, write `FILE_CLOSE{nodeId, sizeSent: offset}` and set `status = "sent"`.
-
-The pieces are zero-copy where possible: `pos === 0 && end === raw.length ? raw : raw.subarray(pos, end)`.
-
-#### Commit handshake (`finalizeScan()`)
-
-Seals the scan, emits a final `SUMMARY`, awaits `pumpDone`, then drains: while `_state === "waiting_resume"` or the queue is non-empty, await `_reconnectPromise` (if any), throw if the state reached `failed`/`aborted`, and re-kick the pump. Then an unbounded commit loop:
-
-1. Write `SESSION_END` with the full root summary and `sealed: true`; `setState("committing")`; `await data.close()`.
-2. **Batch fast path** — if still `committing` and `data.commitResult` is set (parsed from the final POST's JSON body), transition to `committed`, emit `committed`, and return without ever waiting on the WebSocket.
-3. Otherwise await a promise wired to `_commitResolve` / `_commitReject`, unless `_commitRetry` is already true. The pre-check on `_commitRetry` closes a documented race where `handleDisconnect` sets the flag before the promise exists. The awaited promise short-circuits if the state already reached `committed`/`aborted`/`failed`.
-4. If `_commitRetry` is false → `COMMIT_OK` arrived; return.
-5. Otherwise clear the flag, `data.abort("commit_retry")`, `setState("active")`, construct a *new* `DataChannel` on the same `legId` with `streaming: _streamingMode ?? false`, re-register the stale-guarded `onError`, `open().catch(() => {})`, re-pump the requeued files, drain again, and loop back to step 1.
-
-The `COMMIT_RETRY` handler does the requeueing before `finalizeScan` sees the flag: for each `{node_id, accepted_offset}` in `msg.incomplete`, any tracked file not already `"acked"` has its `acceptedOffset` reset and is pushed back as `"pending"`.
-
-#### Control-message handlers (`wireControlEvents()`) — 13 handlers
-
-| Event | Effect |
-|-------|--------|
-| `hello_ok` | `epoch = msg.epoch`; `limits = msg.limits`; `progress.setExpiresAt(msg.expires_at)` |
-| `resume_ok` | Same plus `progress.setFromRootSummary(...)` and `applyResumeState(msg)` |
-| `file_ack` | Advances `acceptedOffset`; adds the positive delta to `bodyDoneTotal` and `progress.setBodyAccepted`; promotes `"sent"` → `"acked"` and calls `progress.acceptFile()` once `acceptedOffset >= size` |
-| `nack_chunk` | Rewinds `acceptedOffset` to `msg.expected_offset`. If `"streaming"`, sets `nacked` so `streamFile` self-requeues; if `"sent"`, requeues directly. Always emits `nackChunk(...)` |
-| `flow` | Sets `paused`; resolves `pauseResolve` on unpause; toggles `paused_by_server` ⇄ `active` |
-| `prune_node` | Adds to `prunedNodes` (blocks future descent via `IngestFilter.shouldDescend`) |
-| `reject_file` | Adds to `rejectedFiles`, marks the tracked file `"rejected"`, `progress.skipFile()` |
-| `session_abort` | `setState("aborted")`, `data.abort(...)`, emit `sessionAbortedByServer`, reject any pending commit |
-| `commit_ok` | `setState("committed")`, emit `committed`, resolve the commit promise |
-| `commit_retry` | Requeue `msg.incomplete`, set `_commitRetry = true`, resolve the commit promise |
-| `ask` | Re-emits as the session-level `ask` event; the app answers with `sendAction()` |
-| `close` | If state is `active` or `paused_by_server`, escalates to `handleDisconnect(unknownError(CONTROL, "control channel closed unexpectedly"))` |
-| `error` | Re-emits verbatim |
-
-#### Resume (`applyResumeState`)
-
-Merges `pruned_nodes` and `rejected_files` into the local sets, then walks `msg.files`: sets `acceptedOffset` from `accepted_offset`, maps `status: "rejected"` → local `"rejected"` (+ add to `rejectedFiles`) and `status: "closed"` → `"acked"`. Files the server knows about but the local scan has not re-discovered still contribute to the accepted/skipped tallies. Finally `progress.setFileCounts(acceptedCount, skippedCount)`, where `skippedCount` starts at `msg.pruned_nodes.length`.
-
-#### Reconnect and backoff (`handleDisconnect`)
-
-Guards: returns immediately if state is `committed`, `aborted`, or already `waiting_resume` — the last prevents double-entry when a WS close and a data-channel error fire together. Records `wasCommitting` before transitioning.
-
-Sets `waiting_resume`, aborts the data channel, and creates a single `_reconnectPromise` that stays pending across *all* retries. A source comment explains why: resolving and re-creating it between attempts would let `finalizeScan`'s while-loop spin without an await and freeze the tab.
-
-The retry loop:
-
-- If `maxReconnectAttempts != null && reconnectCount >= maxReconnectAttempts` → `setState("failed")`, emit `sessionReconnectExhausted(reconnectCount, err)`, reject the pending commit, resolve and clear the reconnect promise, return.
-- `reconnectCount++`; `delay = Math.min(reconnectDelayMs * 2 ** (reconnectCount - 1), 20_000)`.
-- Emit `reconnecting {attempt, delay, maxAttempts}` **before** sleeping so the UI updates immediately, then emit `sessionReconnectFailed(attempt, err)`.
-- Sleep via `setTimeout` stored in `_reconnectTimer` so `abort()` can cancel it. After waking, return early if `abort()` ran during the delay.
-- `await this.connect()`. On success: `requeuePendingFiles()`, `kickPump()`, resolve and clear the reconnect promise, and if `wasCommitting`, set `_commitRetry = true` and resolve the commit promise so `finalizeScan` re-sends `SESSION_END`. Return.
-- On failure: `data.abort("reconnect failed")`, `control.close()`, carry the new error forward, loop.
-
-Backoff is pure exponential with base `reconnectDelayMs`, capped at 20 s — **no jitter**. With defaults the sequence is 1s, 2s, 4s, 8s, 16s, 20s, 20s… `reconnectCount` resets to 0 only on a successful `connect()`.
-
-`requeuePendingFiles()` first replays `_pendingMeta` — `NODE`, `SUMMARY`, and `DIR_CLOSE` frames buffered by `safeWrite` while the channel was down — then requeues every tracked file in `"pending"`, `"streaming"`, or `"sent"` state that is neither rejected nor pruned and whose `acceptedOffset < size`.
-
-#### `safeWrite(frame)`
-
-The single funnel for all data-plane writes. If the channel is missing/closed/failed **and** state is `waiting_resume`, metadata frames (`NODE`, `SUMMARY`, `DIR_CLOSE`) are pushed to `_pendingMeta` for replay and file frames are silently dropped (they are recovered by requeue instead). Otherwise it emits `dataWriteFailed("data channel not available")`. A live write that throws is converted to an emitted error — `MfupError` passes through, anything else is wrapped in `dataWriteFailed("write failed", cause)`. `safeWrite` never throws.
-
-#### `abort(code, reason)`
-
-Fully synchronous: clears `_reconnectTimer`, resolves and clears the reconnect promise (unblocking `finalizeScan`), releases the scan gate, sends `CLIENT_ABORT` on the control channel, attempts a `CLIENT_ABORT` data frame inside a swallowing `try/catch`, closes both channels, aborts `abortCtrl`, sets state `aborted`, and rejects any pending commit with `new Error("aborted")` — a plain `Error`, not an `MfupError`.
+`SESSION_ABORT` is handled specially: it emits `session_abort`, emits `error` with `wsHandshakeFailed(code, reason)`, **and** rejects `ready()` with that same typed fatal error — this is how the session's reconnect loop distinguishes "the server refuses this session forever" (`not_found`, `auth_failed`, `bad_version`) from a transient network failure. A close with `code !== 1000` also emits `wsClosedUnexpected`. Parse failures emit `wsMessageParse` with the first 200 characters of the raw payload.
 
 ---
 
-### 4.3 Wire format (`protocol.ts`)
+### 5.5 `data-channel.ts` — chunk transport
 
-The client mirror of the server codec: 12 exported values, 26 exported types, encode-only (no decoder — server→client traffic is JSON over the WebSocket).
-
-**Framing:** `[4-byte big-endian length][1-byte tag][payload]`. The length covers tag + payload and excludes itself. `allocFrame` writes `view.setUint32(0, 1 + payloadSize)` and `buf[4] = tag`; every encoder then writes from offset 5. All multi-byte integers are big-endian (no `littleEndian` argument is ever passed).
-
-The eight tags and their payload layouts are tabulated in §2.3.
-
-Sizes and offsets are 64-bit `bigint` throughout the frame types; `FileChunkFrame.length` and `checksum` are plain `number`s.
-
-**Control-message unions.** `ClientControlMsg` = `HelloMsg | ResumeMsg | ClientAbortMsg | ActionMsg`. `ServerControlMsg` = 12 members: `HelloOkMsg`, `ResumeOkMsg`, `FileAckMsg`, `NackChunkMsg`, `FlowMsg`, `PruneNodeMsg`, `RejectFileMsg`, `SessionAbortMsg`, `CommitOkMsg`, `CommitRetryMsg`, `ProbeAckMsg`, `AskMsg`. All are tagged by a `t` field carrying the SCREAMING_SNAKE message name. JSON fields use `snake_case` while the binary frame types use `camelCase`.
-
-`NackChunkMsg.reason` is a closed union: `"bad_checksum" | "bad_offset" | "stale_epoch" | "server_policy"`. `FlowMsg.reason` is `"backpressure" | "maintenance" | "storage_pressure"`. `ResumeFileStatus.status` is `"open" | "closed" | "rejected"`.
-
-**CRC32C.** A 256-entry table is built at module load from the Castagnoli polynomial `0x82F63B78` (reflected). `crc32c(data, initial = 0)` is the standard reflected implementation with pre/post inversion, returning an unsigned 32-bit number. The `initial` parameter allows chained/incremental computation, though the session always calls it per-piece with the default. A source comment records that `HashKind` and SHA-256 were removed because "CRC32C per-chunk is sufficient; SHA-256 was never verified server-side" — **per-chunk CRC32C is the only integrity mechanism in this SDK.**
-
----
-
-### 4.4 Data channel (`data-channel.ts`)
-
-HTTP transport for binary frames on one leg. No WebRTC. Two modes selected at construction.
+`DataChannel` moves encoded frames for a single leg. It has two mutually exclusive modes chosen at construction.
 
 ```ts
 export interface DataChannelOpts {
   baseUrl: string;
   sessionId: string;
   legId: string;
-  /** Resume token for data channel auth (sent as X-MFUP-Token header). */
-  resumeToken: string;
-  /** Current session epoch — used to reject stale requests server-side. */
-  epoch: number;
+  resumeToken: string;              // X-MFUP-Token header
+  epoch: number;                    // query param; server rejects stale epochs
   signal?: AbortSignal;
-  /** Enable streaming mode (one long POST with duplex:"half") */
-  streaming?: boolean;
-  /** Batch flush threshold in bytes (default 2 MiB). Only used in batch mode. */
-  flushBytes?: number;
+  streaming?: boolean;              // default false
+  flushBytes?: number;              // default 2 * 1024 * 1024
+  onUploadProgress?: (bytesOnWire: number) => void;
 }
 
 export interface DataCommitResult { files: number; bytes: number; }
 ```
 
-Endpoint: `${baseUrl}/mfup/data/${sessionId}/${legId}`, query `?seq=<n>&final=<0|1>&epoch=<n>`, headers `Content-Type: application/x-mfup` and `X-MFUP-Token: <resumeToken>`. `DEFAULT_FLUSH_BYTES = 2 * 1024 * 1024`.
+| Member | Type | Description |
+|--------|------|-------------|
+| `closed` / `failed` / `bytesSent` | getters | Channel status and cumulative bytes handed over |
+| `commitResult` | `DataCommitResult \| null` | Parsed from the final batch POST response body |
+| `onError(fn)` | `void` | Register the async error sink (single callback, last wins) |
+| `open()` | `Promise<Response \| void>` | Streaming → the fetch promise; batch → resolves when `close()` finishes |
+| `write(frame)` | `void` (synchronous) | Encodes and enqueues/buffers; throws `dataChannelClosed()` when closed |
+| `drain()` | `Promise<void>` | Backpressure gate (see below) |
+| `close()` | `Promise<void>` | Streaming → close the stream controller; batch → flush with `final=1` |
+| `abort(reason?)` | `void` | Streaming → error the controller; batch → discard the buffer and resolve `open()` |
 
-| Member | Signature | Description |
-|--------|-----------|-------------|
-| `closed` / `failed` / `bytesSent` | getters | `boolean`, `boolean`, `number` |
-| `commitResult` | `DataCommitResult \| null` | Parsed from the final batch POST body |
-| `onError(fn)` | `(fn: (err: MfupError) => void) => void` | Single-slot callback (assignment, not a set) |
-| `open()` | `(): Promise<Response \| void>` | `Response` in streaming mode, `void` in batch |
-| `write(frame)` | `(frame: DataFrame): void` | Always synchronous; encodes then enqueues/buffers |
-| `drain()` | `(): Promise<void>` | Backpressure gate |
-| `close()` | `(): Promise<void>` | Graceful; final flush in batch mode |
-| `abort(reason?)` | `(reason?: string): void` | Errors the stream / discards the buffer |
+#### Streaming mode (`duplex: "half"`)
 
-**Streaming mode.** `_openStreaming()` builds a `ReadableStream<Uint8Array>` with `new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 })` and fires one `fetch(url + "?seq=0&final=1&epoch=…", { method: "POST", body: stream, duplex: "half", signal })`. The whole leg is a single `POST` — hence the hard-coded `seq=0&final=1`. `write()` calls `controller.enqueue(encoded)` and adds to `bytesSent`. Backpressure: `drain()` inspects `controller.desiredSize`; if `<= 0`, it parks on a promise stored in `_drainResolve`, which the stream's `pull()` callback resolves once the network consumes enough bytes. `close()` calls `controller.close()`; `abort()` calls `controller.error(new Error(reason ?? "aborted"))`. Both first resolve any parked `drain()` so the pump loop cannot deadlock.
+`_openStreaming()` issues one long-lived `fetch` to `…?seq=0&final=1&epoch={epoch}` with a `ReadableStream` body and `duplex: "half"`, governed by `new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 })` (4 MiB). `write()` calls `controller.enqueue(encoded)` directly. `drain()` blocks when `controller.desiredSize <= 0` and is released by the stream's `pull()` callback, i.e. when the network has actually consumed data — this is what keeps memory bounded when the disk outruns the link, and it is also why the *session* treats writer progress as real network progress in streaming mode.
 
-**Batch mode.** `open()` returns a promise that only settles when `close()`/`abort()` fires `_doneResolve`. `write()` appends the encoded frame to `_batchBuffer` and tracks `_batchBufferBytes`. `drain()` flushes when the buffer reaches `flushBytes`. `_flushBatch(final)` swaps out the buffer, concatenates (`_concatChunks` returns the single chunk unchanged when `length === 1`), assigns a monotonic `seq`, and appends the POST to `_flushChain` — a promise chain that guarantees **never two POSTs in flight**. Non-`ok` responses set `_failed = true` and report `dataHttpError`. On the `final` POST it parses the JSON body: `json.commit` populates `commitResult`, `json.error` produces a `dataHttpError(url, status, "commit_error", json.error)`. A parse failure is swallowed — a source comment notes "commit_ok via WS is the fallback." Network throws set `_failed` and report `dataWriteFailed`.
+#### Batch mode (default)
 
-**What happens when the channel drops.** The channel itself only sets `_failed` and invokes `onError`. Recovery lives entirely in the session: `DATA_WRITE_FAILED` and `DATA_HTTP_ERROR` route to `handleDisconnect`, which aborts the channel, enters `waiting_resume`, buffers subsequent metadata frames, and on reconnect constructs a brand-new `DataChannel` with the new `legId` and bumped `epoch`. In-flight file bodies are re-streamed from the server-acknowledged offset. There is no in-channel retry — a `DataChannel` instance is single-use.
+`write()` appends to `_batchBuffer`. `drain()` flushes once `_batchBufferBytes >= flushBytes` (default 2 MiB). `close()` flushes the remainder with `final=1`.
+
+**Serialisation.** All flushes go through `_flushChain: Promise<void>` — POSTs are chained, so there is never more than one request in flight. Each flush takes the next `seq` from a monotonic counter and posts to `…?seq={seq}&final={0|1}&epoch={epoch}`. `_concatChunks` avoids a copy when the buffer holds exactly one chunk.
+
+**Retry and backoff** (`_postWithRetry`): `MAX_ATTEMPTS = 4`, `RETRY_DELAYS = [500, 1000, 2000]` ms before attempts 2, 3, 4 (with `?? 2000` as the fallback). The loop breaks immediately if `signal.aborted`, both before the delay and after it. The retry policy:
+
+| Outcome | Behaviour |
+|---------|-----------|
+| `2xx` | Success. On `final`, parse the JSON body for `commit` (→ `commitResult`) and `error` (→ `dataHttpError`). Add `body.byteLength` to `bytesSent` |
+| Network error / timeout (thrown) | Record `dataWriteFailed` and retry |
+| `5xx` and `attempt < MAX_ATTEMPTS - 1` | Retry with the **same** `seq` |
+| `409` with body `{error:"seq_mismatch", expected: seq + 1}` on attempt > 0 | Treated as success — the previous "failed" attempt actually landed |
+| Any other `4xx`/`409` | Not retryable; break |
+| All attempts exhausted | `_failed = true`, `_onError(lastErr)` |
+
+Retrying the same `seq` is safe because the server processes each batch POST atomically and advances its seq counter only after full processing. The comment records why this exists: frames inside a failed POST (notably `NODE` metadata killed by a flaky proxy) used to be silently lost, which is precisely how `COMMIT_OK` could be returned on an incomplete tree.
+
+**Wire-level upload progress.** `_xhrPost()` uses `XMLHttpRequest` rather than `fetch` because XHR is the only browser API that exposes real upload progress. Before `send()` it captures `base = this._bytesSent` (bytes of previously *completed* posts) and installs:
+
+```ts
+xhr.upload.onprogress = (e) => { this.opts.onUploadProgress?.(base + e.loaded); };
+```
+
+so the callback always receives a cumulative byte count including the in-flight body. The session feeds this straight into `progress.setBodySent(BigInt(n))`. Without it a slow link showed a 2 MiB jump per completed POST instead of a moving bar.
+
+**Cancellation.** `_xhrPost` registers `signal.addEventListener("abort", () => xhr.abort(), { once: true })` and removes it in a `cleanup()` run from every terminal handler. `onabort` rejects with `DOMException("aborted", "AbortError")`, `onerror`/`ontimeout` reject with `TypeError`. Combined with `DataChannel.abort()` discarding the batch buffer and the retry loop's two `signal.aborted` checks, a user cancel stops the network immediately rather than after draining megabytes.
 
 ---
 
-### 4.5 Ingestion (`ingestion.ts`)
+### 5.6 `ingestion.ts` + `dnd.ts` — input → manifest
 
-Four adapters over the four browser APIs for getting at local files, each normalizing to one callback shape.
+#### Core types (`ingestion.ts`)
 
 ```ts
 export interface DiscoveredNode {
   nodeId: number;
   parentId: number;
   kind: NodeKind;
-  /** For files — exact size. For dirs — null. */
-  size: bigint | null;
-  mtimeMs: bigint | null;
   name: string;
-  /** For files: async iterable of body chunks; accepts a resume offset. Null for dirs. */
+  size: bigint | null;      // exact for files, null for dirs
+  mtimeMs: bigint | null;
+  /** Files: async iterable of body chunks, optionally starting at a byte
+   *  offset (implemented via Blob.slice). Directories: null. */
   openBody: ((offsetBytes?: number) => AsyncIterable<Uint8Array>) | null;
 }
 
 export type IngestCallback = (node: DiscoveredNode) => void | Promise<void>;
 
 export interface IngestFilter {
-  shouldDescend?(nodeId: number, name: string): boolean;
-  shouldInclude?(nodeId: number, name: string): boolean;
+  shouldDescend?(nodeId: number, name: string): boolean;  // false prunes the subtree
+  shouldInclude?(nodeId: number, name: string): boolean;  // false skips the file
 }
 ```
 
-All four adapters share the signature `(source, rootParentId: number, ids: NodeIdAllocator, cb: IngestCallback, filter?: IngestFilter) => Promise<void>` and `await` the callback, so a slow consumer (the scan gate) throttles the walk.
+`NodeIdAllocator` hands out ids starting at `1` (`0` is reserved for the root); `current` returns the last allocated id.
 
-| Adapter | Input | Traversal |
-|---------|-------|-----------|
-| `ingestFromHandles` | `FileSystemHandle[]` | Recursive `walkHandle`; uses `dirHandle.entries()` (cast to `any`) and `fileHandle.getFile()` |
-| `ingestFromEntries` | `FileSystemEntry[]` | Recursive `walkEntry`; `readAllEntries` + promisified `entry.file()` |
-| `ingestFromFileList` | `FileList` | Two-pass: builds a virtual tree by splitting `webkitRelativePath` on `/` and allocating ids, then DFS-emits |
-| `ingestFromFiles` | `File[]` | Flat — every file is a direct child of `rootParentId`, no directories |
-
-`readAllEntries(dir)` loops `reader.readEntries()` until it yields an empty batch, because the API is not guaranteed to return everything in one call.
-
-**Reading and chunking.** All four adapters produce bodies from one primitive:
+**Body reading.** All four adapters read through one private async generator:
 
 ```ts
 const READ_SLICE_SIZE = 65536; // 64 KiB slices
-
-async function* blobChunks(blob: Blob, offset = 0): AsyncGenerator<Uint8Array> {
-  let pos = offset;
-  const size = blob.size;
-  while (pos < size) {
-    const end = Math.min(pos + READ_SLICE_SIZE, size);
-    const buf = await blob.slice(pos, end).arrayBuffer();
-    yield new Uint8Array(buf);
-    pos = end;
-  }
-}
+async function* blobChunks(blob: Blob, offset = 0): AsyncGenerator<Uint8Array>
 ```
 
-The `offset` parameter is what makes mid-file resume work — `streamFile` passes `Number(file.acceptedOffset)` and the generator seeks by slicing. A source comment records the rationale for the async generator over `ReadableStream`: `Blob.stream()` produces "Error in input stream" on multi-chunk files in Firefox, and `ReadableStream({pull})` produced "The operation was aborted"; `slice()` + `arrayBuffer()` is "the most universally reliable path."
+It uses `blob.slice(pos, end).arrayBuffer()` in a loop rather than `Blob.stream()` or a `ReadableStream({pull})`. The comment records why: Firefox raises "Error in input stream" from `Blob.stream()` on multi-chunk files, and `ReadableStream({pull})` produced "The operation was aborted" in some cases. `slice + arrayBuffer` is the universally reliable path, and the `offset` parameter is what makes mid-file resume possible.
 
-Because `READ_SLICE_SIZE` (64 KiB) is smaller than the default `chunkSize` (256 KiB), the session's sub-slicing loop normally runs exactly once per read and each 64 KiB slice becomes one `FILE_CHUNK` frame. *This is an inference from the two constants, not stated anywhere.* The sub-slicing exists to honor a server `max_chunk_bytes` below the read slice size.
+#### The four adapters
 
-**Hashing / integrity.** Ingestion computes no hashes. The only integrity check is the `crc32c(piece)` the session computes per outgoing chunk. `mtimeMs` comes from `file.lastModified` and `size` from `file.size`, both widened to `bigint`.
+All four share the signature `(source, rootParentId: number, ids: NodeIdAllocator, cb: IngestCallback, filter?: IngestFilter) => Promise<void>`.
 
-**`NodeIdAllocator`.** `alloc(): number` returns a monotonically increasing id starting at `1` (0 is reserved for `ROOT_NODE_ID`); `get current(): number` returns the last allocated id. One instance per session, shared across every adapter call so ids stay unique across a resumed scan.
+| Function | Input | Tree walk | Skipping |
+|----------|-------|-----------|----------|
+| `ingestFromHandles` | `FileSystemHandle[]` | Recursive `walkHandle`; directories iterate `(dirHandle as any).entries()`; file metadata from `getFile()` (`size`, `lastModified`) | `shouldDescend` false → the directory node is **not emitted** and the subtree is skipped; `shouldInclude` false → file skipped |
+| `ingestFromEntries` | `FileSystemEntry[]` | Recursive `walkEntry`; directory children via `readAllEntries()`; file via promisified `entry.file()` | Same as above |
+| `ingestFromFileList` | `ArrayLike<File>` with `webkitRelativePath` | Two passes: build a `VNode` tree by splitting `webkitRelativePath` on `/` and allocating ids, then DFS-emit | Same as above, applied during the emit pass |
+| `ingestFromFiles` | `File[]` | Flat — every file is a direct child of `rootParentId` | `shouldInclude` false → `continue` (id already consumed) |
 
-A behavioral detail worth noting: `walkHandle` and `walkEntry` call `ids.alloc()` *before* consulting the filter, so pruned/excluded nodes still consume an id. In `ingestFromFiles` the same holds — ids are allocated then possibly skipped.
+**Path normalisation.** There is no string path normalisation anywhere in ingestion. Structure is carried entirely by `(nodeId, parentId)` pairs and a single-segment `name` per node; only `ingestFromFileList` parses a path, splitting `webkitRelativePath` on `/` and treating the last segment as the file. Client-relative display paths (`"dir/sub/name.ext"`) are reconstructed later in `session.ts` by `nodePath()` walking parent links. Note that `ingestFromFileList` marks a `VNode` as a file whenever it is the last path segment for some entry, so a name colliding between a file and a directory resolves to the file branch.
 
----
+**Directory listing completeness.** `readAllEntries()` wraps `FileSystemDirectoryReader.readEntries` in a recursive callback loop that accumulates batches and resolves only when a batch comes back empty — a single call is not guaranteed to return all children.
 
-### 4.6 Control channel (`control.ts`)
+**Node ids are allocated before filtering.** `walkHandle`/`walkEntry` call `ids.alloc()` first, then consult the filter, so a filtered-out node still burns an id. This is what allows the session's filter (`shouldDescend: id => !prunedNodes.has(id)`, `shouldInclude: id => !rejectedFiles.has(id)`) to be keyed on ids the server sent back.
 
-A thin typed WebSocket wrapper. Sends JSON, dispatches server messages onto a typed event bus, and exposes a `ready()` promise for the handshake.
+**Handle body reuse.** In `walkHandle`, `openBody` closes over the `File` already fetched during the scan rather than re-calling `getFile()`; the same holds for the entry and file-list adapters.
+
+#### `dnd.ts` — extracting a source from browser events
 
 ```ts
-export interface ControlChannelOpts {
-  url: string;            // ws(s)://host/mfup/control
-  sessionId: string;
-  resumeToken: string;
-  legId: string;
-  targetDir: string;
-  /** If set, we send RESUME instead of HELLO */
-  lastKnownEpoch?: number | null;
-}
+export type UploadSource =
+  | { kind: "handles";  handles: Promise<FileSystemHandle[]> }
+  | { kind: "entries";  entries: FileSystemEntry[] }
+  | { kind: "filelist"; files: ArrayLike<File> }   // tree via webkitRelativePath
+  | { kind: "files";    files: File[] };           // flat
 ```
 
-| Member | Signature | Description |
-|--------|-----------|-------------|
-| `epoch` / `limits` / `expiresAt` | getters | `number`, `ServerLimits \| null`, `string \| null` |
-| `ready()` | `(): Promise<void>` | Resolves on `HELLO_OK`/`RESUME_OK`; rejects on close or `SESSION_ABORT`. Settled once (`_readySettled`) |
-| `open()` | `(): void` | Constructs the `WebSocket` and installs 4 handlers |
-| `close(code = 1000, reason = "")` | `(code?: number, reason?: string): void` | |
-| `send(msg)` | `(msg: ClientControlMsg): void` | `JSON.stringify` via optional-chained `ws?.send` |
-| `sendAbort(code, reason)` | `(code: string, reason: string): void` | Sends `{t:"CLIENT_ABORT", code, reason}` |
-| `sendAction(action)` | `(action: "merge_overwrite" \| "cancel"): void` | Sends `{t:"ACTION", action}` |
-| `on(event, fn)` | `<K extends keyof ControlEventMap>(...) => () => void` | Returns unsubscribe |
+| Function | Signature | Behaviour |
+|----------|-----------|-----------|
+| `sourceFromDataTransfer` | `(dt: DataTransfer) => UploadSource \| null` | **Synchronous by contract** — must be called inside the `drop` handler |
+| `sourceFromInput` | `(input: HTMLInputElement) => UploadSource \| null` | Copies out of the live `FileList` so the caller can reset `input.value` immediately |
 
-**Handshake.** `onopen` branches on `lastKnownEpoch != null`: non-null sends `RESUME {session_id, resume_token, leg_id, last_known_epoch}`, null sends `HELLO {v: PROTOCOL_VERSION, session_id, resume_token, leg_id, target_dir}`. Note `target_dir` is only carried on `HELLO`.
+`sourceFromDataTransfer` tries three strategies in order:
 
-**Outbound message types:** 4 (`HELLO`, `RESUME`, `CLIENT_ABORT`, `ACTION`).
+1. **`getAsFileSystemHandle()`** (Chrome/Edge) — collects one promise per item. It requires **every** item to support the call; a single miss sets `allHandles = false` and breaks out. Returns `{kind:"handles", handles}` where `handles` is a `Promise.all(...)` filtered for nulls. The promise is deliberately left unresolved because the `DataTransferItem` list is dead by the next microtask — the *calls* happen synchronously, the *awaiting* happens later.
+2. **`webkitGetAsEntry()`** (Firefox/Safari, also Chrome) — returns `{kind:"entries"}`. `FileSystemEntry` objects are not tied to the `DataTransfer` lifecycle, so lazy streaming works.
+3. **`DataTransfer.files`** — last resort, returns `{kind:"files"}`. The header comment notes Firefox invalidates these blobs after the drop handler returns, so lazy streaming may fail.
 
-**Inbound dispatch:** 12 cases, one per `ServerControlMsg` member, mapped to lowercase event names — `hello_ok`, `resume_ok`, `file_ack`, `nack_chunk`, `flow`, `prune_node`, `reject_file`, `session_abort`, `commit_ok`, `commit_retry`, `probe_ack`, `ask`. `HELLO_OK` caches `epoch`/`limits`/`expiresAt` and settles ready; `RESUME_OK` caches `epoch`/`expiresAt` (not `limits` — `ResumeOkMsg` carries none) and settles ready; `SESSION_ABORT` emits both `session_abort` and an `error` carrying `wsHandshakeFailed(code, reason)`, then rejects ready.
+If `dt.items` is empty or absent, it falls straight to `dt.files`, returning `null` when there are no files at all.
 
-`ControlEventMap` adds two synthetic events beyond the 12 wire messages: `error: MfupError` and `close: { code: number; reason: string }`. A malformed frame emits `wsMessageParse(raw.slice(0,200), err)`; `ws.onerror` emits `wsConnectFailed(url)`; `ws.onclose` always emits `close`, additionally emits `wsClosedUnexpected(code, reason)` when the code is not `1000`, and always settles `ready` with a rejection.
+`sourceFromInput` returns `{kind:"filelist"}` when `input.webkitdirectory` is truthy **or** the first file has a non-empty `webkitRelativePath`; otherwise `{kind:"files"}`. `MfupSession.upload()` consumes this union directly, and also accepts a bare `FileList` or `File[]`.
 
 ---
 
-### 4.7 Transport probe (`probe.ts`)
+### 5.7 `progress.ts` — progress model
 
-```ts
-export interface ProbeResult { streaming: boolean; latencyMs: number; }
-
-export async function probeStreaming(opts: {
-  baseUrl: string; sessionId: string; resumeToken: string;
-  control: ControlChannel; signal?: AbortSignal; timeoutMs?: number;
-}): Promise<ProbeResult>
-```
-
-Empirically determines whether the browser *and* the server/proxy path really support `duplex: "half"` request streaming. Defaults: `timeoutMs = 1500`, probe chunk size 1024 bytes. Endpoint `${baseUrl}/mfup/probe/${sessionId}` with header `X-MFUP-Token`.
-
-Three gates, all of which must pass:
-
-1. **Static feature detection.** Constructs a `Request` with a `ReadableStream` body *without* `duplex`, then *with* it. Streaming is accepted only if the first throws (Chrome's "duplex member must be specified") and the second succeeds. Firefox — where the no-duplex construction may not throw — is rejected here without any network traffic.
-2. **Fetch construction.** The real streaming `fetch` is wrapped in `try/catch`; a synchronous throw returns `{streaming: false, latencyMs: 0}`. So does a throwing `controller.enqueue(chunkA)`.
-3. **Server round-trip.** After enqueuing a 1 KB zero-filled chunk A, races a `PROBE_ACK` on the control channel against `timeoutMs`. The verdict is `msg.first_chunk_bytes ?? 0 >= 1024` — a comment explains this catches browsers that stringify the body ("[object ReadableStream]" = 23 bytes) instead of streaming it. Timeout → `false`.
-
-Afterward it enqueues chunk B, closes the stream, and awaits (and ignores) the fetch response, swallowing errors in both. `latencyMs` is `Math.round(performance.now() - start)` when streaming succeeded, and `0` otherwise — it is never populated on the negative path.
-
-The session probes exactly once per session (`_streamingMode === null` guard in `connect()`), caches the verdict for the session lifetime including across reconnects, and treats any thrown probe as `streaming: false` plus a non-fatal `probeError`.
-
----
-
-### 4.8 Error taxonomy (`errors.ts`)
-
-```ts
-export class MfupError extends Error {
-  readonly code: MfupErrorCode;
-  readonly layer: MfupErrorLayer;
-  readonly action: string;     // human-readable remediation hint
-  readonly fatal: boolean;
-  readonly detail: Record<string, unknown>;
-  readonly timestamp: string;  // ISO 8601, set at construction
-  toJSON(): Record<string, unknown>;   // flat; unwraps an Error cause to {name,message,stack}
-  summary(): string;                   // `[${layer}/${code}] ${message}`
-}
-```
-
-`name` is set to `"MfupError"`. The native `cause` option is used, so `err.cause` chains.
-
-`MfupErrorLayer` has 5 members: `CONTROL = "control"`, `DATA = "data"`, `SESSION = "session"`, `INGEST = "ingest"`, `PROTOCOL = "protocol"`.
-
-**Retryability is expressed by the `fatal` flag** — there is no separate `retryable` field. `fatal: false` means the session may keep going (usually via reconnect); `fatal: true` means the upload cannot continue as-is. Note that `fatal` is advisory metadata: `handleDisconnect` does not consult it, keying instead on the specific codes `DATA_WRITE_FAILED` and `DATA_HTTP_ERROR`.
-
-`MfupErrorCode` declares 22 codes. Sixteen are constructed by 13 factory functions; **six are declared but never constructed anywhere in the client** (verified by grep for `MfupErrorCode.<NAME>`): `WS_SEND_FAILED`, `DATA_STREAM_ERROR`, `SESSION_ABORT_FAILED`, `SESSION_COMMIT_FAILED`, `SESSION_ENDED_BAD_STATE`, `INGEST_READ_ERROR`. They appear to be reserved for future use, or matched against server-side codes — *inference.*
-
-| Code | Layer | Factory | `fatal` | Raised when |
-|------|-------|---------|---------|-------------|
-| `WS_CONNECT_FAILED` | control | `wsConnectFailed(url, cause?)` | `false` | `ws.onerror`, or `control.ready()` rejects in `connect()` |
-| `WS_HANDSHAKE_FAILED` | control | `wsHandshakeFailed(code, reason)` | **`true`** | `SESSION_ABORT` received. `action` branches on `bad_version` / `conflict` / `auth_failed` |
-| `WS_CLOSED_UNEXPECTED` | control | `wsClosedUnexpected(wsCode, wsReason)` | `false` | WS close with a code other than `1000`. `action` branches on `1006` (network) / `1008` (policy) |
-| `WS_MESSAGE_PARSE` | control | `wsMessageParse(rawData, cause)` | `false` | `JSON.parse` of a control frame throws; stores the first 200 chars |
-| `WS_SEND_FAILED` | control | *(none)* | — | Never constructed |
-| `DATA_OPEN_FAILED` | data | `dataOpenFailed(url, cause)` | **`true`** | Streaming `fetch` throws, or `data.open()` rejects. Sniffs the cause message for `duplex`/`ReadableStream`/`body` and sets `detail.isDuplexIssue`, switching `action` to the Chrome/Edge 105+ / HTTP-2-TLS hint |
-| `DATA_HTTP_ERROR` | data | `dataHttpError(url, status, statusText, body?)` | `status === 410` | Non-`ok` data POST response, or a `json.error` in the final batch body. `action` branches on 409 / 410 / 503. Body truncated to 500 chars |
-| `DATA_WRITE_FAILED` | data | `dataWriteFailed(reason, cause?)` | `false` | Channel unavailable in `safeWrite`, `enqueue` throws, `write()` before `open()`, or a batch POST throws |
-| `DATA_STREAM_ERROR` | data | *(none)* | — | Never constructed |
-| `DATA_CHANNEL_CLOSED` | data | `dataChannelClosed()` | `false` | `DataChannel.write()` called after `close()`/`abort()` — the one factory that is also **thrown**, not just reported |
-| `SESSION_ABORTED_BY_SERVER` | session | `sessionAbortedByServer(code, reason)` | **`true`** | `SESSION_ABORT` handled at the session layer |
-| `SESSION_ABORT_FAILED` | session | *(none)* | — | Never constructed |
-| `SESSION_RECONNECT_FAILED` | session | `sessionReconnectFailed(attempt, cause)` | `false` | Emitted on every reconnect attempt, before the backoff sleep |
-| `SESSION_RECONNECT_EXHAUSTED` | session | `sessionReconnectExhausted(attempts, lastCause?)` | **`true`** | `reconnectCount >= maxReconnectAttempts`; also rejects the pending commit |
-| `SESSION_COMMIT_FAILED` | session | *(none)* | — | Never constructed |
-| `SESSION_ENDED_BAD_STATE` | session | *(none)* | — | Never constructed |
-| `INGEST_HANDLE_ERROR` | ingest | `ingestError(source, name, cause)` | `false` | Any adapter throw, and any non-channel-death throw from `streamFile` |
-| `INGEST_READ_ERROR` | ingest | *(none)* | — | Never constructed |
-| `NACK_BAD_CHECKSUM` | protocol | `nackChunk(...)` w/ `bad_checksum` | `false` | Server CRC mismatch; chunk is resent |
-| `NACK_BAD_OFFSET` | protocol | `nackChunk(...)` w/ `bad_offset` | `false` | Offset disagreement; stream restarts from `expected_offset` |
-| `NACK_STALE_EPOCH` | protocol | `nackChunk(...)` w/ `stale_epoch` | **`true`** | Session resumed elsewhere — "this tab's data is stale" |
-| `NACK_SERVER_POLICY` | protocol | `nackChunk(...)` w/ `server_policy` | `false` | Server-side policy rejection |
-| `UNKNOWN` | *varies* | `unknownError(layer, message, cause?)` | `false` | Control channel closed unexpectedly (session layer); also the fallback when `nackChunk` sees an unmapped reason |
-| `UNKNOWN` | data | `probeError(cause)` | `false` | `probeStreaming` throws. `action`: "Will use batch upload mode. This is normal for Firefox/Safari." |
-
-Five codes are fatal: `WS_HANDSHAKE_FAILED`, `DATA_OPEN_FAILED`, `SESSION_ABORTED_BY_SERVER`, `SESSION_RECONNECT_EXHAUSTED`, `NACK_STALE_EPOCH`; plus `DATA_HTTP_ERROR` conditionally on HTTP 410. Note that `probeError` reuses `MfupErrorCode.UNKNOWN` rather than a dedicated code, so it is only distinguishable from `unknownError` by its message and its `layer: DATA`.
-
----
-
-### 4.9 Progress (`progress.ts`)
+`ProgressTracker` merges two independent work units — *scan units* (one per discovered node, dimensionless) and *body bytes* — into one monotonic 0–1 fraction, while keeping exact counters available.
 
 ```ts
 export interface ProgressSnapshot {
-  scanDoneUnits: bigint;    // nodes discovered
-  scanEstUnits: bigint;     // estimated total (grows during scan)
-  bodyDoneBytes: bigint;    // bytes accepted by the server (from FILE_ACK)
-  bodyEstBytes: bigint;     // estimated total from size hints
-  acceptedFiles: number;
+  scanDoneUnits: bigint;    // nodes discovered so far
+  scanEstUnits: bigint;     // estimated total scan units (grows during scan)
+  bodyDoneBytes: bigint;    // bytes ACCEPTED by the server (FILE_ACK)
+  bodySentBytes: bigint;    // bytes handed to the transport; runs ahead of bodyDoneBytes
+  bodyEstBytes: bigint;     // estimated total body bytes (sum of size hints)
+  acceptedFiles: number;    // files fully accepted
   skippedFiles: number;     // pruned + rejected
   scanSealed: boolean;
-  expiresAt: string | null; // session resume deadline
-  fraction: number | null;  // blended 0–1, monotonic; null before any data
+  expiresAt: string | null;
+  fraction: number | null;  // blended 0–1, monotonic, null before any data
 }
 
 export type ProgressListener = (snap: ProgressSnapshot) => void;
 ```
 
-| Method | Signature | Caller |
-|--------|-----------|--------|
-| `on(fn)` | `(fn: ProgressListener) => () => void` | `MfupSession.onProgress` |
-| `snapshot()` | `(): ProgressSnapshot` | `MfupSession.getProgress` |
-| `updateScan(done, est, sealed)` | `(bigint, bigint, boolean) => void` | `emitSummary()` |
-| `addBodyEstimate(bytes)` | `(bigint) => void` | `onDiscover` per file |
-| `setBodyAccepted(bytes)` | `(bigint) => void` | `file_ack` handler; ignores non-increasing values |
-| `acceptFile()` | `() => void` | `file_ack` when a file reaches full size |
-| `skipFile()` | `() => void` | `reject_file` handler and the pump's prune/reject paths |
-| `setFileCounts(accepted, skipped)` | `(number, number) => void` | `applyResumeState` |
-| `setExpiresAt(v)` | `(string \| null) => void` | `hello_ok` / `resume_ok` |
-| `setFromRootSummary(s)` | `(RootSummary-shaped) => void` | `resume_ok` |
-| `advanceBody(nodeId, acceptedOffset)` | `(number, bigint) => void` | **Empty body — a no-op stub.** Its own comment says the session must compute the delta; nothing calls it |
+Units: `scanDoneUnits`/`scanEstUnits` are node counts (`session.ts` increments both by 1 per discovered node); all `body*` fields are bytes. All five are `bigint`; the two file counters are plain `number`.
 
-**Emission cadence is change-driven, not timed.** Every mutator calls the private `notify()`, which builds a fresh snapshot and invokes every listener synchronously. There is no throttling, debouncing, or `requestAnimationFrame` batching. The practical rates: `updateScan` fires once per 50 discovered nodes plus once at seal (`emitSummary` is called on that cadence in `onDiscover`); `addBodyEstimate` fires once per discovered file; `setBodyAccepted` fires once per `FILE_ACK` with a positive delta; `acceptFile`/`skipFile` once per file. A consumer rendering directly from this callback should expect bursty, unthrottled calls during scan — *this is an inference about consumer impact, not a source claim.*
+**Three distinct byte counters.** `bodyEstBytes` is the denominator (accumulated from file sizes at scan time). `bodySentBytes` is what left the client. `bodyDoneBytes` is what the server durably accepted. `bodySentBytes` is what makes the bar move *between* server ACKs.
 
-**Fraction computation.** Returns `null` while both estimates are zero. Otherwise `raw = 0.1 * scanFrac + 0.9 * bodyFrac`, a fixed 10/90 blend. Each sub-fraction is computed in bigint with 4-decimal precision (`Number(done * 10000n / est) / 10000`) to avoid float overflow on large byte counts. Monotonicity is enforced by `Math.max(this._lastFraction, Math.min(1, raw))` with `_lastFraction` persisted — the fraction never decreases even when a growing scan estimate would otherwise pull it backwards, and never exceeds 1. `_lastFraction` is a private field with no reset, so it survives reconnects.
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `on(fn)` | `(ProgressListener) => () => void` | Subscribe; returns unsubscribe |
+| `updateScan(done, est, sealed)` | `(bigint, bigint, boolean) => void` | Replace scan counters; notifies |
+| `addBodyEstimate(bytes)` | `(bigint) => void` | Add to the denominator; notifies |
+| `setBodyAccepted(bytes)` | `(bigint) => void` | Monotonic — ignores values `<= _bodyDone`; notifies on increase |
+| `setBodySent(total)` | `(bigint) => void` | Monotonic; **throttled** (see below) |
+| `acceptFile()` / `skipFile()` | `() => void` | Increment the file counters; notify |
+| `setFileCounts(accepted, skipped)` | `(number, number) => void` | Bulk-set during resume |
+| `setExpiresAt(v)` | `(string \| null) => void` | Set the resume deadline; notifies |
+| `setFromRootSummary(s)` | `(RootSummary-shaped) => void` | Bulk-restore from `RESUME_OK.root_summary`; converts each `number` to `bigint` |
+| `snapshot()` | `() => ProgressSnapshot` | Builds a fresh object and computes `fraction` |
+| `advanceBody(nodeId, acceptedOffset)` | `(number, bigint) => void` | **Empty body.** A comment states the session computes deltas itself and calls `setBodyAccepted` |
 
-Because `onDiscover` increments `scanDone` and `scanEst` together, `scanFrac` is effectively pinned at 1.0 during a live scan and the fraction is dominated by the 90% body term. *Inference from the two increments in `session.ts`.*
+**Throttling.** Only `setBodySent` is rate-limited, via `static readonly SENT_NOTIFY_MS = 200` (≤5 notifications/sec). If at least 200 ms have elapsed since the last send-notify it fires immediately; otherwise it arms a single trailing `setTimeout` for the remainder so the final value always lands. Every other mutator notifies synchronously on every call — the session's own `SNAPSHOT_THROTTLE_MS = 33` coalescer is the second-stage damper for snapshot subscribers.
+
+**Fraction computation.** Returns `null` while both `scanEst` and `bodyEst` are `0n`. Otherwise:
+
+- `scanFrac = Number(scanDone * 10000n / scanEst) / 10000` (or `1` when `scanEst === 0n` and sealed) — the ×10000 detour keeps the division in `bigint` for 4-decimal precision.
+- `bodyFrac` uses `ahead = max(min(bodySent, bodyEst), bodyDone)` — sent bytes are clamped to the estimate (retries can resend the same bytes) and never fall below what the server has accepted.
+- `raw = 0.1 * scanFrac + 0.9 * bodyFrac` — a fixed 10 % scan / 90 % body blend.
+- `clamped = Math.max(_lastFraction, Math.min(1, raw))`, and `_lastFraction` is updated — the bar can never move backwards even when estimates grow.
 
 ---
 
-### 4.10 Build and packaging
+### 5.8 `errors.ts` — error taxonomy
 
-`client/package.json`:
+Every failure surfaces as an `MfupError`, a subclass of `Error` carrying a machine-readable code, a layer, a human-facing remediation hint, and a fatality flag.
+
+```ts
+export class MfupError extends Error {
+  readonly code: MfupErrorCode;
+  readonly layer: MfupErrorLayer;
+  readonly action: string;              // remediation hint, safe to show a user
+  readonly fatal: boolean;              // true → not retryable, session is dead
+  readonly detail: Record<string, unknown>;
+  readonly timestamp: string;           // ISO 8601, set at construction
+  toJSON(): Record<string, unknown>;    // flat form, with the cause chain unwrapped
+  summary(): string;                    // `[${layer}/${code}] ${message}`
+}
+```
+
+`MfupErrorLayer` has 5 members: `CONTROL: "control"`, `DATA: "data"`, `SESSION: "session"`, `INGEST: "ingest"`, `PROTOCOL: "protocol"`.
+
+`MfupErrorCode` declares 25 codes. There is no per-code error *class* — `MfupError` is the only class, and 17 factory functions construct the codes actually in use. `fatal` is the retryability signal: `handleDisconnect()` gives up permanently on a `fatal` error from `connect()`, and the session records the first fatal error in `snapshot.fatalError`.
+
+| Code | Layer | Factory | Thrown / emitted when | Fatal |
+|------|-------|---------|----------------------|-------|
+| `WS_CONNECT_FAILED` | control | `wsConnectFailed(url, cause?)` | `WebSocket.onerror`, or `connect()` fails with a non-`MfupError` cause | no |
+| `WS_HANDSHAKE_FAILED` | control | `wsHandshakeFailed(code, reason)` | Server `SESSION_ABORT`; also rejects `ControlChannel.ready()`. Action text branches on `bad_version` / `conflict` / `auth_failed` | **yes** |
+| `WS_CLOSED_UNEXPECTED` | control | `wsClosedUnexpected(wsCode, wsReason)` | WS close with `code !== 1000`. Action branches on 1006 (network) and 1008 (policy) | no |
+| `WS_MESSAGE_PARSE` | control | `wsMessageParse(rawData, cause)` | `JSON.parse` of an inbound frame throws; `detail.rawData` is truncated to 200 chars | no |
+| `WS_SEND_FAILED` | — | *(declared, no factory, no call site)* | — | — |
+| `DATA_OPEN_FAILED` | data | `dataOpenFailed(url, cause)` | The streaming `fetch` throws, or `DataChannel.open()` rejects. Sniffs the cause message for `duplex`/`ReadableStream`/`body` and sets `detail.isDuplexIssue` | **yes** |
+| `DATA_HTTP_ERROR` | data | `dataHttpError(url, status, statusText, body?)` | Non-2xx data POST, or a `{error}` field in the final POST body. Action branches on 409 / 410 / 503; body truncated to 500 chars | only on `410` |
+| `DATA_WRITE_FAILED` | data | `dataWriteFailed(reason, cause?)` | `enqueue` throws, channel not opened, POST network error, or `safeWrite` with no channel | no |
+| `DATA_STREAM_ERROR` | — | *(declared, no factory, no call site)* | — | — |
+| `DATA_CHANNEL_CLOSED` | data | `dataChannelClosed()` | `DataChannel.write()` called after `close()`/`abort()` | no |
+| `SESSION_ABORTED_BY_SERVER` | session | `sessionAbortedByServer(code, reason)` | `SESSION_ABORT` handler in `session.ts` | **yes** |
+| `SESSION_ABORT_FAILED` | — | *(declared, no factory, no call site)* | — | — |
+| `SESSION_RECONNECT_FAILED` | session | `sessionReconnectFailed(attempt, cause)` | Emitted once per reconnect attempt, before the backoff sleep | no |
+| `SESSION_RECONNECT_EXHAUSTED` | session | `sessionReconnectExhausted(attempts, lastCause?)` | `reconnectCount >= maxReconnectAttempts`; also rejects the pending commit wait | **yes** |
+| `SESSION_COMMIT_FAILED` | — | *(declared, no factory, no call site)* | — | — |
+| `SESSION_ENDED_BAD_STATE` | — | *(declared, no factory, no call site)* | — | — |
+| `PUBLISH_CONFLICT` | session | `publishConflict(conflictingFiles)` | `publish()` gets 409 with body `{error:"conflict_files"}`; `detail.conflictingFiles` holds the list. Action: ask the user, `sendAction("merge_overwrite")`, `publish()` again | no |
+| `PUBLISH_FAILED` | session | `publishFailed(status, body)` | Any other publish failure; `status: 0` for a network throw | only on `404` |
+| `INGEST_HANDLE_ERROR` | ingest | `ingestError(source, name, cause)` | Any of the four `upload*()` methods catches a non-`MfupError`, or `streamFile` throws while the channel is alive | no |
+| `INGEST_READ_ERROR` | — | *(declared, no factory, no call site)* | — | — |
+| `NACK_BAD_CHECKSUM` | protocol | `nackChunk(...)` with `reason:"bad_checksum"` | `NACK_CHUNK` — data corruption; chunk is resent | no |
+| `NACK_BAD_OFFSET` | protocol | `nackChunk(...)` with `reason:"bad_offset"` | `NACK_CHUNK` — file rewinds to `expected_offset` | no |
+| `NACK_STALE_EPOCH` | protocol | `nackChunk(...)` with `reason:"stale_epoch"` | `NACK_CHUNK` — the session was resumed elsewhere; this tab's data is stale | **yes** |
+| `NACK_SERVER_POLICY` | protocol | `nackChunk(...)` with `reason:"server_policy"` | `NACK_CHUNK` — server refused the data | no |
+| `UNKNOWN` | caller-supplied | `unknownError(layer, message, cause?)`, `probeError(cause)`, `nackChunk` fallback | Control channel closed unexpectedly (layer `control`); streaming probe threw (layer `data`, action: "Will use batch upload mode. This is normal for Firefox/Safari."); a `NACK_CHUNK` reason outside the 4 mapped ones — notably `unknown_node` | no |
+
+Six codes (`WS_SEND_FAILED`, `DATA_STREAM_ERROR`, `SESSION_ABORT_FAILED`, `SESSION_COMMIT_FAILED`, `SESSION_ENDED_BAD_STATE`, `INGEST_READ_ERROR`) appear only in the `MfupErrorCode` declaration — no factory constructs them and nothing in `src/` references them. `nackChunk` maps only 4 of the 5 `NackChunkMsg.reason` values, so an `unknown_node` NACK surfaces as `UNKNOWN` at layer `protocol` while still triggering `resendNodeChain()`.
+
+---
+
+### 5.9 `probe.ts` — streaming capability detection
+
+```ts
+export interface ProbeResult { streaming: boolean; latencyMs: number; }
+
+export async function probeStreaming(opts: {
+  baseUrl: string;
+  sessionId: string;
+  resumeToken: string;
+  control: ControlChannel;
+  signal?: AbortSignal;
+  timeoutMs?: number;   // default 1500
+}): Promise<ProbeResult>
+```
+
+The probe answers one question: does this browser, over this transport path, actually support `duplex: "half"` request streaming? The verdict picks `DataChannel`'s mode for the session's lifetime.
+
+**Stage 1 — synchronous feature check (free, no network).** Two `Request` constructions against a dummy URL with a closed `ReadableStream` body:
+
+- Without `duplex` → must **throw** (Chrome raises `TypeError: duplex member must be specified`).
+- With `duplex: "half"` → must **succeed**.
+
+Streaming is possible only if both hold. Any other combination returns `{streaming: false, latencyMs: 0}` immediately, with zero network cost — this is the fast path for Firefox and Safari.
+
+**Stage 2 — empirical round trip.** A `fetch` POST to `{baseUrl}/mfup/probe/{sessionId}` with `X-MFUP-Token`, a `ReadableStream` body, `duplex: "half"`, and the caller's `signal`. A synchronous throw here also returns `{streaming: false, latencyMs: 0}`. A 1 KiB zero-filled `chunkA` is enqueued (a throw on enqueue is another early `false`), and `performance.now()` is sampled.
+
+**The verdict race** — first of three signals wins, guarded by a `settled` latch:
+
+| Signal | Verdict |
+|--------|---------|
+| `PROBE_ACK` on the control channel | `(msg.first_chunk_bytes ?? 0) >= 1024` |
+| `fetchPromise` resolves with `!resp.ok` | `false` |
+| `fetchPromise` rejects | `false` |
+| `timeoutMs` (default 1500 ms) elapses | `false` |
+
+Checking `first_chunk_bytes` is what distinguishes real binary streaming from a browser that stringified the stream — a stringified `ReadableStream` arrives as 23 bytes, well under the 1 KiB threshold. Listening to the fetch promise is what makes the negative verdict fast: Chrome on plain HTTP/1.1 rejects streaming bodies immediately with `ERR_H2_OR_QUIC_REQUIRED`, and without that listener the probe sat out the full 1500 ms timeout before falling back. An early *successful* response also counts as a "no" — it means a proxy buffered the entire body, so the connection is not duplex.
+
+Afterwards a second 1 KiB `chunkB` is enqueued and the stream closed (errors swallowed — the stream may already be errored from an abort), and the fetch is awaited and discarded. `latencyMs` is `Math.round(performance.now() - start)` when streaming succeeded, otherwise `0`.
+
+**Caching.** `MfupSession` wraps this in a `localStorage` cache keyed `mfup:streaming-probe:{serverUrl}` holding `{v: boolean, ts: number}` with a 24-hour TTL, so a returning visitor pays zero probe cost. The rationale recorded in `session.ts`: the verdict depends on browser plus transport path, neither of which changes between visits. All `localStorage` access is try/catch-wrapped, so private mode and worker contexts simply re-probe.
+
+---
+
+## 6. @mfup/react — React Bindings
+
+`@mfup/react` is a dependency-free hook layer (React is a peer, not a bundled dep) over `@mfup/client`. It contributes no protocol logic of its own: it owns a config context, a `useSyncExternalStore` adapter over `MfupSession`, a lifecycle hook that creates exactly one session per `start()` call, and drag-and-drop/file-picker prop getters that delegate extraction to the client's `sourceFromDataTransfer` / `sourceFromInput`. `examples/multiuser-scopes` consumes that surface from the published npm registry (plus `mfup-fastapi` from PyPI) to demonstrate server-enforced per-user upload scopes.
+
+### 6.1 Package layout (`packages/react/`)
+
+Five source modules, one barrel. `package.json` declares `"type": "module"`, `"sideEffects": false`, ESM-only exports (`import` + `types`, no `require` condition), and ships both `dist` and `src`.
 
 | Field | Value |
 |-------|-------|
-| `name` / `version` | `@mfup/client` / `0.1.0` |
-| `type` | `module` — ESM only, no CJS build or dual export map |
-| `main` | `dist/index.js` |
-| `types` | `dist/index.d.ts` |
-| `files` | `["dist"]` |
-| `scripts.build` | `tsc` |
-| `scripts.check` | `tsc --noEmit` |
-| `devDependencies` | `typescript: ^5.5.0` |
-| `license` | MIT |
+| `name` / `version` | `@mfup/react` / `0.2.0` |
+| `exports` | `.` → `./dist/index.js` + `./dist/index.d.ts`; `./package.json` |
+| `peerDependencies` | `@mfup/client` `^0.2.0`, `react` `>=18` |
+| `devDependencies` | `@mfup/client` `*`, `@types/react` `^18.3.0`, `react` `^18.3.0`, `typescript` `^5.5.0` |
+| `scripts` | `build` (`tsc`), `check` (`tsc --noEmit`), `prepack` (`npm run build`) |
 
-**Zero runtime dependencies** and no `dependencies` block at all — the SDK relies solely on browser globals: `fetch`, `ReadableStream`, `ByteLengthQueuingStrategy`, `WebSocket`, `AbortController`, `TextEncoder`, `DataView`, `crypto.randomUUID`, `performance.now`, `Blob`, `File`, and the File System Access / `webkitGetAsEntry` APIs. There is no `exports` map, no bundler, and no test script.
+`tsconfig.json` targets ES2022 / module ES2022 with `moduleResolution: "bundler"`, `lib: ["ES2022","DOM","DOM.Iterable"]`, `strict`, `declaration` + `declarationMap` + `sourceMap`, `isolatedModules`, `rootDir: src` → `outDir: dist`.
 
-`client/tsconfig.json`:
+The `react >=18` floor is load-bearing: `useMfupSession` is built on `useSyncExternalStore`, which is React 18+.
 
-| Option | Value | Consequence |
-|--------|-------|-------------|
-| `target` / `module` | `ES2022` / `ES2022` | Native `bigint`, top-level classes, `Error` `cause` |
-| `moduleResolution` | `bundler` | Though sources still write explicit `.js` extensions |
-| `lib` | `["ES2022", "DOM", "DOM.Iterable"]` | Browser-only; no Node types |
-| `rootDir` / `outDir` | `src` / `dist` | Matches `main`/`types` |
-| `declaration` / `declarationMap` / `sourceMap` | all `true` | Ships `.d.ts`, `.d.ts.map`, `.js.map` |
-| `strict` | `true` | |
-| `isolatedModules` | `true` | Forces `export type` for all type re-exports in `index.ts`; also determines how the five `const enum`s are emitted |
-| `skipLibCheck`, `forceConsistentCasingInFileNames`, `esModuleInterop`, `resolveJsonModule` | `true` | |
-| `include` / `exclude` | `["src"]` / `["node_modules", "dist"]` | |
+### 6.2 Public surface (`src/index.ts`)
 
-Three `@ts-expect-error` suppressions exist for `duplex: "half"`, which is absent from the TypeScript DOM lib types — two in `probe.ts` (lines 47 and 73) and one in `data-channel.ts` (line 127). One `as any` cast covers `FileSystemDirectoryHandle.entries()` in `ingestion.ts`, and another covers `webkitRelativePath` on `File`.
----
-## 5. Example Application
+Five value exports (one component, four hooks), five locally-defined type exports, and nine types re-exported verbatim from `@mfup/client` so an app can import everything from one specifier.
 
-A Vite-based browser demo living at `/workspace/example`. It ships two independent pages built from a shared client SDK: a **main demo** (`index.html` + `src/demo.ts`) that exercises the full session lifecycle with progress, error, and conflict UI, and a **comparison page** (`compare.html` + `src/compare.ts`) that races MFUP against a sequential multipart-POST baseline. Both pages are plain TypeScript modules with no framework — all styling is inline `<style>` in the HTML, and all DOM wiring is imperative `getElementById` + `addEventListener`. The demo consumes the client SDK's TypeScript **sources** directly via a Vite path alias rather than a built package.
+| Export | Kind | Source | Description |
+|--------|------|--------|-------------|
+| `MfupProvider` | component | `context.ts` | Supplies app-wide config defaults |
+| `useMfupConfig()` | hook | `context.ts` | Nearest provider config, or `null` |
+| `useMfupSession(session)` | hook | `useMfupSession.ts` | Reactive snapshot of an `MfupSession` |
+| `useMfupUpload(options?)` | hook | `useMfupUpload.ts` | One upload lifecycle per `start()` |
+| `useMfupDropzone(opts)` | hook | `useMfupDropzone.ts` | Drop + picker prop getters |
+| `MfupConfigValue` | type | `context.ts` | Provider config shape |
+| `UseMfupUploadOptions`, `UseMfupUploadResult` | types | `useMfupUpload.ts` | Upload hook I/O |
+| `UseMfupDropzoneOptions`, `MfupDropzoneRootProps` | types | `useMfupDropzone.ts` | Dropzone hook I/O |
 
-| Path | Role |
-|------|------|
-| `demo/index.html` | Main demo page — markup + all CSS, loads `/src/demo.ts` as a module |
-| `demo/src/demo.ts` | Main demo logic; canonical `MfupSession` usage example |
-| `demo/compare.html` | Comparison page — two-lane "race" markup, loads `/src/compare.ts` |
-| `demo/src/compare.ts` | MFUP lane + traditional-POST lane, timers, flattening helpers |
-| `demo/vite.config.ts` | Dev server, backend proxies, `@mfup/client` alias, dual-entry build |
-| `demo/package.json` | `mfup-demo`, private, ESM; only `vite` + `typescript` as devDeps |
-| `demo/tsconfig.json` | ES2022 / ESNext / `bundler` resolution, strict; includes client sources |
+Re-exported from `@mfup/client` (types only): `MfupAsk`, `MfupAskAction`, `MfupError`, `MfupFileRef`, `MfupSession`, `MfupSessionSnapshot`, `ProgressSnapshot`, `SessionState`, `UploadSource`.
 
----
+### 6.3 Config context (`src/context.ts`)
 
-### 5.1 Main demo page (`index.html` + `src/demo.ts`)
-
-#### User-facing workflow
-
-The page presents a single dropzone ("Drag & drop files / folders here, or **browse**"). Dropping files or folders, or picking files via the browse control, immediately creates a session and starts uploading — there is no separate "Start" button. Once running, a progress panel appears showing:
-
-| UI element | DOM id | Source |
-|------------|--------|--------|
-| State badge | `state-badge` | `SessionState`, uppercased with `_` → space |
-| Session id (first 8 chars) | `session-id-label` | `session.id.slice(0, 8)` |
-| Progress bar | `bar` | `ProgressSnapshot.fraction × 100` |
-| Transferred | `stat-bytes` | `snap.bodyDoneBytes` |
-| Files Accepted | `stat-files` | `snap.acceptedFiles` |
-| Scanned | `stat-scanned` | `snap.scanDoneUnits` |
-| Skipped | `stat-skipped` | `snap.skippedFiles` |
-
-Five buttons exist: **browse** (`browse-btn`), **Abort** (`btn-abort`, disabled until a session is live), **Reset** (`btn-reset`), and **Overwrite** / **Cancel** inside the conflict modal. Below the panel are two collapsible regions: an **Errors** list of detail cards (code, layer, fatal/recoverable, message, suggested action, JSON detail, expandable stack trace and cause chain) and a timestamped **log** stream with four severity colors (`info`/`ok`/`warn`/`err`).
-
-When the server signals a target-directory conflict, a modal overlay ("File Conflict — Files already exist in the target directory. Overwrite existing files?") blocks with Overwrite / Cancel. The badge CSS defines seven states: `active`, `committing`, `committed`, `failed`, `aborted`, `waiting_resume`, `paused_by_server`.
-
-#### Input acquisition strategy
-
-The file header documents a deliberate three-tier drop priority, chosen because Firefox invalidates `DataTransferItem.getAsFile()` blob data after the handler returns:
-
-1. `getAsFileSystemHandle()` — Chrome/Edge, persistent `FileSystemHandle`s. Called synchronously across all items; if any item lacks the method the whole tier is abandoned.
-2. `webkitGetAsEntry()` — Firefox/Safari, persistent `FileSystemEntry` objects supporting lazy streaming and directory traversal.
-3. `e.dataTransfer.files` — last-resort fallback, logged as a `warn`.
-
-Both tier-1 and tier-2 calls must happen in the same tick as the drop event; the code does so and only then awaits `Promise.all(handles)`. Two hidden inputs back the picker: `file-input` (`multiple`) and `folder-input` (`webkitdirectory`).
-
-> **Observation from the code:** `folderInput.click()` is never called anywhere in `demo.ts` — `browse-btn` and the dropzone click both trigger `fileInput.click()`. The `folderInput` `change` listener (the only caller of `session.uploadFileList`) is therefore unreachable through the current markup, even though the input element exists in `index.html`.
-
-#### Canonical call sequence
-
-`startUpload(mode, source)` is the single entry point for every input path. Its SDK usage, in order:
+A `createContext<MfupConfigValue | null>(null)`. `MfupProvider` is written with `createElement` rather than JSX, so the package builds with plain `tsc` and no JSX runtime configuration.
 
 ```ts
-import { MfupSession, MfupError, type ProgressSnapshot, type SessionState }
-  from "@mfup/client/index.js";
-
-const serverUrl = `${location.protocol}//${location.host}`;
-
-// 1. Construct
-session = new MfupSession({ serverUrl, targetDir: ".", chunkSize: 256 * 1024 });
-session.id;                          // read immediately, before connect()
-
-// 2. Subscribe BEFORE connecting
-session.onProgress(renderProgress);  // ProgressSnapshot stream
-session.on("state",        (s)   => renderState(s));
-session.on("ask",          ()    => showConflictModal());
-session.on("committed",    async (ev) => { /* ev.files, ev.bytes */ });
-session.on("reconnecting", (ev)  => { /* ev.attempt, ev.maxAttempts, ev.delay */ });
-session.on("error",        (err) => renderError(err));   // err: MfupError
-
-// 3. Connect (probes transport)
-await session.connect();
-session.streamingMode;   // true -> "streaming (duplex:half)", false -> "batch (sequential POST)"
-session.currentEpoch;    // logged after connect
-
-// 4. Upload — one of four adapters, chosen by input source
-await session.uploadHandles(handles);    // FileSystemHandle[]
-await session.uploadEntries(entries);    // FileSystemEntry[]
-await session.uploadFileList(fileList);  // FileList  (webkitdirectory input)
-await session.uploadFiles(files);        // File[]
+export interface MfupConfigValue {
+  /** Server base URL (may include a path prefix if the consumer mounted the
+   * MFUP router under one, e.g. "https://host/api/uploads"). */
+  serverUrl: string;
+  targetDir?: string;
+  /** Default session meta (delivered to the server's authorize/map hooks). */
+  meta?: unknown;
+  chunkSize?: number;
+  maxReconnectAttempts?: number | null;
+}
 ```
 
-Interactive controls map to two further methods:
+| Export | Signature | Behavior |
+|--------|-----------|----------|
+| `MfupProvider` | `(props: { config: MfupConfigValue; children?: ReactNode })` | Renders `MfupContext.Provider` with `value = props.config`. The value is passed through unmemoized — callers should hold a stable `config` object to avoid re-rendering consumers. |
+| `useMfupConfig` | `(): MfupConfigValue \| null` | `useContext(MfupContext)`. Returns `null` when no provider is mounted; `useMfupUpload` tolerates that and requires per-call `serverUrl` instead. |
+
+Read by `useMfupUpload`, which merges provider defaults under per-call options.
+
+### 6.4 `useMfupSession` (`src/useMfupSession.ts`)
+
+Adapts an `MfupSession` to React's external-store protocol. `MfupSession` already implements `subscribe(onChange) => unsubscribe` and `getSnapshot()` with referentially stable, coalesced snapshots, so the hook is a direct pass-through — tear-free under concurrent rendering, and costing exactly one subscription regardless of how many snapshot fields the component reads.
 
 ```ts
-session.sendAction("merge_overwrite" | "cancel");  // from the conflict modal
-session.abort();                                   // Abort button
-session.state;                                     // read in catch to suppress abort-as-error
+export function useMfupSession(session: MfupSession | null): MfupSessionSnapshot | null
 ```
 
-| SDK surface used | Kind | Purpose in the demo |
-|------------------|------|---------------------|
-| `new MfupSession(config)` | constructor | `serverUrl`, `targetDir: "."`, `chunkSize: 262144` |
-| `session.id` | getter | Session label, publish URL |
-| `session.state` | getter | Distinguish user abort from fatal error |
-| `session.currentEpoch` | getter | Logged after connect |
-| `session.streamingMode` | getter | Logged as streaming vs batch mode |
-| `session.onProgress(fn)` | method | Drives bar + four stat tiles |
-| `session.on(event, fn)` | method | 5 events: `state`, `ask`, `committed`, `reconnecting`, `error` |
-| `session.connect()` | async | Opens control channel, probes transport |
-| `session.uploadHandles/Entries/FileList/Files` | async | 4 ingestion adapters |
-| `session.sendAction(a)` | method | Conflict resolution |
-| `session.abort()` | method | User-initiated abort |
-
-**Publish is not an SDK call.** After `committed` fires, the demo issues a raw request itself:
-
-```ts
-const resp = await fetch(`${serverUrl}/mfup/sessions/${session.id}/publish`, { method: "POST" });
-const data = await resp.json();   // { published: string[] }
-```
-
-The commit → publish handoff is therefore application responsibility, not something `MfupSession` performs.
-
-#### Commit / conflict ordering
-
-The `committed` handler is `async` and awaits `conflictPromise` before publishing. The server can reach COMMITTED while the conflict modal is still open; the demo holds the publish call until the user answers, and skips publish entirely if the answer was `cancel` or if `cancelled` was already set.
-
-#### Error rendering
-
-`renderError(err: MfupError)` reads `code`, `layer`, `fatal`, `message`, `action`, `detail`, `timestamp`, `stack`, and `cause`. `formatCauseChain()` walks `err.cause` up to a depth of 5, prefixing each level with `Caused by:`. Non-fatal errors get a `.warning` class; fatal errors force the badge to `failed` unless the session is already `aborted`. Two caps bound DOM growth:
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `MAX_LOG_ENTRIES` | 200 | Oldest log lines trimmed from the front |
-| `MAX_ERROR_CARDS` | 50 | Cards prepended newest-first, oldest trimmed |
-
-#### Reset behavior
-
-`btn-reset` clears all UI state and sets `session = null`. It does **not** call `session.abort()` first — since `startUpload` guards re-entry with `if (session) return`, pressing Reset mid-upload clears the guard and leaves the previous session running without a UI. (Read directly from the handler; no abort call is present.)
-
----
-
-### 5.2 Comparison page (`compare.html` + `src/compare.ts`)
-
-#### User-facing workflow
-
-A wider dropzone ("Drag & drop files or folders here") sits above a hidden two-column race grid. On drop or file-pick, both lanes start **simultaneously** and the grid becomes visible:
-
-- **Left lane — "MFUP/2 Protocol"** (blue): live timer, progress bar, `Files:` and `Sent:` counters.
-- **Right lane — "Traditional (file-by-file)"** (orange): same widgets.
-
-Each lane carries a badge cycling through `Waiting` → `Uploading` → `Done` / `Failed` (`setBadge`). Timers render at 0.1 s precision and turn green on completion. A shared log below both lanes prefixes entries with `[MFUP]` or `[Traditional]`. A **Reset** button (disabled while running) clears both lanes. The same File Conflict modal from the main page is present and is wired only to the MFUP lane.
-
-#### What is compared against what
-
-| | MFUP lane | Traditional lane |
-|---|---|---|
-| Function | `runMfupLane(mode, source, timer)` | `runTrivialLane(flatFiles, timer)` |
-| Transport | `MfupSession` — protocol streaming/batch | `fetch(POST)` with `FormData`, one file per request, strictly sequential `await` in a `for` loop |
-| Endpoint | `/mfup/*` → `backend:8070` | `/trivial/upload` → `trivial:8071` (prefix stripped) |
-| Target | `targetDir: "mfup-target"` | server-side `UPLOAD_DIR`, path passed as a `path` form field |
-| Chunking | `chunkSize: 256 * 1024` | none — whole file per request |
-| Directory structure | preserved by protocol ingestion | reconstructed server-side from the `path` field |
-| Failure handling | throws → lane badge `error` | logs and `continue`s to the next file; lane can still finish `done` |
-
-#### Measurement mechanism
-
-`LaneTimer` wraps `performance.now()`:
-
-| Method | Behavior |
+| Aspect | Behavior |
 |--------|----------|
-| `start()` | Records `startMs`, begins a `setInterval` re-render every 100 ms |
-| `stop()` | Records `endMs`, clears the interval, renders final value |
-| `elapsed()` | `(endMs \|\| performance.now()) - startMs` |
-| `reset()` | Clears interval, resets display to `0.0 sec` |
+| Null session | Accepted. `subscribe` becomes a shared `noopUnsubscribe`, `getSnapshot` returns `null`. |
+| SSR | The `getServerSnapshot` argument is `() => null`, so server rendering yields `null` rather than throwing. |
+| Re-render trigger | Once per new snapshot identity published by the session. Because snapshots are coalesced by the client, bursts of wire events collapse into a bounded number of renders. |
+| Identity deps | `subscribe` and `getSnapshot` are `useCallback`s keyed on `[session]` — swapping sessions re-subscribes; re-rendering with the same session does not. |
+| Cleanup | The unsubscribe returned by `session.subscribe` is invoked by `useSyncExternalStore` on unmount or session change. No abort is performed here. |
 
-`startRace(mode, source, flatFiles)` launches both lanes through `Promise.allSettled([...])`, so neither lane's failure aborts the other, and both timers run concurrently.
+### 6.5 `useMfupUpload` (`src/useMfupUpload.ts`)
 
-Metrics collected per lane: **elapsed wall-clock time** (the headline number), **file count**, and **bytes sent**. MFUP's counters come from `ProgressSnapshot` (`acceptedFiles`, `bodyDoneBytes`, `fraction`); the traditional lane's counters are computed client-side by accumulating `file.size` after each successful response, with percentage against a precomputed `totalBytes` reduce.
+The primary hook: one `MfupSession` per `start()` call, driven to completion (connect → upload → settle asks → publish). Three design constraints are visible in the code:
 
-#### Methodological caveats visible in the code
+- The session is constructed **inside `start()`**, never in an effect, so React StrictMode's double-invoked effects cannot spawn ghost sessions.
+- Option callbacks are read through `optsRef` (reassigned on every render), so inline lambdas neither re-subscribe listeners nor go stale — the four `s.on(...)` handlers are registered once and always dispatch to the latest props.
+- `autoPublish` awaits `settleAsks()`, so the transfer keeps streaming while a conflict dialog is open and publish happens only after the user's verdict.
 
-These are read directly from `compare.ts`; the significance ranking is the reviewer's assessment. They matter because `docs/MFUP_RU.md` reports a headline **12× speedup (1.4 s vs 17.2 s on 188 files / 1.0 MB)** produced by exactly this harness.
+The module-level `const TERMINAL = ["committed", "aborted", "failed"]` defines the three terminal states used by `busy`, `start`'s re-entrancy guard, `reset`, and the unmount cleanup.
 
-1. **The lanes contend with each other.** `Promise.allSettled` runs both concurrently over the same uplink, browser connection pool, and CPU. Neither timer measures an isolated upload.
-2. **The traditional lane's directory scan is untimed; MFUP's is timed.** `flattenHandles()` / `flattenEntry()` fully traverse directories and materialize every `File` object in the *drop handler*, before `startRace` is called. The MFUP lane receives raw handles/entries and performs its own traversal *inside* the timed region. This asymmetry disadvantages MFUP.
-3. **Publish time is excluded from MFUP** but has no analogue in the baseline. The MFUP timer stops when `uploadX()` resolves; the `POST .../publish` is fired from an un-awaited async listener and is not counted.
-4. **Two different servers, not two different protocols.** `backend:8070` is the FastAPI MFUP app; `trivial:8071` is a separate FastAPI service. The measurement conflates protocol design with server implementation.
-5. **The baseline is deliberately worst-case.** The traditional lane issues exactly one in-flight request at a time (`await` inside `for`). Real-world uploaders typically parallelize 4–6 requests. The UI labels this honestly as "file-by-file".
-6. **Single sample, no warm-up, no repetition, no median.** One run per drop; nothing is discarded or averaged.
-7. **Different byte accounting.** MFUP reports protocol-acknowledged `bodyDoneBytes`; the baseline reports optimistic client-side `file.size` sums.
-8. **Partial success reads as success.** A traditional-lane file that fails is logged and skipped; the lane still stops the timer and shows `Done`.
-9. **Only wall-clock is compared.** No integrity verification, resumability, or connection-count comparison is instrumented.
-10. **Flat fallback path.** In `mode: "files"`, `flat` is built as `{ file, path: f.name }` with no directory prefix, so relative structure is dropped for the baseline on that path.
-
-The qualitative conclusion — that per-file round-trips dominate at high file counts — is well supported by the design. The specific multiplier should be read as an illustration produced by this harness, not a controlled benchmark.
-
-#### Additional code observations
-
-- `compare.ts` supports **three** modes (`handles`, `entries`, `files`) — there is no `filelist` mode, unlike `demo.ts`.
-- `folderInput` is declared at the top of `compare.ts` but never referenced again: no `change` listener, no `.click()`, and `btnReset` clears only `fileInput.value`. The `folder-input` element in `compare.html` is therefore inert.
-- The MFUP lane registers no `error` or `state` listener — failures surface only through the `try/catch` around `connect()`/`uploadX()`.
-
----
-
-### 5.3 Vite configuration (`vite.config.ts`)
+#### Options
 
 ```ts
-export default defineConfig({
-  root: ".",
-  publicDir: "public",
-  resolve: { alias: { "@mfup/client": path.resolve(__dirname, "../client/src") } },
-  build:   { rollupOptions: { input: {
-             main:    path.resolve(__dirname, "index.html"),
-             compare: path.resolve(__dirname, "compare.html") } } },
-  server:  { host: "0.0.0.0", port: 3000, strictPort: true, allowedHosts: true,
-             fs: { allow: ["/client", "/app"] },
-             proxy: { /* 4 rules */ } },
+export interface UseMfupUploadOptions {
+  serverUrl?: string;          // falls back to <MfupProvider>
+  targetDir?: string;
+  meta?: unknown;              // → server-side authorize/map_file hooks
+  chunkSize?: number;
+  maxReconnectAttempts?: number | null;
+  autoPublish?: boolean;       // default true
+  abortOnUnmount?: boolean;    // default false
+  onCommitted?(ev: { files: number; bytes: number }): void;
+  onPublished?(files: string[]): void;
+  onAsk?(ask: MfupAsk): void;
+  onError?(err: MfupError): void;
+}
+```
+
+| Option | Default | Resolution / effect |
+|--------|---------|---------------------|
+| `serverUrl` | — | `opts.serverUrl ?? ctx.serverUrl`; missing ⇒ `start()` throws `"useMfupUpload: serverUrl missing — pass it in options or via <MfupProvider>"` |
+| `targetDir`, `meta`, `chunkSize`, `maxReconnectAttempts` | provider value | `opts.X ?? ctx.X`, passed straight into the `MfupSession` constructor |
+| `autoPublish` | `true` | After `settleAsks()`, publishes only when the verdict is not `"cancel"` **and** `s.state === "committed"` |
+| `abortOnUnmount` | `false` | Uploads survive route changes by default |
+| `onCommitted` | — | Bound to the session's `committed` event; receives `{ files, bytes }` |
+| `onPublished` | — | Bound to `published`; receives `ev.published` (a `string[]`) |
+| `onAsk` | — | Bound to `ask`; receives the `MfupAsk` |
+| `onError` | — | Bound to `error`; receives the `MfupError` |
+
+#### Result
+
+```ts
+export interface UseMfupUploadResult {
+  session: MfupSession | null;
+  snapshot: MfupSessionSnapshot | null;
+  pendingAsks: readonly MfupAsk[];
+  busy: boolean;
+  start(source: UploadSource | FileList | File[]): Promise<void>;
+  abort(): void;
+  publish(): Promise<{ published: string[] }>;
+  reset(): void;
+}
+```
+
+| Member | Type | Behavior |
+|--------|------|----------|
+| `session` | `MfupSession \| null` | State-backed; `null` until the first `start()`, `null` again after `reset()` |
+| `snapshot` | `MfupSessionSnapshot \| null` | `useMfupSession(session)` — the sole re-render driver during a transfer |
+| `pendingAsks` | `readonly MfupAsk[]` | `useMemo` over `snapshot.asks.filter(a => a.answered === null)`; recomputed only when the snapshot identity changes; `[]` when no snapshot |
+| `busy` | `boolean` | `snapshot !== null && !TERMINAL.includes(snapshot.state)` |
+| `start` | `(source) => Promise<void>` | Accepts an `UploadSource`, a `FileList`, or `File[]`. Constructs the session, registers the four listeners, commits it to `sessionRef` **and** `setSession`, then `await connect()` → `await upload(source)` → `await settleAsks()` → conditional `await publish()`. Rejects on fatal errors. |
+| `abort` | `() => void` | `sessionRef.current?.abort()` with no arguments; no-op when there is no session |
+| `publish` | `() => Promise<{ published: string[] }>` | Manual publish for `autoPublish: false` flows; throws `"useMfupUpload: no session to publish"` when `sessionRef` is empty |
+| `reset` | `() => void` | If the current session is non-terminal, aborts it with `("client_reset", "hook reset")`; then clears `sessionRef` and `setSession(null)` so `start()` can run again |
+
+#### Re-entrancy, re-render, and cleanup semantics
+
+| Concern | Guarantee |
+|---------|-----------|
+| Concurrent starts | `start()` throws `"useMfupUpload: an upload is already running — abort() it or wait"` when the previous session's `state` is not in `TERMINAL`. The check reads `sessionRef` (synchronous), not React state. |
+| Callback identity | `start`, `abort`, `publish`, `reset` are all `useCallback(..., [])` — referentially stable for the component's lifetime, so they are safe as effect deps or as props to memoized children. |
+| Options freshness | `optsRef.current = options` and `ctxRef.current = ctx` execute on every render; `start()` re-reads both at call time, so late-changing `serverUrl`/`meta` are picked up without recreating anything. |
+| Re-renders | Two sources only: `setSession` (once per `start`, once per `reset`) and snapshot publication via `useSyncExternalStore`. Passing new inline option lambdas causes no extra subscription churn. |
+| Unmount | A `useEffect(..., [])` cleanup aborts with `("client_unmount", "component unmounted")` **only** when `optsRef.current.abortOnUnmount` is true and the session is non-terminal. With the default `false`, an in-flight upload keeps running after the component unmounts. |
+| StrictMode | The dev-mode mount/unmount/remount cycle runs that cleanup while `sessionRef.current` is still `null` (no session exists before `start()`), so it is inert; session creation in `start()` is what makes this safe. |
+
+Usage:
+
+```tsx
+const { snapshot, pendingAsks, busy, start, abort } = useMfupUpload({
+  meta: { scope: "workspace" },
+  onPublished: () => refresh(),
 });
 ```
 
-| Key | Value | Effect |
-|-----|-------|--------|
-| `root` | `"."` | Project root is `demo/` |
-| `publicDir` | `"public"` | Static passthrough (directory exists and is empty) |
-| `resolve.alias` | `@mfup/client` → `../client/src` | Bare-specifier prefix rewrite to the SDK's TypeScript sources |
-| `build.rollupOptions.input` | `main`, `compare` | Two HTML entry points → multi-page build into `dist/` |
-| `server.host` | `0.0.0.0` | Listens on all interfaces (required inside a container) |
-| `server.port` / `strictPort` | `3000` / `true` | Fail rather than auto-increment |
-| `server.allowedHosts` | `true` | Accepts any `Host` header — needed when proxied behind Caddy |
-| `server.fs.allow` | `["/client", "/app"]` | Grants dev-server file access outside root; matches the compose mounts |
+### 6.6 `useMfupDropzone` (`src/useMfupDropzone.ts`)
 
-**Proxy rules — four entries, all `changeOrigin: true`:**
-
-| Path prefix | Target | Notes |
-|-------------|--------|-------|
-| `/mfup/control` | `http://backend:8070` | `ws: true` — WebSocket upgrade for the control channel |
-| `/mfup` | `http://backend:8070` | Data POSTs, `/mfup/sessions/{id}/publish` |
-| `/health` | `http://backend:8070` | Health probe |
-| `/trivial` | `http://trivial:8071` | `rewrite: (path) => path.replace(/^\/trivial/, "")` |
-
-The more specific `/mfup/control` key is declared before `/mfup`; this ordering is presumably intentional so the WebSocket-upgrade rule matches first, since Vite evaluates proxy keys in declaration order (inferred, not stated in a comment). The proxy targets are Docker Compose service hostnames, and the same routing is mirrored in the repository's `Caddyfile` for the built path.
-
----
-
-### 5.4 Client SDK resolution and running the demo
-
-#### How `@mfup/client` is resolved
-
-**Not a published package and not a workspace link — a build-time path alias to source.** Verified evidence:
-
-- `demo/package.json` declares `"dependencies": {}` — empty. Only `vite ^6.0.0` and `typescript ^5.7.0` are devDependencies.
-- `demo/node_modules/@mfup` does not exist.
-- There is no root-level `package.json`, so there is no npm/pnpm workspace.
-- Resolution happens solely through `resolve.alias["@mfup/client"] → path.resolve(__dirname, "../client/src")`.
-
-Both pages import `@mfup/client/index.js`. Because the alias is a prefix replacement, this becomes `<repo>/client/src/index.js`, which Vite resolves to `client/src/index.ts` (the `.js` suffix is the TypeScript ESM authoring convention). The client's own `package.json` declares `"main": "dist/index.js"`, but the demo bypasses `dist/` entirely — **the client does not need to be built for the demo to run.**
-
-Type-checking is aligned the same way: `tsconfig.json` sets `"include": ["src/**/*.ts", "../client/src/**/*.ts"]`, pulling the SDK sources into the demo's own program under `strict` mode with `moduleResolution: "bundler"`.
-
-Inside Docker, `__dirname` is `/app` and the alias resolves to `/client/src` — which is exactly why `server.fs.allow` lists `/client` alongside `/app`.
-
-#### Server URL discovery
-
-Neither page hardcodes a backend address. Both compute:
+Prop getters for a drop target and a file input. All source extraction is delegated to `sourceFromDataTransfer` / `sourceFromInput` from `@mfup/client`, invoked **synchronously inside the event handler** — required because `DataTransferItem.getAsFileSystemHandle` / `webkitGetAsEntry` are only valid during the drop event.
 
 ```ts
-const serverUrl = `${window.location.protocol}//${window.location.host}`;
+export interface UseMfupDropzoneOptions {
+  onSource(source: UploadSource): void;
+  disabled?: boolean;
+}
+
+export interface MfupDropzoneRootProps {
+  onDragEnter(e: DragEvent<HTMLElement>): void;
+  onDragOver(e: DragEvent<HTMLElement>): void;
+  onDragLeave(e: DragEvent<HTMLElement>): void;
+  onDrop(e: DragEvent<HTMLElement>): void;
+}
 ```
 
-All MFUP traffic therefore goes back to whatever origin served the page, and the Vite proxy (dev) or Caddy (built) routes it onward. `MfupSession` derives its WebSocket URL by swapping `http` → `ws` on this value.
+| Return member | Type | Behavior |
+|---------------|------|----------|
+| `isDragActive` | `boolean` | `useState`; true between the outermost `dragenter` and the matching `dragleave`/`drop`. Not set when `disabled`. |
+| `getRootProps()` | `() => MfupDropzoneRootProps` | Stable (`useCallback([])`). Returns a fresh object of four handlers to spread onto the drop container. |
+| `getInputProps(o?)` | `(o?: { directory?: boolean }) => {...}` | Stable (`useCallback([])`). Returns `type: "file"`, `multiple: true`, an `onChange`, plus `webkitdirectory: ""` when `o.directory` is true (folder picker). |
+
+Handler details:
+
+| Event | Action |
+|-------|--------|
+| `onDragEnter` | `preventDefault()`, increments `depthRef`, sets drag-active unless `disabled` |
+| `onDragOver` | `preventDefault()` only — required for the browser to fire `drop` |
+| `onDragLeave` | Decrements `depthRef` (floored at 0); clears drag-active only at depth 0 |
+| `onDrop` | `preventDefault()`, zeroes depth, clears drag-active; returns early when `disabled`; otherwise `sourceFromDataTransfer(e.dataTransfer)` and calls `onSource` if non-null |
+| input `onChange` | Returns early when `disabled`; `sourceFromInput(e.currentTarget)`, then sets `e.currentTarget.value = ""` (safe because `sourceFromInput` copies out of the live `FileList`) so re-picking the same folder re-fires; calls `onSource` if non-null |
+
+The `depthRef` counter exists because `dragenter`/`dragleave` bubble from every child element — without it the highlight flickers as the pointer crosses children. `optsRef` mirrors the latest options each render, so `disabled` and `onSource` are always read fresh despite the getters being stable. The hook holds no session and performs no cleanup on unmount; it owns only local state.
+
+### 6.7 `examples/multiuser-scopes` — dogfooding consumer app
+
+A two-part example (FastAPI server + Vite/React SPA) written strictly against the **published** packages, the way an outside consumer would: `mfup-fastapi==0.2.0` from PyPI and `@mfup/client` / `@mfup/react` from npm — no workspace links. It demonstrates the OIDC-style auth pipeline in miniature: users are auto-created via cookie, each user gets three file zones, and a single `authorize` hook converts `(cookie, HELLO.meta.scope)` into a server-owned destination so files always land at `<DATA_DIR>/<user_id>/<scope>/…` regardless of what the browser requested.
+
+#### Dependencies (exact, as declared)
+
+| Side | Package | Version spec | Installed |
+|------|---------|--------------|-----------|
+| server | `mfup-fastapi` | `==0.2.0` (pinned) | — |
+| client | `@mfup/client` | `^0.2.3` | 0.2.3 |
+| client | `@mfup/react` | `^0.2.0` | 0.2.0 |
+| client | `react`, `react-dom` | `^18.3.1` | — |
+| client (dev) | `@types/react` `^18.3.12`, `@types/react-dom` `^18.3.1`, `typescript` `^5.5.0`, `vite` `^6.0.0` | — | — |
+
+The client is `"private": true`, `"type": "module"`, named `mfup-example-multiuser-scopes`, with scripts `dev` (`vite`), `build` (`tsc --noEmit && vite build`), and `preview` (`vite preview`). Its `tsconfig.json` is `noEmit` with `jsx: "react-jsx"`, ES2022 target, bundler resolution, `strict`, and `isolatedModules`.
+
+#### Server (`server/app.py`)
+
+Module constants: `DATA_DIR = Path(os.environ.get("DEMO_DATA_DIR", "./data")).resolve()`, `SCOPES = ("workspace", "scratch", "uploads")`, `COOKIE_NAME = "demo_uid"`.
+
+| Symbol | Kind | Description |
+|--------|------|-------------|
+| `_uid_from_headers(headers)` | function | Parses the `Cookie` header with `SimpleCookie`, extracts `demo_uid`, and accepts it only if `uid.isalnum()` and `8 <= len(uid) <= 64`; else `None`. Takes a plain `Mapping[str, str]` so the same code serves HTTP requests and the WebSocket handshake. |
+| `authorize(req: AuthRequest)` | async hook | The entire multiuser/scope policy. Returns `AuthResult \| None`. |
+| `engine` | `MfupEngine` | Built from `MfupConfig(base_dir=DATA_DIR, redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"), authorize=authorize)` |
+| `app` | `FastAPI` | `title="MFUP example — multiuser scopes"`, `lifespan=engine.lifespan` |
+| `whoami` | route `GET /api/whoami` | Auto-creates the demo user |
+| `list_files` | route `GET /api/files/{scope}` | Top-level listing of one zone |
+
+The router is mounted under a prefix inside an otherwise ordinary app:
+
+```python
+app = FastAPI(title="MFUP example — multiuser scopes", lifespan=engine.lifespan)
+app.include_router(engine.router, prefix="/api/mfup")
+```
+
+**How scoping is enforced.** `authorize` is the only policy surface, and it denies by returning `None` in two cases: no valid cookie (the SPA is expected to call `/api/whoami` first), and `req.meta["scope"]` not in `SCOPES` (also covering non-dict `meta`). Otherwise it returns:
+
+```python
+return AuthResult(
+    base_dir=str(DATA_DIR / uid),   # per-user home (staging lives inside)
+    target_dir=scope,               # SERVER owns the layout: <uid>/<scope>/
+    max_total_bytes=512 * 2**20,    # 512 MiB per session
+    max_files=20_000,
+    context={"uid": uid, "scope": scope},
+)
+```
+
+Because `base_dir` is rooted at the user's own directory and `target_dir` is fixed to the validated scope name, a client-supplied `targetDir` cannot escape or cross into another user's tree. Staging lives inside the per-user home, so commit is a rename within one filesystem subtree. `context` carries `{uid, scope}` forward to the engine's downstream hooks. Per-session limits are 512 MiB and 20,000 files.
+
+**Own routes.** `GET /api/whoami` mints `uid = secrets.token_hex(8)` on first visit (16 hex chars — satisfying the alnum / 8–64 check), creates `DATA_DIR/uid`, and sets the cookie with `max_age=30*24*3600`, `httponly=True`, `samesite="lax"`; it returns `{"user_id": uid, "scopes": [...]}`. `GET /api/files/{scope}` returns `403` with `{"error": "unknown user or scope"}` for a missing cookie or unknown scope, otherwise lists `DATA_DIR/uid/scope` one level deep, directories first then by name, as `{"scope": ..., "entries": [{name, dir, size}]}` with `size: null` for directories.
+
+#### Client (`client/src/`)
+
+`main.tsx` mounts `<App />` inside `<StrictMode>` via `createRoot` and imports `./style.css` — the StrictMode wrapper is exactly the condition `useMfupUpload` is designed against (session created in `start()`, not in an effect).
+
+`App.tsx` bootstraps the user, then wires the provider once at the root:
+
+```tsx
+<MfupProvider config={{ serverUrl: `${location.origin}/api/mfup` }}>
+```
+
+`App` fetches `/api/whoami` in a mount effect, stores `user_id`, renders `creating your demo user…` until it resolves, and falls back to the string `"(server unreachable — is examples/…/server running?)"` on failure. It then renders one `<ScopeZone>` per entry of `SCOPES = ["workspace", "scratch", "uploads"] as const`.
+
+`ScopeZone` is the whole demo, and touches only the published hook surface:
+
+| Wiring | Code | Purpose |
+|--------|------|---------|
+| Upload | `useMfupUpload({ meta: { scope }, onPublished: () => void refresh() })` | The scope travels as session meta → arrives as `AuthRequest.meta` on the server; the listing refreshes after publish |
+| Dropzone | `useMfupDropzone({ disabled: busy, onSource: (src) => { start(src).catch(() => {}) } })` | Drops and picks feed `start()`; the zone is inert while an upload runs; the rejection is swallowed because failures are surfaced through the snapshot |
+| Root props | `<section className={"zone" + (isDragActive ? " drag" : "")} {...getRootProps()}>` | Drag highlight |
+| Pickers | `<input {...getInputProps()} />` and `<input {...getInputProps({ directory: true })} />` | Files picker and folder picker in the same header |
+| Listing | `fetch(\`/api/files/${scope}\`)` in a `useCallback`/`useEffect` pair keyed on `scope` | Server-disk viewer; a transient failure keeps the previous listing |
+
+Rendering reads exclusively from the snapshot store: `snapshot.state`, `snapshot.fraction` (→ percent bar), `snapshot.reconnect.attempt` (badge reads `reconnecting #N`), `snapshot.progress.acceptedFiles`, `snapshot.progress.bodyDoneBytes`, `snapshot.currentFile.path`, `snapshot.published`, and `snapshot.fatalError.{code,message}`. Derived flags are `cancelled = state === "aborted"`, `failed = state === "failed"`, and `done = state === "committed" && snapshot.published != null`. A `Cancel upload` button calls `abort` directly. Note `fmtBytes(n: number | bigint)` — byte counters may arrive as `bigint`, and it coerces with `Number(n)`.
+
+The interactive conflict path is the point of the example: `pendingAsks.map(...)` renders one dialog per unanswered ask with two buttons, `ask.respond("merge_overwrite")` and `ask.respond("cancel")`, while the transfer keeps streaming in the background. Dropping the same folder twice triggers it; answering `cancel` aborts the session so nothing is published and the previous files stay untouched.
 
 #### Running it
 
-**Full stack via Docker Compose** (from `/workspace`) — the intended path, since the proxy targets are compose service names:
+```bash
+# server (Python 3.10+, reachable Redis)
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --port 8090
+# sanity: curl -s localhost:8090/api/mfup/health  → "crc32c":"native"
 
-```
-docker compose up
-```
-
-`caddy` serves `./demo/dist` — the *built* output produced by `frontend-build` — while the `frontend` dev-server service is only `expose`d on the compose network, not published. So `http://localhost:20060` reaches the production build; reaching the hot-reloading Vite dev server requires publishing port 3000 or entering the network yourself.
-
-**Standalone npm scripts** (`demo/package.json` — two scripts):
-
-| Script | Command | Result |
-|--------|---------|--------|
-| `npm run dev` | `vite` | Dev server on `0.0.0.0:3000` with HMR and the four proxies |
-| `npm run build` | `vite build` | Static `dist/` with both `index.html` and `compare.html` |
-
-Running `npm install && npm run dev` outside Compose starts the UI, but every backend call fails unless the hostnames `backend` and `trivial` resolve — the proxy targets are not configurable via environment variables.
-
-**Pages once running:** `/` (or `/index.html`) for the main demo, `/compare.html` for the comparison.
-
----
-## 6. Deployment & Infrastructure
-
-The whole MFUP stack runs from a single `docker compose` file at the repository root. There are no Dockerfiles: every service uses a stock upstream image, bind-mounts the relevant source directory, and installs its dependencies in the container's `command` at startup. Only one port reaches the host — Caddy on `20060` — and Caddy fronts the compiled demo, the MFUP server, and the trivial baseline server on a single origin, so the browser client never makes a cross-origin request. Persistent state is limited to one bind-mounted directory, `./uploads`, shared by both upload servers and excluded from version control.
-
-### 6.1 Service topology (`docker-compose.yaml`)
-
-Six services. Five use `expose` (visible only inside the compose network); `caddy` is the only service with a `ports:` mapping.
-
-| Service | Image | Port | Host-published | Volumes | Environment | depends_on |
-|---|---|---|---|---|---|---|
-| `redis` | `redis:7-alpine` | `expose: 6379` | no | none | none | — |
-| `backend` | `python:3.12-slim` | `expose: 8070` | no | `./server:/app`, `./uploads:/data/uploads` | `MFUP_BASE_DIR=/data/uploads`, `REDIS_URL=redis://redis:6379/0` | `redis` |
-| `trivial` | `python:3.12-slim` | `expose: 8071` | no | `./benchmarks/trivial-server:/app`, `./uploads:/data/uploads` | `UPLOAD_DIR=/data/uploads/trivial-target` | — |
-| `frontend` | `node:20-alpine` | `expose: 3000` | no | `./example:/app`, `./client:/client` | none | — |
-| `frontend-build` | `node:20-alpine` | none | no | `./example:/app`, `./client:/client` | none | — |
-| `caddy` | `caddy:2-alpine` | `80` in container | **yes — `20060:80`** | `./Caddyfile:/etc/caddy/Caddyfile:ro`, `./demo/dist:/srv/dist:ro` | none | `backend`, `frontend-build`, `trivial` |
-
-Startup commands:
-
-| Service | Command |
-|---|---|
-| `backend` | `pip install --quiet fastapi uvicorn[standard] websockets redis && python -m uvicorn mfup.app:app --host 0.0.0.0 --port 8070 --log-level info` |
-| `trivial` | `pip install --quiet fastapi uvicorn[standard] python-multipart && python -m uvicorn app:app --host 0.0.0.0 --port 8071 --log-level info` |
-| `frontend` | `npm install && npx vite` |
-| `frontend-build` | `npm install && npx vite build` |
-
-Key behaviors:
-
-- **No image build step.** `backend` sets `working_dir: /app` with `./server` mounted there, so `uvicorn mfup.app:app` resolves the `mfup` package straight from the mounted source tree. `server/pyproject.toml` is never installed — dependencies are named explicitly in the `pip install` line. Editing Python source on the host changes what the container runs on next restart.
-- **No `healthcheck:` blocks are defined anywhere in the file.** Readiness is expressed only through `depends_on`, which waits for container *start*, not for the process inside to be serving. Both Python services do expose an HTTP `/health` endpoint, but Compose is not configured to poll them.
-- **Redis has no volume.** Nothing is mounted at `/data`, so the Redis dataset lives only in the container's writable layer. Inferred: the session index is therefore treated as reconstructible or expendable across container recreation, not as durable state. Note the consequence — losing Redis loses the ability to *find* live sessions at restart, even though their SQLite state survives on disk (see §7.1).
-- **`./uploads` is shared by two writers.** `backend` treats `/data/uploads` as its root (`MFUP_BASE_DIR`), while `trivial` writes under `/data/uploads/trivial-target` (`UPLOAD_DIR`). Both point at the same host directory, so a side-by-side benchmark run leaves both result trees under one path for comparison.
-- **`frontend-build` is a one-shot job.** It has no port and no long-running process — `vite build` writes `./demo/dist` and the container exits. `caddy` serves that same directory read-only at `/srv/dist`, which is why `caddy` lists `frontend-build` in `depends_on`. Because `depends_on` does not wait for completion, Caddy can come up while the build is still running and serve an empty or stale `dist` (inferred from the absence of a completion condition).
-- **`frontend` (the Vite dev server) is not wired into the published path.** It is not referenced by the Caddyfile and not in Caddy's `depends_on`, and its port 3000 is `expose`d rather than published, so with the file as written the dev server is not reachable from the host. Inferred: it is an opt-in development service intended to be reached from inside the compose network — supported by `demo/vite.config.ts`, whose `server.proxy` block re-implements the Caddy routes against the compose DNS names.
-
-### 6.2 Reverse proxy and single-origin routing (`Caddyfile`)
-
-A single site block listening on `:80` inside the container, reached from the host at `http://localhost:20060`. Four `handle` blocks, evaluated as an ordered routing table:
-
-| Match | Action | Target |
-|---|---|---|
-| `/mfup/*` | `reverse_proxy` (prefix preserved) | `backend:8070` |
-| `/health` (exact path) | `reverse_proxy` | `backend:8070` |
-| `/trivial/*` | `uri strip_prefix /trivial`, then `reverse_proxy` | `trivial:8071` |
-| (no matcher — fallback) | `root * /srv/dist`, `try_files {path} /index.html`, `file_server` | static demo build |
-
-The `/mfup/*` rule forwards the path unchanged, so the MFUP server's routes line up one-to-one: the control WebSocket at `/mfup/control`, data POSTs at `/mfup/data/{session_id}/{leg_id}`, `/mfup/probe/{session_id}`, `/mfup/sessions`, `/mfup/sessions/{session_id}`, `/mfup/sessions/{session_id}/publish`, and `/mfup/sweep`. Caddy's `reverse_proxy` passes WebSocket upgrades through natively, so no extra directive is needed for the control channel. `/trivial/*` is the mirror case: the prefix is stripped before forwarding, so `/trivial/upload` arrives at the baseline server as `/upload`.
-
-The single-origin arrangement means the browser sees exactly one host and port for everything — the HTML and JS bundle, the MFUP REST surface, the control WebSocket, and the trivial server. Nothing is cross-origin, so there is no CORS configuration anywhere in the stack, no preflight cost on the data-POST path, and the WebSocket opens against the same authority as the page. It also keeps the comparison honest: both servers are measured through the identical proxy hop.
-
-The fallback `try_files {path} /index.html` is the standard SPA pattern. Note that the built demo has two HTML entry points; `compare.html` is served directly by `file_server` because it exists on disk, before the `/index.html` fallback applies.
-
-### 6.3 Baseline upload server (`benchmarks/trivial-server/app.py`)
-
-A **benchmark control, not production code** — its own docstring reads "Trivial file-by-file upload server for comparison demo." It exists solely to give the demo a naive upload implementation to measure MFUP against: one HTTP request per file, no protocol on top. 47 lines of FastAPI, two routes.
-
-| Route | Method | Description |
-|---|---|---|
-| `/upload` | POST | Accepts one `multipart/form-data` file plus an optional `path` form field; streams it to disk under `BASE_DIR` |
-| `/health` | GET | Returns `{"status": "ok"}` |
-
-| Symbol | Type | Description |
-|---|---|---|
-| `BASE_DIR` | const | `Path(os.environ.get("UPLOAD_DIR", "/data/uploads"))` — write root; compose overrides it to `/data/uploads/trivial-target` |
-| `app` | `FastAPI` | Titled "Trivial Upload Server" |
-| `upload_file(file, path)` | async route handler | Writes the upload, returns `{"ok": True, "file": str(rel), "size": size}` |
-| `health()` | async route handler | Liveness probe |
-
-Behavior in `upload_file`: the destination is `BASE_DIR / path / file.filename` (or `BASE_DIR / file.filename` when `path` is empty). Before any directory is created, it applies a path-traversal guard — `dest.resolve().relative_to(BASE_DIR.resolve())`, returning HTTP 403 with `{"error": "path traversal"}` on `ValueError`. Only then does it `mkdir(parents=True, exist_ok=True)` the parent and stream the body to disk in 256 KiB chunks, accumulating the byte count it reports back.
-
-How it differs from the real MFUP server: no sessions, no session IDs, no legs, no resume, no manifest, no probe, no publish, no sweep, and no WebSocket control channel — the entire surface is a single stateless POST. It does not use Redis, and unlike `backend` it needs `python-multipart` because it parses form uploads. An interrupted transfer leaves a truncated file with no way to continue it; the client must re-send the whole file. That gap is precisely what the comparison demo is built to show.
-
-### 6.4 Repository packing helper (`repomix.sh`)
-
-A three-line POSIX shell wrapper:
-
-```sh
-npx repomix@latest \
-  --no-file-summary \
-  --header-text "" \
-  -o repomix-output.xml \
-  "$@"
+# client
+npm run dev     # Vite on 0.0.0.0:20061
 ```
 
-It packs the entire repository into one XML file for ingestion by an LLM, suppressing repomix's per-file summary block and boilerplate header. `"$@"` forwards extra arguments through, so callers can narrow the scope without editing the script. The output file is gitignored, so running it never dirties the working tree.
+Optional server environment: `DEMO_DATA_DIR` (default `./data`) and `REDIS_URL` (default `redis://localhost:6379/0`).
 
-### 6.5 Version control exclusions (`.gitignore`)
+`vite.config.ts` fixes both `server` and `preview` to `host: "0.0.0.0"`, `port: 20061`, `strictPort: true`, `allowedHosts: true`, and proxies a single prefix:
 
-Seven entries, all generated or runtime artifacts:
+```ts
+proxy: { "/api": { target: BACKEND, changeOrigin: true, ws: true } }
+```
 
-| Pattern | What it excludes |
-|---|---|
-| `node_modules/` | npm dependencies installed by `frontend` / `frontend-build` |
-| `dist/` | Vite build output, including `demo/dist` that Caddy serves |
-| `*.egg-info/` | Python packaging metadata |
-| `__pycache__/` | Python bytecode caches |
-| `.vite/` | Vite's dependency-optimization cache |
-| `uploads/` | **Runtime upload storage** — the bind-mount target for both `backend` and `trivial` |
-| `repomix-output.xml` | Output of `repomix.sh` |
-
-`uploads/` is the significant one: it is the only durable state the stack produces, holding completed uploads, in-progress `.incoming.<uuid>` staging entries written by the MFUP server, and the `trivial-target/` subtree. Confirmed by `git ls-files uploads` — zero tracked files.
-
-Note that `dist/` being ignored while `caddy` mounts `./demo/dist:/srv/dist:ro` is what makes `frontend-build` load-bearing: the directory Caddy serves does not exist in a fresh clone and must be produced by that service before the site has content.
-
-### 6.6 Running the stack locally
-
-Everything below follows directly from the config files; no scripts or Makefiles beyond these exist.
-
-- **Full stack:** `docker compose up` from `/workspace` starts all six services. `frontend-build` runs `npm install && vite build` and exits; the rest stay up.
-- **Serving stack only (skip the dev server):** `docker compose up caddy` pulls in `backend`, `frontend-build`, and `trivial` via `depends_on`, and `redis` transitively via `backend`.
-- **Access point:** `http://localhost:20060` — the only host-published port. The demo shell is served from the built `demo/dist`; `/mfup/*` and `/health` route to the MFUP server; `/trivial/*` routes to the baseline with the prefix stripped.
-- **First run is slow by design.** Every container installs dependencies at startup, so the first `up` includes network installs. Because `depends_on` does not wait for readiness, Caddy may briefly return 502 on `/mfup/*` or serve an empty `/srv/dist` while `backend` and `frontend-build` are still installing (inferred from the absence of healthchecks).
-- **Rebuilding the demo after a client or example change:** `docker compose up frontend-build` re-runs `vite build` into `demo/dist`; Caddy picks up the new files from the read-only mount without a restart, since it reads from disk per request.
-- **Restarting the server after a Python change:** `docker compose restart backend`. The source is bind-mounted, so no rebuild is needed, but uvicorn is started without `--reload`, so the process must be restarted to pick up edits.
-- **Vite dev mode caveat:** the `frontend` (Vite dev) service is behind the `dev` compose profile, so `docker compose up` does **not** start it; `docker compose --profile dev up frontend` does. This is deliberate — without it, `frontend` and `frontend-build` would both `npm ci` into the same bind-mounted `./example` concurrently, clobber each other's `node_modules`, and the build would fail. Both services keep `node_modules` in a per-container anonymous volume rather than the bind mount.
-- **Uploaded data:** lands in `/workspace/uploads` on the host — MFUP output at the root, trivial-server output under `trivial-target/`. Deleting that directory resets all upload state on disk; Redis state is separate and disappears when the `redis` container is removed.
-
-### 6.7 Tests and CI
-
-Two test surfaces, plus GitHub Actions.
-
-**Server unit tests** (`server/tests/`, `pytest`, `asyncio_mode=auto`): `test_protocol.py` (8 decoder tests) + `test_edge_cases.py` (23 tests — see §3.9).
-
-**End-to-end** (`e2e/`, Playwright, projects `chromium`/`firefox`/`webkit`). A harness page `demo/e2e.html` exposes `window.mfupE2E` (build deterministic OPFS trees, run a real `MfupSession`, publish, report). `e2e/lib/gen.ts` regenerates the same bytes on the Node side for **byte-exact on-disk verification** against `uploads/`. Coverage:
-
-| Spec | What it proves |
-|---|---|
-| `opfs-upload` / `folder-input` | Upload via `uploadHandles` (OPFS `FileSystemDirectoryHandle`) and `<input webkitdirectory>`; every byte verified on disk (all engines) |
-| `resume` | `docker compose kill backend` mid-transfer → reconnect → RESUME → byte-exact continuation → `COMMIT_OK` |
-| `meta-loss` | kill mid-scan of hundreds of small files → the NODE-loss regression: full tree still commits (files count matches) |
-| `conflict` / `conflict-matrix` | `{merge_overwrite, cancel} × {answered before, after commit}` — overwrite lands new bytes; cancel leaves the target at v1 and cleans staging |
-| `retention` | client abort leaves no staging dir, no Redis zset member, no meta hash; a planted orphan is reclaimed by reconciliation |
-
-Chaos/conflict/retention specs are tagged `@chromium-only` and `grepInvert`-ed out of the firefox/webkit projects at collection time (they exercise the engine-independent protocol path; running them once on chromium is enough). The global test timeout is 60 s so a hang fails fast; chaos specs raise their own.
-
-**`.github/workflows/e2e.yml`** — three jobs:
-
-| Job | Runner | What it does |
-|---|---|---|
-| `server-unit` | ubuntu | `pip install "./server[dev]"`, `pytest` |
-| `linux-e2e` | ubuntu | brings up the **full `docker compose` stack** in the runner, runs all three Playwright engines (incl. the kill/resume chaos specs) |
-| `macos-webkit` | **macos-15** | native-Safari-proxy: brew redis + `pip install ./server` + `vite build` served by `vite preview`, runs the webkit project. `macos-14` is avoided — its frozen webkit rejects Playwright's `Page.overrideSetting(PushAPIEnabled)` |
-
-The demo build is **deterministic**: a committed `demo/package-lock.json`, `npm ci` (not `npm install`), and `npm run build|dev|preview` (local vite `6.4.1`) — never `npx vite`, which fetches the latest vite (v8/rolldown) and breaks the build.
-
----
-## 7. Known Gaps & Divergences
-
-This section synthesizes findings that span module boundaries. Items resolved
-by the post-hardening work (§0) are marked **[fixed]** with a pointer; the rest
-remain open. Each item was read from source; inferences say so.
-
-### 7.1 Design doc vs implementation
-
-`docs/MFUP_RU.md` is the project's design note. Its claims vs the code:
-
-| Claim in `docs/MFUP_RU.md` | Actual implementation |
-|---|---|
-| Frame envelope is `[tag:1][length:4][payload:N]` | It is `[length:4][tag:1][payload]` — length first. Both implementations agree |
-| "At restart the server scans `.incoming.*` directories and recovers sessions" | Recovery is Redis-driven (`get_not_expired()`), not a scan. **[partly addressed]** A session absent from Redis is still not *recovered*, but it is no longer *leaked*: `reconcile_orphans` now removes staging dirs that no live session and no Redis entry reference (§3.5, retires the old 7.1 leak) |
-| "Either all files are published, or none" | Still true only **per top-level entry**: `publish_session` loops `os.rename`/`os.replace` with no cross-entry transaction and no rollback (§3.6). Open. |
-
-The doc's architectural narrative (two channels, interleaved scan/transfer, staging→publish, blended progress) remains the best statement of intent.
-
-### 7.2 Implemented but unwired
-
-| Feature | Server method | Status |
-|---|---|---|
-| File rejection (`REJECT_FILE`) | `LiveSession.reject_file()` | **[fixed]** now wired: illegal names and `fs_conflict` (dir-on-file / file-on-dir) reject the offending node (§3.2, §3.4) |
-| Server-initiated backpressure (`FLOW`) | `LiveSession.send_flow()` | Still no callers — a production knob kept for when storage/maintenance pressure needs it |
-| Subtree pruning (`PRUNE_NODE`) | `LiveSession.prune_node()` | Still no callers — reserved for server-side policy pruning |
-
-`SessionState.PAUSED_BY_SERVER` therefore remains reachable only if `send_flow` is wired. `FAILED` is **now written** (commit-retry cap, storage abort). `EXPIRED` is still only *read* — the sweeper deletes expired sessions rather than transitioning them.
-
-Six of the client's `MfupErrorCode` members are still declared but never constructed (`WS_SEND_FAILED`, `DATA_STREAM_ERROR`, `SESSION_ABORT_FAILED`, `SESSION_COMMIT_FAILED`, `SESSION_ENDED_BAD_STATE`, `INGEST_READ_ERROR`); `ProgressTracker.advanceBody()` is still an empty stub. `unknown_node` was **added** to `NACK_CHUNK.reason` and is fully wired.
-
-### 7.3 Advertised but unenforced limits
-
-`HELLO_OK.limits` still advertises three caps the server does not enforce:
-
-| Limit | Default | Enforced? |
-|---|---|---|
-| `MFUP_MAX_CHUNK_BYTES` | 262144 | No — client-side hint only (`Math.min(chunkSize, …)`) |
-| `MFUP_MAX_OPEN_FILES` | 1 | No |
-| `MFUP_MAX_PENDING_FILES` | 64 | No |
-
-**[fixed]** `FrameReader` now caps `frame_len` (`DEFAULT_MAX_FRAME_LEN = 1 MiB`, raises on excess), and the buffered data path caps the POST body at `MFUP_MAX_BUFFERED_BODY` (16 MiB). Still open: no cap on concurrent sessions or total staged bytes; the three `limits` values remain advisory.
-
-### 7.4 Durability
-
-Unchanged: `COMMIT_OK` means "invariants held and bytes reached the OS page cache," not "survives power loss." `FileWriter._sync_write` does `write()`+`flush()` with **no `fsync`**; SQLite runs `synchronous=NORMAL` under WAL. Deliberate — see §3.7.
-
-### 7.5 Authentication
-
-**[fixed]** All state-changing and listing routes now authenticate:
-
-- `POST /mfup/sessions/{id}/publish` requires the session's `X-MFUP-Token`.
-- `GET /mfup/sessions`, `GET /mfup/sessions/{id}`, `POST /mfup/sweep` require the `X-MFUP-Admin-Token` header matched against `MFUP_ADMIN_TOKEN`; if that env var is unset the routes return `403` (disabled by default).
-
-Data/probe endpoints already used `X-MFUP-Token`; `?epoch=` is now mandatory (§0). Path traversal remains defended in four layers, and — unlike before — those defenses **now have tests** (§3.9): `validate_node_name` with `..`/`/`/`\`/NUL, and `resolve_payload_path` on an escaping/broken chain.
-
-### 7.6 Concurrency observations
-
-`LiveSession._lock` **is still created and never acquired** — there is no
-per-session mutual exclusion; serialization rests on one-active-leg and
-one-epoch-per-leg. Two consequences persist:
-
-1. **Concurrent POSTs on the same leg** remain possible in the streaming path; the safety net is `FileWriter.write`'s offset assertion (misordered chunk → `NACK_CHUNK`, not corruption). The buffered/batch path is now processed atomically per POST, narrowing the window.
-2. **`body_done_bytes` can lose counts** across the `await` in `_handle_file_chunk`'s read-modify-write. Cosmetic only — `COMMIT_OK.bytes` comes from `count_committed_files()`.
-
-A related benign race surfaces as `sqlite3.ProgrammingError: Cannot operate on a closed database` in the log when a control-channel abort closes the DB while a data POST is mid-frame; it is caught (→ the POST fails) and the session is being torn down anyway. Taking `_lock` in `process_frame` and `registry.remove` would close it.
-
-**[fixed]** duplicate `FILE_OPEN` now closes the prior writer (was an fd leak); `_on_idle`/`detach_leg` now revert `COMMITTING` to `WAITING_RESUME` and refresh TTL. The pure-Python `crc32c` hot loop is **gone** — CRC-32C is a C dependency now (§3.3).
-
-### 7.7 Test coverage
-
-The near-total gap is substantially closed.
-
-**Server** now has two test files: `test_protocol.py` (8 decoder tests) and `test_edge_cases.py` (23 tests) covering illegal/traversal names, dir/file collisions → `REJECT_FILE`, `resolve_payload_path` broken chain, ENOSPC → `SESSION_ABORT`, the commit-retry cap, and duplicate `FILE_OPEN`. `asyncio_mode=auto`; these drive real `LiveSession`s against a temp SQLite DB with a fake WS. Still thin: full HTTP-route/WS-handshake tests and a `redis_index` unit test.
-
-**End-to-end** is new (`e2e/`, Playwright, 3 engines) and covers the stateful behaviour that was previously untested only by reading: OPFS/folder-input upload with byte-exact on-disk verification, resume across `docker compose kill` mid-transfer, the meta-loss regression (kill mid-scan → full tree still committed), a 4-case conflict matrix (`{overwrite,cancel} × {before,after commit}`), and retention (abort leaves no disk/Redis trace; reconciliation removes a planted orphan). See §6.7.
-
-Remaining: `publish.py` merge paths, `redis_index.py`, and server-side HTTP status paths are still only exercised indirectly through e2e.
+with `BACKEND = process.env.EXAMPLE_BACKEND_URL ?? "http://localhost:8090"`. One rule covers both the app's own `/api/whoami` and `/api/files/*` routes and the mounted MFUP router at `/api/mfup/*`; `ws: true` is what forwards the control-channel WebSocket upgrade. Because the SPA derives `serverUrl` from `location.origin`, the proxy also makes the cookie same-origin, which is what lets `authorize` read `demo_uid` off the WebSocket handshake headers.
 
 ---
 
-## 8. Project Structure
+## 7. Demo Application & Benchmarks
+
+The `demo/` directory is a Vite 6 multi-page app that exercises `@mfup/client` and `@mfup/react` against a live MFUP/2 server. It is not published — it aliases the sibling packages by **source path**, so editing `packages/client/src/*` hot-reloads the demo. Four HTML pages sit on four independent TypeScript entry points: an interactive upload demo, a head-to-head benchmark against a naive POST-per-file baseline, a scripted harness driven by the Playwright e2e suite, and a React-hooks smoke target. The baseline for the benchmark is `benchmarks/trivial-server/app.py`, a deliberately minimal FastAPI server deployed alongside the MFUP backend and proxied at `/trivial/*`.
+
+Note that `demo/` is the internal dev/test playground, not an integration reference — for that, see `examples/multiuser-scopes` (§6.7), which is what the root `docker-compose.yaml` runs.
+
+### 7.1 Entry points
+
+| Page | Script | Rollup input name | Scenario exercised | URL on the e2e stack |
+|------|--------|-------------------|--------------------|----------------------|
+| `demo/index.html` | `demo/src/demo.ts` | `main` | Full interactive upload UX: drag-and-drop, folder picker, progress, conflict modal, error cards, abort/reset | `/` |
+| `demo/compare.html` | `demo/src/compare.ts` | `compare` | MFUP/2 vs sequential multipart POST, two lanes racing on the same file set | `/compare.html` |
+| `demo/e2e.html` | `demo/src/e2e.ts` | `e2e` | Headless control surface (`window.mfupE2E`) building OPFS trees for Playwright | `/e2e.html` |
+| `demo/react.html` | `demo/src/react-demo.tsx` | `react` | `@mfup/react` hooks (`MfupProvider`, `useMfupUpload`, `useMfupDropzone`) with `data-testid` hooks | `/react.html` |
+
+**Running them.** The demo is served two ways. The internal dev/test stack (`e2e/docker-compose.yaml`) runs `frontend-build` (`npm ci && npm run build`) and has Caddy serve `demo/dist` on host port **20060**, proxying `/mfup/*` and `/health` to `backend:8070` and `/trivial/*` (prefix stripped) to `trivial:8071`. For hot reload, the `frontend` service is gated behind the `dev` Compose profile and runs `vite` on port 3000. Natively, `npm run dev` in `demo/` starts the same dev server on `0.0.0.0:3000`; `npm run build` then `npm run preview` serves the static build on port 20060. Playwright's `baseURL` defaults to `http://localhost:20060` (`MFUP_BASE_URL` overrides).
+
+All four scripts derive the server URL from the page itself — `demo.ts` and `compare.ts` compute `` `${location.protocol}//${location.host}` ``, `e2e.ts` and `react-demo.tsx` use `location.origin` — so the client always talks back through whatever proxy served the page.
+
+### 7.2 Main demo (`demo/src/demo.ts` + `demo/index.html`)
+
+Wires `MfupSession` to a drag-and-drop UI. Sessions are created with `targetDir: "."` and `chunkSize: 256 * 1024`.
+
+The file-header comment documents the drop-handler priority chain and why it exists: `getAsFileSystemHandle()` (Chrome/Edge, persistent handles) → `webkitGetAsEntry()` (Firefox/Safari, persistent `FileSystemEntry`) → `<input>` file picker. `DataTransferItem.getAsFile()` and `e.dataTransfer.files` are deliberately not used for drag-and-drop because Firefox invalidates the underlying blob after the handler returns. The page delegates the whole chain to `sourceFromDataTransfer(e.dataTransfer)`, which must run synchronously inside the drop handler — and does.
+
+| Control (element id) | Trigger | Effect |
+|----------------------|---------|--------|
+| `#dropzone` | `dragover` / `dragleave` | Toggles `.dragover` class |
+| `#dropzone` | `drop` | `sourceFromDataTransfer` → `startUpload`; ignored if a session is live |
+| `#dropzone` | `click` | Opens `#file-input` if no session is live |
+| `#browse-btn` | `click` | Opens `#file-input` (`multiple`), `stopPropagation` |
+| `#browse-folder-btn` | `click` | Opens `#folder-input` (`webkitdirectory`), `stopPropagation` |
+| `#file-input` / `#folder-input` | `change` | `sourceFromInput(input)` → `startUpload` |
+| `#btn-abort` | `click` | `session.abort()`; disabled outside `active` / `paused_by_server` / `waiting_resume` |
+| `#btn-reset` | `click` | Aborts a live session with reason `client_reset` before clearing all UI state |
+| `#modal-overwrite` | `click` | `ask.respond("merge_overwrite")` |
+| `#modal-cancel` | `click` | `ask.respond("cancel")`, sets `cancelled = true` |
+
+The progress panel (`#progress`) shows a state badge (`#state-badge`, class-driven per `SessionState`), a truncated session id, a fill bar (`#bar`), and four stat tiles:
+
+| Tile id | Label | Source field |
+|---------|-------|--------------|
+| `#stat-bytes` | Transferred | `snap.bodyDoneBytes` |
+| `#stat-files` | Files Accepted | `snap.acceptedFiles` |
+| `#stat-scanned` | Scanned | `snap.scanDoneUnits` |
+| `#stat-skipped` | Skipped | `snap.skippedFiles` |
+
+| Internal | Behavior |
+|----------|----------|
+| `scheduleProgress(snap)` | Coalesces progress renders to one per `requestAnimationFrame` — `ProgressTracker` emits synchronously on every mutation, which for many-small-file trees is tens of thousands of DOM writes |
+| `renderState(state)` | `committed` → green bar at 100%, abort disabled; `aborted`/`failed` → red bar, abort disabled; `active`/`paused_by_server`/`waiting_resume` → abort enabled |
+| `renderError(err)` | Prepends an error card: code, `layer / FATAL\|recoverable`, message, action, `detail` JSON, collapsible stack trace + cause chain. Capped at `MAX_ERROR_CARDS = 50` |
+| `formatCauseChain(err)` | Walks `.cause` up to depth 5, joining each stack with a `Caused by:` prefix |
+| `log(msg, cls)` | Timestamped entries (`en-US`, `hour12: false`, `fractionalSecondDigits: 3`), capped at `MAX_LOG_ENTRIES = 200` |
+| `fmtBytes(n)` | `B` / `KB` / `MB` (1 decimal) / `GB` (2 decimals), accepts `bigint` |
+
+Session events handled: `state`, `ask`, `committed`, `reconnecting`, `error`, plus `onProgress`. The `committed` handler is the interesting one — if a conflict modal is still open it awaits `conflictPromise` before calling `session.publish()`, and skips publishing entirely if the user chose `cancel`. `reconnecting` overwrites the badge with `RECONNECTING <attempt>/<max>` (`∞` when `maxAttempts` is null). On connect the log records the negotiated mode: `streaming (duplex:half)` or `batch (sequential POST)` from `session.streamingMode`.
+
+### 7.3 Benchmark race (`demo/src/compare.ts` + `demo/compare.html`)
+
+The performance claim of the project, measured in-browser. One dropzone feeds **both** lanes; `startRace` launches them with `Promise.allSettled([runMfupLane(...), runTrivialLane(...)])`, so the two uploads run **concurrently over the same connection budget**.
+
+**Input preparation (outside both timers).** The drop handler resolves the dropped items three ways, in order, and produces two things: the *native source* for MFUP and a flattened `FlatFile[]` (`{ file: File; path: string }`) for the baseline.
+
+| Path | Detection | MFUP mode | Flattener |
+|------|-----------|-----------|-----------|
+| 1 | every item yields `getAsFileSystemHandle()` (Chrome/Edge) | `handles` → `session.uploadHandles()` | `flattenHandles()` — recurses `dir.entries()`, calls `getFile()` per file |
+| 2 | `webkitGetAsEntry()` returns entries (Firefox/Safari) | `entries` → `session.uploadEntries()` | `flattenEntry()` — recurses `createReader().readEntries()` in batches until empty |
+| 3 | fallback `e.dataTransfer.files` | `files` → `session.uploadFiles()` | one `FlatFile` per file, `path = f.name` |
+
+Clicking the dropzone opens `#file-input` (`multiple`) and takes path 3 with `mode: "files"`.
+
+Note the asymmetry, which is inherent to the design: directory traversal and `File` materialization for the baseline happen in the drop handler **before** `startRace`, so the baseline's timer excludes tree walking, while MFUP's scan happens inside `session.upload*()` and therefore inside its timer. Per-file `FormData` construction is inside the baseline timer.
+
+**What each lane measures.**
+
+| | MFUP lane (`runMfupLane`) | Baseline lane (`runTrivialLane`) |
+|---|---|---|
+| Timer starts | before `session.connect()` | before the POST loop |
+| Work timed | `connect()` (incl. streaming probe) + `uploadHandles`/`uploadEntries`/`uploadFiles` (scan, chunked transfer, commit) | for each file: build `FormData`, `await fetch(POST /trivial/upload)` — strictly one at a time, sequentially |
+| Timer stops | after the upload call resolves | after the last POST returns |
+| Excluded | `publish()` — issued from the `committed` handler, after the timer stopped | nothing after the loop |
+| Request shape | 1 WebSocket control channel + the data channel (streaming `duplex:half`, or sequential POSTs in batch mode) | N multipart requests, N = file count |
+| Failure handling | catch → badge `error`, log | non-`ok` response logs and `continue`s to the next file |
+| Target | `targetDir: "mfup-target"`, `chunkSize: 256 * 1024` | `UPLOAD_DIR` of the trivial service |
+
+**Reported metrics.** Per lane: elapsed wall time via `LaneTimer` (`performance.now()`, re-rendered on a 100 ms `setInterval`, displayed as `N.N sec`), a percentage fill bar, a file counter, and a byte counter. Sources differ — MFUP reads `ProgressSnapshot.fraction`, `.acceptedFiles`, `.bodyDoneBytes`; the baseline accumulates `file.size` after each *successful* POST and computes `doneBytes / totalBytes`. `LaneTimer.elapsed()` supplies the final `[MFUP] Complete in X sec` / `[Traditional] Complete in X sec` log lines. There is no aggregate speedup figure computed in code — the comparison is the two timers side by side.
+
+**Publish.** The MFUP lane does not use `session.publish()`; it issues the HTTP call directly so the demo shows the wire shape:
+
+```ts
+await fetch(`${serverUrl}/mfup/sessions/${session.id}/publish`, {
+  method: "POST",
+  headers: { "X-MFUP-Token": session.token },
+});
+```
+
+**Conflicts.** The `ask` handler reveals `#conflict-overlay` and answers via `session.sendAction("merge_overwrite" | "cancel")`; the `committed` handler awaits that answer before publishing and skips publish on `cancel`.
+
+**UI.** Two `.lane` panels (`.lane.mfup`, `.lane.trivial`) titled "MFUP/2 Protocol" and "Traditional (file-by-file)", each with badge (`waiting` / `running` / `done` / `error`), a 2.4 rem timer, a bar, and files/bytes stats — element ids `mfup-{timer,bar,badge,files,bytes}` and `trivial-{timer,bar,badge,files,bytes}`. `#btn-reset` (disabled during a race) clears both lanes, the log, and the file input.
+
+#### Baseline server (`benchmarks/trivial-server/app.py`)
+
+FastAPI app titled `Trivial Upload Server`, run by the `trivial` Compose service with `python-multipart`, uvicorn on port 8071, and `UPLOAD_DIR=/data/uploads/trivial-target`. It is the industry-default pattern MFUP/2 is measured against: no sessions, no resume, no integrity checks, no batching.
+
+| Route | Method | Parameters | Behavior |
+|-------|--------|-----------|----------|
+| `/upload` | POST | `file: UploadFile = File(...)`, `path: str = Form(default="")` | Joins `path / file.filename`, resolves against `BASE_DIR` and returns `403 {"error": "path traversal"}` if it escapes, `mkdir(parents=True, exist_ok=True)`, streams the body to disk in 256 KiB reads, returns `{"ok": true, "file": <rel>, "size": <bytes>}` |
+| `/health` | GET | — | `{"status": "ok"}` |
+
+`BASE_DIR` comes from `UPLOAD_DIR` (default `/data/uploads`). The demo reaches `/upload` as `/trivial/upload`; the Vite proxy and the Caddyfile both strip the `/trivial` prefix.
+
+Per `benchmarks/README.md`, the motivating measurement (from `docs/MFUP_RU.md`) is a 188-file, 1.0 MB project folder uploaded POST-per-file in **17.2 s** — roughly 13 s of request round-trips and 2.9 s of `FormData` construction against ~1.3 s of actual transfer. The README explicitly warns that the gap is RTT-dependent and that the race page should be run over a real network path, not localhost.
+
+### 7.4 E2E harness (`demo/src/e2e.ts` + `demo/e2e.html`)
+
+Not part of the demo UX. `e2e.html` is a bare page containing a single `<pre id="status">` element; the script exposes a control surface on `window.mfupE2E` and builds deterministic file trees in **OPFS**, uploading them through a real `MfupSession` so the `ingestFromHandles` adapter is driven by genuine `FileSystemDirectoryHandle` objects.
+
+**Control surface — `window.mfupE2E` (6 functions, assigned at module end):**
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `detect()` | `() => Promise<{ opfs: boolean; createWritable: boolean }>` | Capability probe. Opens OPFS, creates and removes a `.probe` file, reports whether `createWritable` exists. Specs use it to skip on engines without OPFS write support |
+| `run(opts)` | `(RunOpts) => Promise<RunResult>` | Full happy-path/conflict run: build tree → connect → `uploadHandles([root])` → optionally answer the ASK → publish |
+| `runAndAbort(opts)` | `(RunOpts & { abortAfterBytes: number }) => Promise<{ sessionId, state, log }>` | Starts an upload without awaiting it, polls progress every 50 ms, and calls `session.abort("client_cancel", "test abort")` once `bodyDoneBytes >= abortAfterBytes`. Returns the session id so a test can assert disk/Redis cleanup |
+| `progress()` | `() => object \| null` | Last `ProgressSnapshot` flattened to numbers: `bodyDoneBytes`, `bodyEstBytes`, `scanDoneUnits`, `acceptedFiles`, `fraction`, plus live `state` |
+| `bytesFor(key, size)` | `(string, number) => Uint8Array` | Deterministic content generator (xorshift seeded by FNV-1a) |
+| `fnv1a(s)` | `(string) => number` | 32-bit FNV-1a hash |
+
+`bytesFor`/`fnv1a` are duplicated in `e2e/lib/gen.ts` and must stay byte-for-byte identical — the Node-side verifier regenerates expected content to compare against what landed on disk.
+
+**Input/output shapes:**
+
+```ts
+interface ManifestEntry { path: string; size: number }          // "/"-separated, relative to root
+interface ConflictOpts {
+  action: "merge_overwrite" | "cancel";
+  when: "on_ask" | "after_commit";   // answer immediately, or only after COMMIT_OK arrived
+}
+interface RunOpts {
+  rootName: string;      // top-level dir name, unique per test run
+  targetDir: string;     // server-side target dir
+  manifest: ManifestEntry[];
+  chunkSize?: number;    // default 256 * 1024
+  contentSeed?: string;  // default rootName — vary it to prove overwrite replaced bytes
+  conflict?: ConflictOpts;  // absent → never answer an ASK
+}
+interface RunResult {
+  sessionId: string; streaming: boolean | null; epoch: number; state: string;
+  committed: { files: number; bytes: number } | null;
+  published: unknown; publishStatus: number | null;
+  uploadError: string | null; askSeen: boolean;
+  errors: { code: string; msg: string; fatal: boolean }[];
+  log: string[]; reconnects: number;
+}
+```
+
+**Observable side channels.** `#status` in `e2e.html` is stepped through `building OPFS tree...` → `connecting...` → `uploading...` → `publishing...` → `done`. The returned `log` array is the machine-readable trace, with these tags: `state:<s>`, `streaming:<bool>`, `reconnecting:<attempt>:<delay>`, `committed:<files>:<bytes>`, `ask:<code>[:<name>]`, `answer:<action>`, `uploadError:<msg>` (and `uploadErr:<msg>` in `runAndAbort`).
+
+**Behaviors specs depend on:**
+- `buildOpfsTree` removes any existing `rootName` recursively before recreating it, so reruns are clean; file bytes are `bytesFor(seed + "/" + entry.path, size)`.
+- `ConflictOpts.when === "after_commit"` makes the ASK handler await the `committed` promise before responding — this is the interactive-transfer invariant, that the upload keeps running while the user decides and the answer may land either side of `COMMIT_OK`.
+- Publish is retried up to **4 times** with a 300 ms delay, but only when the error code is `PUBLISH_CONFLICT` — the ACTION travels over WebSocket while publish is HTTP, so a `merge_overwrite` answer can still be in flight. Any other error breaks out immediately. `publishStatus` is taken from `e.detail.status`, or `409` when the code is `PUBLISH_CONFLICT`.
+- Publish is skipped entirely when nothing committed or when `conflict.action === "cancel"`.
+
+Specs driving this page: `abort.spec.ts`, `conflict-matrix.spec.ts`, `meta-loss.spec.ts`, `opfs-upload.spec.ts`, `resume.spec.ts`, `retention.spec.ts` (all navigate to `/e2e.html`).
+
+### 7.5 React demo (`demo/src/react-demo.tsx` + `demo/react.html`)
+
+The full upload UX built only on the public `@mfup/react` surface, mounted with `createRoot` into `#root` inside `<StrictMode>` and wrapped in `<MfupProvider config={{ serverUrl: location.origin }}>`. It doubles as the e2e smoke target for the React package (`e2e/tests/react.spec.ts`).
+
+Two hooks do all the work:
+
+```tsx
+const { snapshot, pendingAsks, busy, start, abort, reset } = useMfupUpload({
+  targetDir: ".", meta: { app: "react-demo" },
+  onCommitted, onPublished, onError,
+});
+const { isDragActive, getRootProps, getInputProps } = useMfupDropzone({
+  disabled: busy,
+  onSource: (src) => start(src),
+});
+```
+
+`getInputProps()` produces the file input; `getInputProps({ directory: true })` produces the folder input.
+
+**`data-testid` surface (14):**
+
+| testid | Element | Content / action |
+|--------|---------|------------------|
+| `dropzone` | div with `getRootProps()` | Adds `.dragover` when `isDragActive` |
+| `file-input` | input | `getInputProps()` |
+| `folder-input` | input | `getInputProps({ directory: true })` |
+| `state` | span | `snapshot?.state ?? "idle"` |
+| `reconnect` | span | Rendered only when `snapshot.reconnect` exists: `reconnecting #<attempt>` |
+| `bar` | `<progress max=100>` | `Math.round(snapshot.fraction * 100)` |
+| `stats` | div | `<acceptedFiles> files · <bodyDoneBytes>` plus `· sending <currentFile.path>` when present |
+| `published` | div | `snapshot.published.join(", ")` |
+| `ask` | div, one per `pendingAsks` entry | `"<name>" already exists. Overwrite?` |
+| `ask-overwrite` | button | `ask.respond("merge_overwrite")` |
+| `ask-cancel` | button | `ask.respond("cancel")` |
+| `abort` | button | Rendered only while `busy`; calls `abort` |
+| `reset` | button | Rendered when not `busy` and a snapshot exists; calls `reset` |
+| `log` | `<pre>` | Rolling 50-line log fed by `onCommitted` / `onPublished` / fatal `onError` / dropzone `onSource` |
+
+### 7.6 Build configuration
+
+#### `demo/vite.config.ts`
+
+Proxy targets default to docker-compose service names and are overridable by env var for CI jobs without Docker (the macOS WebKit runner):
+
+| Env var | Default |
+|---------|---------|
+| `MFUP_BACKEND_URL` | `http://backend:8070` |
+| `MFUP_TRIVIAL_URL` | `http://trivial:8071` |
+
+The `PROXY` object (4 rules) is shared by `server` and `preview`:
+
+| Prefix | Target | Options |
+|--------|--------|---------|
+| `/mfup/control` | `BACKEND` | `changeOrigin`, **`ws: true`** — must precede `/mfup` so the WebSocket upgrade is not swallowed by the generic rule |
+| `/mfup` | `BACKEND` | `changeOrigin` |
+| `/health` | `BACKEND` | `changeOrigin` |
+| `/trivial` | `TRIVIAL` | `changeOrigin`, `rewrite: p => p.replace(/^\/trivial/, "")` |
+
+| Section | Setting | Value / rationale |
+|---------|---------|-------------------|
+| `resolve.dedupe` | `["react", "react-dom"]` | The aliased `@mfup/react` source would otherwise resolve React from the workspace root while example code resolves its own copy — two React instances break the hooks dispatcher |
+| `resolve.alias` | `@mfup/client` → `../packages/client/src/index.ts` | Exact-file alias: the demo builds against package **source** for cross-package hot reload; consumers install the built packages and import the same specifiers |
+| | `@mfup/react` → `../packages/react/src/index.ts` | same |
+| `build.rollupOptions.input` | `main`, `compare`, `e2e`, `react` | The four HTML pages, resolved absolutely |
+| `server` | `host: "0.0.0.0"`, `port: 3000`, `strictPort: true`, `allowedHosts: true` | Container-reachable dev server; `allowedHosts: true` accepts any Host header (proxied/tunnelled access) |
+| `server.fs.allow` | `[<repo root>, "/packages", "/app"]` | Repo root for native runs plus the docker-compose mount points |
+| `preview` | `host: "0.0.0.0"`, `port: 20060`, `strictPort: true`, `allowedHosts: true`, same `PROXY` | Serves the built `dist` statically — used by the macOS CI job because WebKit plus the HMR dev server hangs on the frozen macOS WebKit build; static files match what Linux/Caddy serves |
+
+`publicDir` is `public` (currently empty) and `root` is `.`.
+
+#### `demo/tsconfig.json`
+
+`target`/`lib` ES2022 with `DOM` + `DOM.Iterable`, `module: ESNext`, `moduleResolution: "bundler"`, `strict: true`, `jsx: "react-jsx"`, `esModuleInterop`, `skipLibCheck`, `forceConsistentCasingInFileNames`. `paths` mirrors the Vite aliases with an extra deep-import mapping:
+
+| Specifier | Maps to |
+|-----------|---------|
+| `@mfup/client` | `../packages/client/src/index.ts` |
+| `@mfup/client/*` | `../packages/client/src/*` |
+| `@mfup/react` | `../packages/react/src/index.ts` |
+
+`include` covers `src/**/*.ts`, `src/**/*.tsx`, and both package source trees, so type-checking the demo also type-checks the packages it aliases.
+
+#### `demo/package.json`
+
+Private, `type: "module"`, name `mfup-demo`. It is **not** a workspace member of the root `mfup-monorepo` (which lists only `packages/client` and `packages/react`) — it installs independently from its own `package-lock.json`.
+
+| Script | Command |
+|--------|---------|
+| `dev` | `vite` |
+| `build` | `vite build` |
+| `preview` | `vite preview` |
+
+Dependencies: `react` / `react-dom` `^18.3.1`. Dev dependencies: `@types/react` `^18.3.31`, `@types/react-dom` `^18.3.7`, `typescript` `^5.7.0`, `vite` `^6.0.0`. Neither `@mfup/client` nor `@mfup/react` appears as a dependency — they are resolved purely through the alias/paths mapping.
+
+---
+
+## 8. Testing & Deployment
+
+MFUP/2 is verified by two independent layers. `server/tests/` is a pytest suite that drives `mfup-core` and `mfup-fastapi` in-process — real per-session SQLite databases in `tmp_path`, a fake WebSocket capturing control messages, no network. `e2e/` is a Playwright suite that drives Chromium, Firefox and WebKit against a full containerized stack (Caddy → FastAPI backend → Redis, plus a built demo bundle), including chaos tests that `docker compose kill` the backend mid-upload and assert byte-exact recovery. Both stacks share one bind-mounted `uploads/` directory, which is how the Node-side assertions read what the server actually wrote.
+
+| Layer | Location | Runner | Count |
+|-------|----------|--------|-------|
+| Python unit / hardening | `server/tests/` | `cd server && python -m pytest tests -q` | 34 test functions → 41 collected cases (parametrization) |
+| Browser end-to-end | `e2e/tests/` | `cd e2e && npx playwright test` | 11 declared tests → 14 chromium cases + 3 each on firefox/webkit |
+
+### 8.1 Wire-protocol tests (`server/tests/test_protocol.py`)
+
+Eight synchronous tests covering CRC-32C and the incremental `FrameReader`. Frames are hand-assembled with `struct` (`_build_frame` writes `!I` length = 1 + payload, then the tag byte), so the tests pin the exact on-wire byte layout rather than round-tripping through the encoder.
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_crc32c_empty` | `crc32c(b"")` is `0`. |
+| `test_crc32c_known` | `crc32c(b"hello")` is `0x9A71BB4C` — pins the Castagnoli polynomial against a known vector. |
+| `test_decode_node_frame` | A hand-built `NODE` payload (`!I` node_id, `!I` parent_id, kind byte, `!H`-prefixed UTF-8 name, presence byte + `!Q` size_hint, presence byte for mtime) decodes to one `NodeFrame` with `node_id=42`, `parent_id=1`, `kind=FILE`, `name="test.txt"`, `size_hint=1024`, `mtime_ms is None`. |
+| `test_decode_file_chunk_frame` | A `FILE_CHUNK` payload (`!I` node_id, `!Q` offset, `!I` length, checksum-kind byte, `!I` checksum, body) decodes to a `FileChunkFrame` whose `payload` and `checksum` match the CRC computed over the body. |
+| `test_decode_dir_close` | A 4-byte `DIR_CLOSE` payload decodes to `DirCloseFrame(node_id=5)`. |
+| `test_decode_session_end` | A `SESSION_END` payload (four `!Q` counters + sealed byte) decodes with `scan_done_units=100`, `body_done_bytes=5000`, `sealed is True`. |
+| `test_incremental_feed` | Feeding a frame **one byte at a time** yields zero frames on every byte except the last, which yields exactly one — the reader never emits a partial frame and never loses buffered bytes. |
+| `test_multiple_frames` | Two `DIR_CLOSE` frames fed in a single `feed()` drain as two frames in order (`node_id` 1 then 2). |
+
+### 8.2 Hardening suite (`server/tests/test_edge_cases.py`)
+
+26 test functions (41 collected cases after parametrization). The shared fixtures are `FakeWS`, which records every control message and exposes `of_type(t)`, and `make_session(tmp_path, sid)`, which opens a real session DB via `open_session_db`, calls `db.init_session(...)`, constructs `LiveSession(sid, "tok", tmp_path, db, target_dir=".")`, attaches leg `"leg1"` and swaps in the fake socket. Two helpers stream whole trees: `_send_tree(s, files)` emits NODE/FILE_OPEN/FILE_CHUNK/FILE_CLOSE per entry plus a terminal `SessionEndFrame`, and `_upload_tree` additionally asserts `try_commit()` returns `COMMIT_OK`.
+
+#### Name validation and path traversal
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_validate_node_name_rejects` | `validate_node_name` raises `ValueError` for all 8 params: `""`, `"."`, `".."`, `"a/b"`, `"a\\b"`, `"a\x00b"`, `"/"`, `"..\\.."` — empty, dot-entries, both separators, and NUL. |
+| `test_validate_node_name_accepts` | Passes without raising for all 6 params: `"file.txt"`, `"a b c"`, `"файл ❤.md"`, `".hidden"`, `"..foo"`, `"foo.."` — unicode, spaces, leading dot and dot-prefixed/suffixed names stay legal. |
+| `test_illegal_name_node_dropped_and_rejected` | A `NODE` named `".."` is not stored (`db.get_node(1) is None`), *is* recorded in `s.dropped_nodes` so the commit node-count invariant still balances, and the client receives `REJECT_FILE`. |
+| `test_traversal_name_never_escapes_payload` | A `"../evil"` node is rejected at ingest and no `evil` entry is created outside the payload root. |
+| `test_resolve_payload_path_broken_chain_raises` | `resolve_payload_path` raises `ValueError` when a node's parent id (99) was never stored — an orphan chain can never resolve to a path. |
+| `test_resolve_payload_path_normal` | For `src/app.ts`, the resolved path is `is_relative_to(staging_dir(base, sid)/"payload")` and has `name == "app.ts"`. |
+
+#### Type collisions
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_dir_on_file_collision_rejects_not_crashes` | A file `foo` is written to disk, then a `DIR` node also named `foo` arrives (mkdir over a file). Node 2 appears in a `REJECT_FILE` message and `s.state` remains `ACTIVE`. |
+| `test_file_on_dir_collision_rejects_not_crashes` | A dir `bar` exists, then `FILE_OPEN` for a file named `bar` raises `IsADirectoryError` internally; node 2 is `REJECT_FILE`-ed and the session stays `ACTIVE`. |
+
+#### Storage failure and commit termination
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_enospc_aborts_session` | `FileWriter._sync_write` is monkeypatched to raise `OSError(errno.ENOSPC)`. The session transitions to `ABORTED` and the last `SESSION_ABORT` carries `code == "storage_full"`. |
+| `test_commit_retry_capped` | A file with `final_size=100` but `accepted_offset=0` can never complete. Driving `set_state(COMMITTING)` + `try_commit()` for `MAX_COMMIT_RETRIES + 4` iterations must reach `FAILED` and emit `SESSION_ABORT` — the consecutive-no-progress cap prevents an infinite commit loop. |
+| `test_duplicate_file_open_closes_prior_writer` | A second `FILE_OPEN` for the same node installs a *different* writer object and the first writer's `_fh.closed` is true — no leaked file handle. |
+
+#### Quotas and chunk policy
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_byte_quota_aborts_session` | With `quota_max_bytes = 5`, a 10-byte chunk drives the session to `ABORTED` with `SESSION_ABORT` code `"quota_exceeded"`. |
+| `test_file_quota_aborts_session` | With `quota_max_files = 2`, two file nodes keep the session `ACTIVE`; the third aborts it with `"quota_exceeded"`. |
+| `test_duplicate_node_does_not_double_count_file_quota` | With `quota_max_files = 1`, replaying the *same* NODE frame (the resume path) leaves the session `ACTIVE` and `files_seen == 1` — re-sent metadata is idempotent against the quota. |
+| `test_oversized_chunk_nacked` | With `max_chunk_bytes = 8`, a 16-byte chunk produces `NACK_CHUNK` with `reason == "server_policy"` while the session stays `ACTIVE` — a client policy violation is recoverable, not fatal. |
+
+#### Hook loading
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_load_hook_valid` | `load_hook("os.path:join")` returns the callable; `fn("a","b") == "a/b"`. |
+| `test_load_hook_invalid_raises` | Raises `ImportError`/`AttributeError`/`ModuleNotFoundError` for all 4 params: `""`, `"no_colon"`, `"nonexistent.module:fn"`, `"os.path:nonexistent"`. |
+
+#### Per-session base directories and recovery
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_per_session_base_dir_staging_and_publish` | `SessionRegistry(global_base).create(..., target_dir="incoming", base_dir=home)` stages at `home/.incoming.sid1/payload` and creates **nothing** under `global_base`. A one-file upload commits (`COMMIT_OK`), `publish_session(home, "sid1", home/"incoming")` returns `["hello.txt"]`, the bytes match, and the staging dir is reclaimed. |
+| `test_recover_session_derives_base_from_staging_parent` | After detaching and removing a session, a *fresh* `SessionRegistry` recovers it from the staging path alone (`recover_session("sid2", home/".incoming.sid2")`); `s2.base_dir == home` — the base is derived from the staging parent, as lazy-resume does from Redis meta — and `resume(...)` returns state `ACTIVE`. |
+| `test_auth_and_meta_persist_across_recovery` | `client_meta` (`{"scope":"avatars","album":7}`), `quota_max_bytes=12345`, `quota_max_files=10` and `auth_context={"user_id":"alice"}` all survive registry teardown and `recover_session` on a new registry — authorization results are durable, not per-connection. |
+
+#### Mapped publish
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_mapped_publish_by_type` | `list_payload_files` returns sorted relative paths `["c.jpg","shots/a.jpg","shots/b.pdf"]`. `publish_session_mapped` with a per-file mapping writes `media/avatars/{a,c}.jpg` and `docs/b.pdf`, the client's `shots/` layout is **not** replicated in the target, and staging is reclaimed. |
+| `test_mapped_publish_rejects_escape_and_collision` | `MappingError` for a mapping to `"../evil"` (escape) and for two sources mapped to the same destination (collision). After both failures the staging payload is intact and the target is absent or empty — mapping validation is all-or-nothing. |
+
+#### `on_committed` hook and programmatic publish
+
+| Test | Scenario / invariant asserted |
+|------|-------------------------------|
+| `test_on_committed_notification_fields` | The event carries `session_id="oc1"`, `target_dir="out"`, `files=1`, `bytes=5`, `meta={"scope":"docs"}`, `context={"user_id":"alice"}` and an existing `staging_dir`. Returning `None` means notification only: the session stays in the registry and the target dir is never created. |
+| `test_on_committed_publish_verdict` | Returning `"publish"` publishes server-side: bytes land in `out/b.txt`, the registry entry is gone, `index.removed == ["oc2"]`, and staging is removed. |
+| `test_on_committed_hook_error_is_contained` | A hook raising `RuntimeError` still yields `COMMIT_OK` to the client, state `COMMITTED`, a live registry entry and intact staging — a broken consumer hook cannot damage a completed commit. |
+| `test_engine_publish_typed_errors` | `MfupEngine.publish` raises `SessionNotFound` for an unknown id and `NotCommitted` for an `ACTIVE` session; after commit it returns `["d.txt"]`, writes the bytes and removes the session from the index. |
+
+`make_engine` constructs `MfupEngine(MfupConfig(base_dir=tmp_path, on_committed=...))` and wires `registry` and a `FakeIndex` by hand, deliberately skipping `startup()` so the hook tests need no Redis.
+
+### 8.3 Playwright specs (`e2e/tests/`)
+
+Every spec resolves `UPLOADS` to `<repo>/uploads` and asserts on the files the server actually wrote, using `verifyTree` from `e2e/lib/gen.ts`. Chaos specs resolve `REPO` to `e2e/` and shell out to `docker compose` with that cwd, so they always act on the **e2e** stack. Tests tagged `@chromium-only` are excluded at collection time on firefox/webkit via `grepInvert`, so they never instantiate a page fixture there.
+
+| Spec file | Test(s) | Entry point | Verified behavior |
+|-----------|---------|-------------|-------------------|
+| `opfs-upload.spec.ts` | `OPFS handles upload → commit → publish → bytes verified` | `/e2e.html` | Uploads a generated OPFS tree via real `FileSystemDirectoryHandle`s (`MfupSession.uploadHandles()`), skipping if `detect()` reports no `opfs`/`createWritable`. Asserts no fatal errors, `committed.bytes === totalBytes(manifest)`, `publishStatus === 200`, and byte-exact tree at `uploads/e2e/<rootName>`. Runs on all three engines. |
+| `folder-input.spec.ts` | `webkitdirectory input upload via demo page` | `/` (index.html) | Drives the demo's `#folder-input` (`ingestFromFileList` adapter) with a real on-disk tree written by `writeTreeToDisk`. Waits for `#log` to contain `Published:`, asserts `#state-badge` is `COMMITTED` (attaching `#error-list` text as the failure message), and verifies `uploads/<rootName>` — the demo uses `targetDir "."`. Runs on all three engines. |
+| `react.spec.ts` | `react hooks: folder upload → auto-publish → bytes on disk` | `/react.html` | Smoke for `@mfup/react`: a folder set on `[data-testid=folder-input]` must drive `useMfupUpload`/`useMfupDropzone` through commit and autoPublish. Asserts `[data-testid=log]` contains `published:`, `[data-testid=state]` is exactly `committed`, `[data-testid=published]` contains the root name, and bytes match. `openReactPage` captures `pageerror`/console errors so a mount failure reports the cause rather than a bare timeout. Runs on all three engines. |
+| `react.spec.ts` | `react hooks: conflict ask dialog → overwrite → published @chromium-only` | `/react.html` | Second upload into the same target must surface the hook-rendered dialog (`[data-testid=ask]`); clicking `[data-testid=ask-overwrite]` publishes and leaves a byte-exact tree. |
+| `conflict.spec.ts` | `second upload into same target → ASK → merge_overwrite → published @chromium-only` | `/` (index.html) | Vanilla demo conflict path: upload, `#btn-reset`, re-upload → `#conflict-overlay` becomes visible → `#modal-overwrite` → `Published:` and byte-exact tree. |
+| `conflict-matrix.spec.ts` | 4 cases from `CASES` (`overwrite`/`cancel` × `on_ask`/`after_commit`), all `@chromium-only` | `/e2e.html` (`mfupE2E.run`) | Round 1 uploads v1 and publishes; round 2 re-uploads the same tree with `contentSeed = rootName + "#v2"` and an answer scheduled either mid-transfer (`on_ask`) or after commit (`after_commit`). `askSeen` must be true in every case. Overwrite: `committed.bytes === totalBytes(manifest)`, `publishStatus === 200`, and `verifyTree(..., v2seed)` proves the **new** bytes replaced the old. Cancel: `publishStatus` is null, the target still verifies against the v1 seed, local state is terminal (`aborted`/`failed`), and `expectStagingGone` polls up to 15 s for the server to remove the `.incoming.<sessionId>` directory. Each case gets a 240 s timeout. |
+| `resume.spec.ts` | `backend restart mid-upload → reconnect → resume → verified bytes @chromium-only` | `/e2e.html` | Uploads `standardManifest({ bigFileBytes: 60_000_000, smallFiles: 8 })`, polls `mfupE2E.progress()` until `bodyDoneBytes > 2_000_000`, then `docker compose kill backend` + `start backend` (SIGKILL, because `restart`'s SIGTERM lets uvicorn drain and the upload can win that race). Asserts `committed.bytes === totalBytes`, `reconnects >= 1`, `publishStatus === 200`, and a byte-exact tree at `uploads/e2e-resume/<rootName>`. 420 s timeout. Exercises Redis recovery, COMMITTING→ACTIVE revert, `FileWriter` seek+truncate, epoch fencing and client backoff. |
+| `meta-loss.spec.ts` | `backend killed mid-scan of many small files → full tree still published @chromium-only` | `/e2e.html` | Regression for a real bug where lost NODE frames produced `COMMIT_OK` for 16 of 65 files. Uses a local `manySmallFiles(600)` generator (paths `d${i%20}/s${i%5}/f-${i}.bin`, sizes `10_000 + (i*37)%8000`, ≈8.4 MB spanning several 2 MiB batch POSTs), kills the backend once `bodyDoneBytes > 100_000` so metadata is guaranteed in flight, and asserts `committed.files === 600`, `committed.bytes === totalBytes`, `publishStatus === 200`, and a byte-exact tree. Covers batch-POST transport retry at the same seq, NODE-chain re-send on reconnect, `unknown_node` NACKs, and the server's node-count commit invariant. 420 s timeout. |
+| `abort.spec.ts` | `cancel mid-upload → aborted immediately, never resurrected @chromium-only` | `/e2e.html` (`mfupE2E.runAndAbort`) | A single 48 MiB file cancelled after 4 MiB. `state` must be `aborted`, `state:aborted` must appear in the log, and **no** `state:active`/`committing`/`committed` entry may follow it — an in-flight reconnect must not resurrect an aborted session, and the upload promise must settle rather than hang awaiting a commit that can never arrive. |
+| `retention.spec.ts` | `client abort mid-transfer leaves no disk or Redis trace @chromium-only` | `/e2e.html` | Aborts after 500 KB of a 40-file / 8 MB tree; asserts `state === "aborted"`, then polls up to 15 s for `uploads/.incoming.<sid>` to disappear (cleanup runs in the WS `finally` block) and asserts `ZSCORE mfup:sessions <sid>` is empty and `EXISTS mfup:meta:<sid>` is `0`. Redis is inspected with `docker compose exec -T redis redis-cli`. |
+| `retention.spec.ts` | `no orphaned staging dirs accumulate (reconciliation net) @chromium-only` | none (compose only) | Plants a fake orphan **inside** the backend container (`/data/uploads/.incoming.orphan-*` with a 1 KB payload file, `touch -d '20 minutes ago'` to age it past the 600 s `ORPHAN_GRACE`) so it is owned by the same user as the bind mount. Confirms it exists and has no zset entry, restarts the backend, polls `/health` for readiness, then asserts startup reconciliation removed the directory. |
+
+Playwright runner configuration (`e2e/playwright.config.ts`):
+
+| Setting | Value |
+|---------|-------|
+| `testDir` | `./tests` |
+| `timeout` | `60_000` (chaos/resume specs raise their own via `test.setTimeout`) |
+| `retries` | `0` globally |
+| `workers` | `1` — sequential, because all tests share one server and one `uploads/` dir |
+| `reporter` | `[["list"]]` |
+| `use.baseURL` | `process.env.MFUP_BASE_URL ?? "http://localhost:20060"` |
+| `use.ignoreHTTPSErrors` | `true` |
+| `use.navigationTimeout` / `actionTimeout` | `30_000` each |
+| Project `chromium` | `Desktop Chrome`; runs everything including `@chromium-only` |
+| Project `firefox` | `Desktop Firefox`; `grepInvert: /@chromium-only/` |
+| Project `webkit` | `Desktop Safari`; `grepInvert: /@chromium-only/`; `retries: 1` when `process.env.CI` (absorbs sporadic macOS cold-start slowness) |
+
+### 8.4 Fixture generator (`e2e/lib/gen.ts`)
+
+Deterministic tree generator plus on-disk verifier. Its header states that `bytesFor()` **must match `demo/src/e2e.ts` byte-for-byte** — the browser generates content with the same algorithm the Node-side verifier re-derives, so no fixture bytes ever cross the wire out of band.
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `ManifestEntry` | interface | `{ path: string; size: number }`; `path` is relative and always `/`-separated. |
+| `fnv1a(s)` | function | 32-bit FNV-1a over the string's char codes, via `Math.imul`, returned unsigned. |
+| `bytesFor(key, size)` | function | Fills a `Uint8Array(size)` from an xorshift32 PRNG (`<<13`, `>>>17`, `<<5`) seeded with `fnv1a(key) \|\| 1`, taking the low byte each step. Content is a pure function of `(key, size)`. |
+| `standardManifest(opts?)` | function | The project-shaped tree (see below). |
+| `totalBytes(manifest)` | function | Sum of all entry sizes. |
+| `writeTreeToDisk(baseDir, rootName, manifest)` | function | `rm -rf`s `baseDir/rootName`, recreates every entry with `bytesFor(rootName + "/" + entry.path, size)`, returns the root path. Used by the `<input webkitdirectory>` specs, which write into `e2e/.tmp`. |
+| `verifyTree(uploadedRoot, rootName, manifest, contentSeed?)` | function | Returns an array of problem strings — `MISSING: <path>`, `SIZE: <path> expected N got M`, or `BYTES: <path> first diff at offset N`. Empty array means byte-exact. `contentSeed` defaults to `rootName`; passing a different seed (e.g. `rootName + "#v2"`) is how the conflict matrix proves an overwrite actually replaced bytes. |
+
+`standardManifest({ bigFileBytes?, smallFiles? })` composition:
+
+| Entries | Path pattern | Size |
+|---------|--------------|------|
+| `smallFiles` (default 60) | `${dir}/file-${i}.ts`, cycling `dirs = ["src", "src/components", "src/utils", "assets", "assets/img", "deep/a/b/c/d"]` | `512 + ((i * 997) % 7000)` → 512–7511 bytes |
+| 1 | `README.md` | 3000 |
+| 1 | `empty.txt` | 0 (zero-length file coverage) |
+| 1 | `файл — тест ❤.txt` | 2048 (non-ASCII name coverage) |
+| 1 | `assets/img/photo.bin` | 300000 |
+| 1 | `bundle.bin` | `bigFileBytes` (default 2000000) |
+
+The default manifest is 65 entries totalling 2,560,458 bytes, and covers nested directories up to five levels deep, a unicode filename, an empty file and one large file in a single tree. Specs override the knobs for their purpose: `{smallFiles: 8, bigFileBytes: 60_000_000}` for resume, `{smallFiles: 30, bigFileBytes: 1_500_000}` for the conflict matrix, `{smallFiles: 40, bigFileBytes: 8_000_000}` for retention, `{smallFiles: 20, bigFileBytes: 200_000}` for the conflict spec.
+
+### 8.5 E2E stack topology (`e2e/docker-compose.yaml` + `e2e/Caddyfile`)
+
+Six services; only Caddy publishes a host port. Everything the browser touches enters through `localhost:20060`.
+
+| Service | Image | Ports | Command | Environment | Volumes |
+|---------|-------|-------|---------|-------------|---------|
+| `redis` | `redis:7-alpine` | `expose 6379` | image default | — | — |
+| `backend` | `python:3.12-slim` | `expose 8070` | `pip install --quiet fastapi uvicorn[standard] websockets redis crc32c && python -m uvicorn mfup_fastapi.app:app --host 0.0.0.0 --port 8070 --log-level info` (workdir `/app`, `depends_on: redis`) | `MFUP_BASE_DIR=/data/uploads`, `REDIS_URL=redis://redis:6379/0`, `MFUP_ADMIN_TOKEN=dev-admin-token`, `PYTHONPATH=/app/mfup-core:/app/mfup-fastapi` | `../server:/app`, `../uploads:/data/uploads` |
+| `trivial` | `python:3.12-slim` | `expose 8071` | `pip install --quiet fastapi uvicorn[standard] python-multipart && python -m uvicorn app:app --host 0.0.0.0 --port 8071 --log-level info` | `UPLOAD_DIR=/data/uploads/trivial-target` | `../benchmarks/trivial-server:/app`, `../uploads:/data/uploads` |
+| `frontend` | `node:20-alpine` | `expose 3000` | `npm ci && npm run dev` | — | `../demo:/app`, `../packages:/packages`, anonymous `/app/node_modules` |
+| `frontend-build` | `node:20-alpine` | — | `npm ci && npm run build` | — | `../demo:/app`, `../packages:/packages`, anonymous `/app/node_modules` |
+| `caddy` | `caddy:2-alpine` | **`20060:80`** | image default (`depends_on: backend, frontend-build, trivial`) | — | `./Caddyfile:/etc/caddy/Caddyfile:ro`, `../demo/dist:/srv/dist:ro` |
+
+Two deliberate constraints are documented in the file itself. `frontend` sits behind the `dev` profile so a plain `docker compose up` does not start it — otherwise it and `frontend-build` would `npm ci` concurrently into the same bind-mounted `../demo` and clobber each other's `node_modules` (`vite: not found`). And both node services run `npm ci && npm run …` rather than `npx vite`, which would fetch the latest vite from the registry instead of the lockfile's. The anonymous `/app/node_modules` volume keeps installed packages out of the bind-mounted host directory and unshared between containers.
+
+Caddy's `:80` site block routes in this order:
+
+| Route | Handling |
+|-------|----------|
+| `/mfup/*` | `reverse_proxy backend:8070` — all protocol traffic, HTTP and the WebSocket upgrade |
+| `/health` | `reverse_proxy backend:8070` — the readiness probe used by CI and the retention spec |
+| `/trivial/*` | `uri strip_prefix /trivial` then `reverse_proxy trivial:8071` — the benchmark baseline server |
+| everything else | `root * /srv/dist`, `try_files {path} /index.html`, `file_server` — the built demo bundle with SPA fallback |
+
+Request flow: the browser loads `http://localhost:20060/` (or `/e2e.html`, `/react.html`) → Caddy serves static files from `demo/dist`, which `frontend-build` produced into the bind mount and Caddy mounts read-only. Client protocol calls go to `/mfup/*` → Caddy → `backend:8070` (uvicorn running `mfup_fastapi.app:app` directly off the `../server` bind mount via `PYTHONPATH`, no editable install). The backend persists session state in `redis:6379` and writes payloads under `/data/uploads`, which is the host's `uploads/` directory — the same directory `verifyTree` reads from Node. Chaos specs bypass HTTP entirely and manipulate containers with `docker compose kill/start/restart/exec` run from `e2e/`.
+
+### 8.6 Dev stack (`docker-compose.yaml`)
+
+The root compose file is described in its own header as **the main application of the repo**: the consumer example `examples/multiuser-scopes` running exactly as an outside integrator would run it — server dependencies from PyPI, client dependencies from npm, nothing built from this repo's sources. `docker compose up -d` serves `http://localhost:20061`, and uploads land in `./uploads/<user_id>/<scope>/…` on the host.
+
+| Service | Image | Ports | Command | Environment | Volumes |
+|---------|-------|-------|---------|-------------|---------|
+| `redis` | `redis:7-alpine` | `expose 6379` | image default | — | — |
+| `server` | `python:3.12-slim` | `expose 8090` | `pip install --quiet -r requirements.txt && python -m uvicorn app:app --host 0.0.0.0 --port 8090 --log-level info` (workdir `/app`, `depends_on: redis`) | `DEMO_DATA_DIR=/data/uploads`, `REDIS_URL=redis://redis:6379/0` | `./examples/multiuser-scopes/server:/app`, `./uploads:/data/uploads` |
+| `client` | `node:20-alpine` | **`20061:20061`** | `npm install --no-audit --no-fund && npm run dev` (vite dev server with hot reload; its `/api` proxy targets the server service) | `EXAMPLE_BACKEND_URL=http://server:8090` | `./examples/multiuser-scopes/client:/app`, anonymous `/app/node_modules` |
+
+Differences from the e2e stack:
+
+| Aspect | Dev stack (root) | E2E stack (`e2e/`) |
+|--------|------------------|--------------------|
+| Host port | `20061` (vite dev server) | `20060` (Caddy) |
+| Edge | none — vite dev server proxies `/api` to the backend | Caddy reverse proxy with four route groups |
+| Application | `examples/multiuser-scopes` (`app:app`) | `mfup_fastapi.app:app` |
+| Package source | PyPI `requirements.txt` + npm registry — nothing built from repo sources | `../server` bind mount on `PYTHONPATH`, `../packages` aliased into the demo build |
+| Frontend | vite dev server, hot reload | pre-built static `demo/dist` served by Caddy (`frontend-build`), optional `dev`-profile hot-reload service |
+| Backend port | 8090 | 8070 |
+| Base dir env | `DEMO_DATA_DIR` | `MFUP_BASE_DIR` |
+| Extras | — | `trivial` benchmark baseline server, `MFUP_ADMIN_TOKEN=dev-admin-token` |
+| Shared | `redis:7-alpine`, `./uploads` bind-mounted to `/data/uploads` | same |
+
+### 8.7 npm scripts and CI
+
+| Script | Package | Command | Effect |
+|--------|---------|---------|--------|
+| `build` | root (`mfup-monorepo`) | `npm run build -w @mfup/client && npm run build -w @mfup/react` | Builds both npm workspaces (`packages/client`, `packages/react`) in dependency order. |
+| `check` | root | `npm run check -w @mfup/client && npm run check -w @mfup/react` | Runs each workspace's own check (type-check/lint) task. |
+| `test` | `e2e` (`mfup-e2e`) | `playwright test` | Runs the Playwright suite against `MFUP_BASE_URL` (default `http://localhost:20060`). |
+
+The root package is `private: true` with `workspaces: ["packages/client", "packages/react"]`; `e2e` is `private: true`, `type: "module"`, with `@playwright/test ^1.49.0` as its only devDependency. Python tests have no npm entry point — CI runs `cd server && python -m pytest tests -q`.
+
+CI (`.github/workflows/e2e.yml`) runs three jobs: `server-unit` installs `./server/mfup-core` and `./server/mfup-fastapi[dev]` and runs pytest; `packaging` builds and `npm pack`s both workspaces, installs the tarballs into a scratch project and asserts `MfupSession`, `FrameTag.NODE === 1` and `useMfupUpload` resolve, then `python -m build` + `twine check` both wheels and asserts `len(MfupEngine(MfupConfig()).router.routes) == 8`; `linux-e2e` brings up `docker compose -f e2e/docker-compose.yaml`, installs Chromium/Firefox/WebKit, waits up to 120 s for `/health` plus an `/e2e.html` response containing `mfupE2E`, and runs `npx playwright test`, dumping backend logs on failure.
+
+### 8.8 Invariants the suites protect
+
+**Resume.** Killing the backend with SIGKILL mid-upload never loses or duplicates bytes: the client reconnects, RESUMEs, and the published tree matches the source byte-for-byte with `committed.bytes` equal to the manifest total (`resume.spec.ts`). A recovered session reconstructs its `base_dir` from the staging directory's parent, and its quotas, `auth_context` and `client_meta` survive a registry restart (`test_recover_session_derives_base_from_staging_parent`, `test_auth_and_meta_persist_across_recovery`). Replayed NODE frames are idempotent and do not double-count the file quota (`test_duplicate_node_does_not_double_count_file_quota`).
+
+**Metadata loss.** A commit can never report success on an incomplete tree. Killing the backend while metadata for hundreds of files is in flight still yields `committed.files === 600` and a byte-exact tree — the server's node-count invariant, `unknown_node` NACKs, same-seq batch retry and NODE-chain re-send together close the gap (`meta-loss.spec.ts`). Rejected nodes are counted in `dropped_nodes` precisely so this invariant stays balanced (`test_illegal_name_node_dropped_and_rejected`).
+
+**Conflict resolution.** The overwrite question is non-blocking: the answer may arrive mid-transfer or after commit, and all four combinations behave identically per action (`conflict-matrix.spec.ts`). Overwrite publishes the *new* bytes — verified against the v2 content seed, not merely "a file exists". Cancel leaves the target byte-identical to v1, attempts no publish, drives the session to a terminal local state, and leaves no staging directory behind.
+
+**Retention / GC.** A session that ends by abort or cancel leaves nothing: no `.incoming.<sid>` directory, no `mfup:sessions` zset member, no `mfup:meta:<sid>` hash (`retention.spec.ts`). Staging that outlives its Redis registration past the 600 s `ORPHAN_GRACE` window is removed by startup reconciliation. Successful publish also reclaims staging, both in-process (`test_per_session_base_dir_staging_and_publish`, `test_mapped_publish_by_type`) and server-side via the `on_committed` `"publish"` verdict.
+
+**Abort semantics.** Cancel is instant and terminal. The session goes to `aborted` and no subsequent event may move it to `active`, `committing` or `committed`; the upload promise settles rather than waiting for a commit that can never arrive (`abort.spec.ts`).
+
+**Containment.** No name can escape the payload root: separators, dot-entries, NUL and empty names are rejected at ingest, an unresolvable parent chain raises, resolved paths are asserted `is_relative_to` the payload root, and mapped publish rejects both `..` escapes and destination collisions without moving anything.
+
+**Failure containment.** A full disk aborts with `storage_full`, quota breaches abort with `quota_exceeded`, oversized chunks are NACKed with `server_policy` while the session stays alive, type collisions reject a node rather than crashing the session, an unsatisfiable commit terminates at `MAX_COMMIT_RETRIES` instead of looping, a duplicate `FILE_OPEN` closes the prior file handle, and an exception from a consumer's `on_committed` hook cannot damage a completed commit.
+
+---
+
+## 9. Project Structure
 
 ```
-/workspace
-├── server/                      Python — MFUP/2 server (§3)
-│   ├── mfup/
-│   │   ├── app.py               FastAPI app: 8 routes, lifespan, sweeper
-│   │   ├── session_manager.py   LiveSession state machine, FileWriter, SessionRegistry
-│   │   ├── storage.py           SQLite SessionDB, staging paths, traversal guards
-│   │   ├── protocol.py          Binary frame decoder, crc32c, PROTOCOL_VERSION
-│   │   ├── redis_index.py       Expiry sorted set + per-session metadata hash
-│   │   ├── publish.py           Staging → target_dir rename, conflict merge
-│   │   └── __main__.py          python -m mfup → uvicorn on 0.0.0.0:8070
-│   ├── tests/test_protocol.py   8 decoder tests (the only test file)
-│   └── pyproject.toml           mfup-server 0.1.0, requires-python >=3.10
+/
+├── packages/                      # npm workspaces (published)
+│   ├── client/                    # @mfup/client 0.2.3 — zero runtime deps
+│   │   └── src/
+│   │       ├── session.ts         # MfupSession: state machine, pump, commit loop (1604 ln)
+│   │       ├── protocol.ts        # wire types, encoders, CRC-32C            (466 ln)
+│   │       ├── data-channel.ts    # streaming/batch transport, retry, XHR    (422 ln)
+│   │       ├── ingestion.ts       # 4 tree-walk adapters → DiscoveredNode    (330 ln)
+│   │       ├── errors.ts          # MfupError + 25 codes, 17 factories       (329 ln)
+│   │       ├── control.ts         # WebSocket wrapper, 14-event bus          (237 ln)
+│   │       ├── progress.ts        # ProgressTracker, blended fraction        (187 ln)
+│   │       ├── probe.ts           # duplex:"half" capability probe           (140 ln)
+│   │       ├── index.ts           # re-export barrel                          (92 ln)
+│   │       └── dnd.ts             # sourceFromDataTransfer / sourceFromInput  (87 ln)
+│   └── react/                     # @mfup/react 0.2.0 — peer: client + react>=18
+│       └── src/{index,context,useMfupSession,useMfupUpload,useMfupDropzone}.ts
 │
-├── client/                      TypeScript — @mfup/client browser SDK (§4)
-│   ├── src/
-│   │   ├── index.ts             Re-export barrel (no logic)
-│   │   ├── session.ts           MfupSession orchestrator — 1002 lines
-│   │   ├── protocol.ts          Binary frame encoders, crc32c, control-msg types
-│   │   ├── data-channel.ts      HTTP data plane: streaming + batch modes
-│   │   ├── control.ts           Typed WebSocket wrapper
-│   │   ├── ingestion.ts         4 browser file-API adapters, blobChunks
-│   │   ├── probe.ts             duplex:"half" capability probe
-│   │   ├── errors.ts            MfupError, 22 codes, 5 layers
-│   │   └── progress.ts          ProgressTracker, blended monotonic fraction
-│   ├── package.json             ESM only, zero runtime dependencies
-│   └── tsconfig.json            ES2022, strict, declaration output to dist/
+├── server/                        # PyPI packages
+│   ├── mfup-core/mfup_core/       # 0.2.0 — deps: redis>=5, crc32c>=2.7
+│   │   ├── session_manager.py     # LiveSession, FileWriter, SessionRegistry
+│   │   ├── storage.py             # SessionDB (SQLite), path resolution
+│   │   ├── protocol.py            # frame codec, FrameReader, SessionState
+│   │   ├── hooks.py               # authorize / map_file / on_committed
+│   │   ├── publish.py             # rename staging → target, mapped publish
+│   │   ├── redis_index.py         # SessionIndex (expiry zset + meta hash)
+│   │   └── __init__.py            # 26 public exports
+│   ├── mfup-fastapi/mfup_fastapi/ # 0.2.0 — pins mfup-core==0.2.0
+│   │   ├── engine.py              # MfupEngine: routes, lifecycle, sweeper
+│   │   ├── config.py              # MfupConfig + from_env()
+│   │   ├── app.py / __main__.py   # standalone entry points
+│   │   └── __init__.py            # create_app, typed publish errors
+│   └── tests/                     # pytest: 34 functions → 41 cases
+│       ├── test_edge_cases.py     # hardening: names, quotas, ENOSPC, hooks
+│       └── test_protocol.py       # CRC vectors + FrameReader
 │
-├── demo/                     Vite demo — two pages (§5)
-│   ├── src/demo.ts              Canonical MfupSession usage
-│   ├── src/compare.ts           MFUP vs file-by-file race harness
-│   ├── index.html               Main demo (markup + all CSS)
-│   ├── compare.html             Comparison page
-│   └── vite.config.ts           @mfup/client alias → ../client/src, 4 proxies
+├── examples/multiuser-scopes/     # CONSUMER example — published packages only
+│   ├── server/app.py              # authorize hook → per-user base_dir + scope
+│   └── client/src/{App.tsx,main.tsx}
 │
-├── benchmarks/trivial-server/app.py        Benchmark control: naive POST-per-file server (§6.3)
+├── demo/                          # internal dev/test playground (Vite 6, 4 pages)
+│   ├── src/{demo,compare,e2e}.ts, src/react-demo.tsx
+│   ├── {index,compare,e2e,react}.html
+│   └── vite.config.ts             # aliases packages by SOURCE path
 │
-├── docs/
-│   ├── FULL.md                  This document
-│   └── MFUP_RU.md               Russian design note — motivation, benchmarks (see §7.1)
+├── e2e/                           # Playwright: 11 tests, chromium/firefox/webkit
+│   ├── tests/*.spec.ts            # incl. chaos: resume, meta-loss, abort, retention
+│   ├── lib/gen.ts                 # deterministic manifests + byte-exact verifier
+│   ├── docker-compose.yaml        # 6 services, Caddy on :20060
+│   └── Caddyfile
 │
-├── docker-compose.yaml          6 services, no Dockerfiles (§6.1)
-├── Caddyfile                    Single-origin routing, host port 20060 (§6.2)
-├── repomix.sh                   Repo → single XML for LLM ingestion
-└── uploads/                     Runtime storage (gitignored) — staging + published trees
+├── benchmarks/trivial-server/     # naive POST-per-file baseline (the comparison)
+├── docker-compose.yaml            # MAIN app: the consumer example on :20061
+├── uploads/                       # shared bind mount — staging + published trees
+└── docs/
+    ├── FULL.md                    # this document
+    ├── EXTENDING.md               # integration contract (hooks, security, topologies)
+    ├── CLIENT.md                  # browser SDK reference
+    └── MFUP_RU.md                 # original design notes (RU)
 ```
-
-**Approximate sizes** (tokens, excluding lockfiles): server 18.4k across 11 files · client 23.2k across 11 files · example 13.8k across 7 files · infrastructure 0.9k across 4 files.
