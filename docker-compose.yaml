@@ -54,8 +54,8 @@ services:
     command: sh -c "npm ci && npm run dev"
     volumes:
       - ./example:/app
-      # vite alias ../packages/client/src → /packages/client/src in-container
-      - ./packages/client:/packages/client
+      # vite aliases ../packages/{client,react}/src → /packages/... in-container
+      - ./packages:/packages
       # per-container node_modules (anonymous volume): never extract npm
       # packages into the bind-mounted host dir, and never share them.
       - /app/node_modules
@@ -66,7 +66,7 @@ services:
     command: sh -c "npm ci && npm run build"
     volumes:
       - ./example:/app
-      - ./packages/client:/packages/client
+      - ./packages:/packages
       - /app/node_modules
 
   caddy:
