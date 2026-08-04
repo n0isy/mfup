@@ -35,12 +35,12 @@ services:
     environment:
       UPLOAD_DIR: /data/uploads/trivial-target
     volumes:
-      - ./trivial-server:/app
+      - ./benchmarks/trivial-server:/app
       - ./uploads:/data/uploads
 
   # Optional hot-reload dev server. Behind the `dev` profile so a plain
   # `docker compose up` does NOT start it — otherwise it and frontend-build
-  # both `npm ci` into the same bind-mounted ./example concurrently, clobber
+  # both `npm ci` into the same bind-mounted ./demo concurrently, clobber
   # each other's node_modules, and the build fails ("vite: not found").
   frontend:
     image: node:20-alpine
@@ -53,7 +53,7 @@ services:
     # breaks the build when local resolution hiccups.
     command: sh -c "npm ci && npm run dev"
     volumes:
-      - ./example:/app
+      - ./demo:/app
       # vite aliases ../packages/{client,react}/src → /packages/... in-container
       - ./packages:/packages
       # per-container node_modules (anonymous volume): never extract npm
@@ -65,7 +65,7 @@ services:
     working_dir: /app
     command: sh -c "npm ci && npm run build"
     volumes:
-      - ./example:/app
+      - ./demo:/app
       - ./packages:/packages
       - /app/node_modules
 
@@ -79,4 +79,4 @@ services:
       - "20060:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./example/dist:/srv/dist:ro
+      - ./demo/dist:/srv/dist:ro

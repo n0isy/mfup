@@ -1,5 +1,12 @@
 # MFUP/2 — resumable multi-file upload
 
+[![e2e](https://github.com/n0isy/mfup/actions/workflows/e2e.yml/badge.svg)](https://github.com/n0isy/mfup/actions/workflows/e2e.yml)
+[![release](https://github.com/n0isy/mfup/actions/workflows/release.yml/badge.svg)](https://github.com/n0isy/mfup/actions/workflows/release.yml)
+[![npm @mfup/client](https://img.shields.io/npm/v/%40mfup%2Fclient?label=%40mfup%2Fclient&color=cb3837)](https://www.npmjs.com/package/@mfup/client)
+[![npm @mfup/react](https://img.shields.io/npm/v/%40mfup%2Freact?label=%40mfup%2Freact&color=cb3837)](https://www.npmjs.com/package/@mfup/react)
+[![PyPI mfup-core](https://img.shields.io/pypi/v/mfup-core?label=mfup-core&color=3775a9)](https://pypi.org/project/mfup-core/)
+[![PyPI mfup-fastapi](https://img.shields.io/pypi/v/mfup-fastapi?label=mfup-fastapi&color=3775a9)](https://pypi.org/project/mfup-fastapi/)
+
 Move whole directory trees (`node_modules`-scale: tens of thousands of small
 files) from a browser to a server — resumable, interactive, atomic.
 
@@ -22,10 +29,20 @@ files) from a browser to a server — resumable, interactive, atomic.
 
 | Package | Registry | What |
 |---|---|---|
-| [`packages/client`](packages/client) | npm `@mfup/client` | Browser SDK: session, ingestion (DnD/pickers), events + snapshot store |
-| [`packages/react`](packages/react) | npm `@mfup/react` | React hooks: `useMfupUpload`, `useMfupDropzone`, `useMfupSession` |
-| [`server/mfup-core`](server/mfup-core) | PyPI `mfup-core` | Engine: protocol, session state machine, storage, publish, hooks |
-| [`server/mfup-fastapi`](server/mfup-fastapi) | PyPI `mfup-fastapi` | `MfupEngine` + `APIRouter` to mount into your FastAPI, or standalone server |
+| [`packages/client`](packages/client) | npm [`@mfup/client`](https://www.npmjs.com/package/@mfup/client) | Browser SDK: session, ingestion (DnD/pickers), events + snapshot store |
+| [`packages/react`](packages/react) | npm [`@mfup/react`](https://www.npmjs.com/package/@mfup/react) | React hooks: `useMfupUpload`, `useMfupDropzone`, `useMfupSession` |
+| [`server/mfup-core`](server/mfup-core) | PyPI [`mfup-core`](https://pypi.org/project/mfup-core/) | Engine: protocol, session state machine, storage, publish, hooks |
+| [`server/mfup-fastapi`](server/mfup-fastapi) | PyPI [`mfup-fastapi`](https://pypi.org/project/mfup-fastapi/) | `MfupEngine` + `APIRouter` to mount into your FastAPI, or standalone server |
+
+Around the packages:
+
+- [`examples/`](examples) — **consumer-grade examples** built strictly on the
+  published packages (multiuser + scopes pattern), plus the validation
+  record of the guide below;
+- [`demo/`](demo) — the internal dev/test playground (e2e harness pages);
+  not an integration reference;
+- [`benchmarks/`](benchmarks) — the naive POST-per-file baseline and the
+  race methodology.
 
 ## Quick start (dev stack)
 

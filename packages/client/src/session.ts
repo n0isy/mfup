@@ -325,7 +325,13 @@ export class MfupSession {
   private _commitRetry = false;
 
   constructor(config: MfupSessionConfig) {
-    this.serverUrl = config.serverUrl.replace(/\/$/, "");
+    // Accept page-relative server URLs too ("/api/uploads") — consumers
+    // mounting the router under a prefix naturally write that, and the
+    // WebSocket URL derivation needs an absolute http(s) base.
+    const resolved = typeof location !== "undefined"
+      ? new URL(config.serverUrl, location.origin).toString()
+      : config.serverUrl;
+    this.serverUrl = resolved.replace(/\/$/, "");
     this.targetDir = config.targetDir ?? ".";
     this.meta = config.meta;
     this.sessionId = config.sessionId ?? genUUID();

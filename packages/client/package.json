@@ -1,8 +1,15 @@
 {
   "name": "@mfup/client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MFUP/2 resumable multi-file upload client: folder drag-and-drop, streaming or batched transport, interactive conflict handling, reconnect/resume",
-  "keywords": ["upload", "resumable", "multi-file", "drag-and-drop", "websocket", "mfup"],
+  "keywords": [
+    "upload",
+    "resumable",
+    "multi-file",
+    "drag-and-drop",
+    "websocket",
+    "mfup"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -10,7 +17,9 @@
     "directory": "packages/client"
   },
   "homepage": "https://github.com/n0isy/mfup#readme",
-  "bugs": { "url": "https://github.com/n0isy/mfup/issues" },
+  "bugs": {
+    "url": "https://github.com/n0isy/mfup/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -22,7 +31,10 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit",

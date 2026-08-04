@@ -272,7 +272,7 @@ The codec asymmetry is worth noting: the server only ever *decodes* binary frame
 
 ### 1.9 Deployment shape
 
-The whole stack runs from one `docker compose` file with **no Dockerfiles** — stock images, bind-mounted source, dependencies installed in each service's `command`. Caddy is the single published port (`20060:80`) and fronts everything on one origin, so the browser makes no cross-origin request and the stack carries no CORS configuration at all. A deliberately naive baseline server (`trivial-server/`) is deployed alongside as the benchmark control. See §6.
+The whole stack runs from one `docker compose` file with **no Dockerfiles** — stock images, bind-mounted source, dependencies installed in each service's `command`. Caddy is the single published port (`20060:80`) and fronts everything on one origin, so the browser makes no cross-origin request and the stack carries no CORS configuration at all. A deliberately naive baseline server (`benchmarks/trivial-server/`) is deployed alongside as the benchmark control. See §6.
 
 **The server is inherently single-process.** `SessionRegistry` is an in-memory dict; a second uvicorn worker would not see sessions created by the first (`registry.get()` → `None` → `410` on data POSTs). Redis indexes sessions for expiry but does not share the live registry.
 
@@ -1561,13 +1561,13 @@ A Vite-based browser demo living at `/workspace/example`. It ships two independe
 
 | Path | Role |
 |------|------|
-| `example/index.html` | Main demo page — markup + all CSS, loads `/src/demo.ts` as a module |
-| `example/src/demo.ts` | Main demo logic; canonical `MfupSession` usage example |
-| `example/compare.html` | Comparison page — two-lane "race" markup, loads `/src/compare.ts` |
-| `example/src/compare.ts` | MFUP lane + traditional-POST lane, timers, flattening helpers |
-| `example/vite.config.ts` | Dev server, backend proxies, `@mfup/client` alias, dual-entry build |
-| `example/package.json` | `mfup-demo`, private, ESM; only `vite` + `typescript` as devDeps |
-| `example/tsconfig.json` | ES2022 / ESNext / `bundler` resolution, strict; includes client sources |
+| `demo/index.html` | Main demo page — markup + all CSS, loads `/src/demo.ts` as a module |
+| `demo/src/demo.ts` | Main demo logic; canonical `MfupSession` usage example |
+| `demo/compare.html` | Comparison page — two-lane "race" markup, loads `/src/compare.ts` |
+| `demo/src/compare.ts` | MFUP lane + traditional-POST lane, timers, flattening helpers |
+| `demo/vite.config.ts` | Dev server, backend proxies, `@mfup/client` alias, dual-entry build |
+| `demo/package.json` | `mfup-demo`, private, ESM; only `vite` + `typescript` as devDeps |
+| `demo/tsconfig.json` | ES2022 / ESNext / `bundler` resolution, strict; includes client sources |
 
 ---
 
@@ -1768,7 +1768,7 @@ export default defineConfig({
 
 | Key | Value | Effect |
 |-----|-------|--------|
-| `root` | `"."` | Project root is `example/` |
+| `root` | `"."` | Project root is `demo/` |
 | `publicDir` | `"public"` | Static passthrough (directory exists and is empty) |
 | `resolve.alias` | `@mfup/client` → `../client/src` | Bare-specifier prefix rewrite to the SDK's TypeScript sources |
 | `build.rollupOptions.input` | `main`, `compare` | Two HTML entry points → multi-page build into `dist/` |
@@ -1796,8 +1796,8 @@ The more specific `/mfup/control` key is declared before `/mfup`; this ordering 
 
 **Not a published package and not a workspace link — a build-time path alias to source.** Verified evidence:
 
-- `example/package.json` declares `"dependencies": {}` — empty. Only `vite ^6.0.0` and `typescript ^5.7.0` are devDependencies.
-- `example/node_modules/@mfup` does not exist.
+- `demo/package.json` declares `"dependencies": {}` — empty. Only `vite ^6.0.0` and `typescript ^5.7.0` are devDependencies.
+- `demo/node_modules/@mfup` does not exist.
 - There is no root-level `package.json`, so there is no npm/pnpm workspace.
 - Resolution happens solely through `resolve.alias["@mfup/client"] → path.resolve(__dirname, "../client/src")`.
 
@@ -1825,9 +1825,9 @@ All MFUP traffic therefore goes back to whatever origin served the page, and the
 docker compose up
 ```
 
-`caddy` serves `./example/dist` — the *built* output produced by `frontend-build` — while the `frontend` dev-server service is only `expose`d on the compose network, not published. So `http://localhost:20060` reaches the production build; reaching the hot-reloading Vite dev server requires publishing port 3000 or entering the network yourself.
+`caddy` serves `./demo/dist` — the *built* output produced by `frontend-build` — while the `frontend` dev-server service is only `expose`d on the compose network, not published. So `http://localhost:20060` reaches the production build; reaching the hot-reloading Vite dev server requires publishing port 3000 or entering the network yourself.
 
-**Standalone npm scripts** (`example/package.json` — two scripts):
+**Standalone npm scripts** (`demo/package.json` — two scripts):
 
 | Script | Command | Result |
 |--------|---------|--------|
@@ -1851,10 +1851,10 @@ Six services. Five use `expose` (visible only inside the compose network); `cadd
 |---|---|---|---|---|---|---|
 | `redis` | `redis:7-alpine` | `expose: 6379` | no | none | none | — |
 | `backend` | `python:3.12-slim` | `expose: 8070` | no | `./server:/app`, `./uploads:/data/uploads` | `MFUP_BASE_DIR=/data/uploads`, `REDIS_URL=redis://redis:6379/0` | `redis` |
-| `trivial` | `python:3.12-slim` | `expose: 8071` | no | `./trivial-server:/app`, `./uploads:/data/uploads` | `UPLOAD_DIR=/data/uploads/trivial-target` | — |
+| `trivial` | `python:3.12-slim` | `expose: 8071` | no | `./benchmarks/trivial-server:/app`, `./uploads:/data/uploads` | `UPLOAD_DIR=/data/uploads/trivial-target` | — |
 | `frontend` | `node:20-alpine` | `expose: 3000` | no | `./example:/app`, `./client:/client` | none | — |
 | `frontend-build` | `node:20-alpine` | none | no | `./example:/app`, `./client:/client` | none | — |
-| `caddy` | `caddy:2-alpine` | `80` in container | **yes — `20060:80`** | `./Caddyfile:/etc/caddy/Caddyfile:ro`, `./example/dist:/srv/dist:ro` | none | `backend`, `frontend-build`, `trivial` |
+| `caddy` | `caddy:2-alpine` | `80` in container | **yes — `20060:80`** | `./Caddyfile:/etc/caddy/Caddyfile:ro`, `./demo/dist:/srv/dist:ro` | none | `backend`, `frontend-build`, `trivial` |
 
 Startup commands:
 
@@ -1871,8 +1871,8 @@ Key behaviors:
 - **No `healthcheck:` blocks are defined anywhere in the file.** Readiness is expressed only through `depends_on`, which waits for container *start*, not for the process inside to be serving. Both Python services do expose an HTTP `/health` endpoint, but Compose is not configured to poll them.
 - **Redis has no volume.** Nothing is mounted at `/data`, so the Redis dataset lives only in the container's writable layer. Inferred: the session index is therefore treated as reconstructible or expendable across container recreation, not as durable state. Note the consequence — losing Redis loses the ability to *find* live sessions at restart, even though their SQLite state survives on disk (see §7.1).
 - **`./uploads` is shared by two writers.** `backend` treats `/data/uploads` as its root (`MFUP_BASE_DIR`), while `trivial` writes under `/data/uploads/trivial-target` (`UPLOAD_DIR`). Both point at the same host directory, so a side-by-side benchmark run leaves both result trees under one path for comparison.
-- **`frontend-build` is a one-shot job.** It has no port and no long-running process — `vite build` writes `./example/dist` and the container exits. `caddy` serves that same directory read-only at `/srv/dist`, which is why `caddy` lists `frontend-build` in `depends_on`. Because `depends_on` does not wait for completion, Caddy can come up while the build is still running and serve an empty or stale `dist` (inferred from the absence of a completion condition).
-- **`frontend` (the Vite dev server) is not wired into the published path.** It is not referenced by the Caddyfile and not in Caddy's `depends_on`, and its port 3000 is `expose`d rather than published, so with the file as written the dev server is not reachable from the host. Inferred: it is an opt-in development service intended to be reached from inside the compose network — supported by `example/vite.config.ts`, whose `server.proxy` block re-implements the Caddy routes against the compose DNS names.
+- **`frontend-build` is a one-shot job.** It has no port and no long-running process — `vite build` writes `./demo/dist` and the container exits. `caddy` serves that same directory read-only at `/srv/dist`, which is why `caddy` lists `frontend-build` in `depends_on`. Because `depends_on` does not wait for completion, Caddy can come up while the build is still running and serve an empty or stale `dist` (inferred from the absence of a completion condition).
+- **`frontend` (the Vite dev server) is not wired into the published path.** It is not referenced by the Caddyfile and not in Caddy's `depends_on`, and its port 3000 is `expose`d rather than published, so with the file as written the dev server is not reachable from the host. Inferred: it is an opt-in development service intended to be reached from inside the compose network — supported by `demo/vite.config.ts`, whose `server.proxy` block re-implements the Caddy routes against the compose DNS names.
 
 ### 6.2 Reverse proxy and single-origin routing (`Caddyfile`)
 
@@ -1891,7 +1891,7 @@ The single-origin arrangement means the browser sees exactly one host and port f
 
 The fallback `try_files {path} /index.html` is the standard SPA pattern. Note that the built demo has two HTML entry points; `compare.html` is served directly by `file_server` because it exists on disk, before the `/index.html` fallback applies.
 
-### 6.3 Baseline upload server (`trivial-server/app.py`)
+### 6.3 Baseline upload server (`benchmarks/trivial-server/app.py`)
 
 A **benchmark control, not production code** — its own docstring reads "Trivial file-by-file upload server for comparison demo." It exists solely to give the demo a naive upload implementation to measure MFUP against: one HTTP request per file, no protocol on top. 47 lines of FastAPI, two routes.
 
@@ -1932,7 +1932,7 @@ Seven entries, all generated or runtime artifacts:
 | Pattern | What it excludes |
 |---|---|
 | `node_modules/` | npm dependencies installed by `frontend` / `frontend-build` |
-| `dist/` | Vite build output, including `example/dist` that Caddy serves |
+| `dist/` | Vite build output, including `demo/dist` that Caddy serves |
 | `*.egg-info/` | Python packaging metadata |
 | `__pycache__/` | Python bytecode caches |
 | `.vite/` | Vite's dependency-optimization cache |
@@ -1941,7 +1941,7 @@ Seven entries, all generated or runtime artifacts:
 
 `uploads/` is the significant one: it is the only durable state the stack produces, holding completed uploads, in-progress `.incoming.<uuid>` staging entries written by the MFUP server, and the `trivial-target/` subtree. Confirmed by `git ls-files uploads` — zero tracked files.
 
-Note that `dist/` being ignored while `caddy` mounts `./example/dist:/srv/dist:ro` is what makes `frontend-build` load-bearing: the directory Caddy serves does not exist in a fresh clone and must be produced by that service before the site has content.
+Note that `dist/` being ignored while `caddy` mounts `./demo/dist:/srv/dist:ro` is what makes `frontend-build` load-bearing: the directory Caddy serves does not exist in a fresh clone and must be produced by that service before the site has content.
 
 ### 6.6 Running the stack locally
 
@@ -1949,9 +1949,9 @@ Everything below follows directly from the config files; no scripts or Makefiles
 
 - **Full stack:** `docker compose up` from `/workspace` starts all six services. `frontend-build` runs `npm install && vite build` and exits; the rest stay up.
 - **Serving stack only (skip the dev server):** `docker compose up caddy` pulls in `backend`, `frontend-build`, and `trivial` via `depends_on`, and `redis` transitively via `backend`.
-- **Access point:** `http://localhost:20060` — the only host-published port. The demo shell is served from the built `example/dist`; `/mfup/*` and `/health` route to the MFUP server; `/trivial/*` routes to the baseline with the prefix stripped.
+- **Access point:** `http://localhost:20060` — the only host-published port. The demo shell is served from the built `demo/dist`; `/mfup/*` and `/health` route to the MFUP server; `/trivial/*` routes to the baseline with the prefix stripped.
 - **First run is slow by design.** Every container installs dependencies at startup, so the first `up` includes network installs. Because `depends_on` does not wait for readiness, Caddy may briefly return 502 on `/mfup/*` or serve an empty `/srv/dist` while `backend` and `frontend-build` are still installing (inferred from the absence of healthchecks).
-- **Rebuilding the demo after a client or example change:** `docker compose up frontend-build` re-runs `vite build` into `example/dist`; Caddy picks up the new files from the read-only mount without a restart, since it reads from disk per request.
+- **Rebuilding the demo after a client or example change:** `docker compose up frontend-build` re-runs `vite build` into `demo/dist`; Caddy picks up the new files from the read-only mount without a restart, since it reads from disk per request.
 - **Restarting the server after a Python change:** `docker compose restart backend`. The source is bind-mounted, so no rebuild is needed, but uvicorn is started without `--reload`, so the process must be restarted to pick up edits.
 - **Vite dev mode caveat:** the `frontend` (Vite dev) service is behind the `dev` compose profile, so `docker compose up` does **not** start it; `docker compose --profile dev up frontend` does. This is deliberate — without it, `frontend` and `frontend-build` would both `npm ci` into the same bind-mounted `./example` concurrently, clobber each other's `node_modules`, and the build would fail. Both services keep `node_modules` in a per-container anonymous volume rather than the bind mount.
 - **Uploaded data:** lands in `/workspace/uploads` on the host — MFUP output at the root, trivial-server output under `trivial-target/`. Deleting that directory resets all upload state on disk; Redis state is separate and disappears when the `redis` container is removed.
@@ -1962,7 +1962,7 @@ Two test surfaces, plus GitHub Actions.
 
 **Server unit tests** (`server/tests/`, `pytest`, `asyncio_mode=auto`): `test_protocol.py` (8 decoder tests) + `test_edge_cases.py` (23 tests — see §3.9).
 
-**End-to-end** (`e2e/`, Playwright, projects `chromium`/`firefox`/`webkit`). A harness page `example/e2e.html` exposes `window.mfupE2E` (build deterministic OPFS trees, run a real `MfupSession`, publish, report). `e2e/lib/gen.ts` regenerates the same bytes on the Node side for **byte-exact on-disk verification** against `uploads/`. Coverage:
+**End-to-end** (`e2e/`, Playwright, projects `chromium`/`firefox`/`webkit`). A harness page `demo/e2e.html` exposes `window.mfupE2E` (build deterministic OPFS trees, run a real `MfupSession`, publish, report). `e2e/lib/gen.ts` regenerates the same bytes on the Node side for **byte-exact on-disk verification** against `uploads/`. Coverage:
 
 | Spec | What it proves |
 |---|---|
@@ -1982,7 +1982,7 @@ Chaos/conflict/retention specs are tagged `@chromium-only` and `grepInvert`-ed o
 | `linux-e2e` | ubuntu | brings up the **full `docker compose` stack** in the runner, runs all three Playwright engines (incl. the kill/resume chaos specs) |
 | `macos-webkit` | **macos-15** | native-Safari-proxy: brew redis + `pip install ./server` + `vite build` served by `vite preview`, runs the webkit project. `macos-14` is avoided — its frozen webkit rejects Playwright's `Page.overrideSetting(PushAPIEnabled)` |
 
-The demo build is **deterministic**: a committed `example/package-lock.json`, `npm ci` (not `npm install`), and `npm run build|dev|preview` (local vite `6.4.1`) — never `npx vite`, which fetches the latest vite (v8/rolldown) and breaks the build.
+The demo build is **deterministic**: a committed `demo/package-lock.json`, `npm ci` (not `npm install`), and `npm run build|dev|preview` (local vite `6.4.1`) — never `npx vite`, which fetches the latest vite (v8/rolldown) and breaks the build.
 
 ---
 ## 7. Known Gaps & Divergences
@@ -2095,14 +2095,14 @@ Remaining: `publish.py` merge paths, `redis_index.py`, and server-side HTTP stat
 │   ├── package.json             ESM only, zero runtime dependencies
 │   └── tsconfig.json            ES2022, strict, declaration output to dist/
 │
-├── example/                     Vite demo — two pages (§5)
+├── demo/                     Vite demo — two pages (§5)
 │   ├── src/demo.ts              Canonical MfupSession usage
 │   ├── src/compare.ts           MFUP vs file-by-file race harness
 │   ├── index.html               Main demo (markup + all CSS)
 │   ├── compare.html             Comparison page
 │   └── vite.config.ts           @mfup/client alias → ../client/src, 4 proxies
 │
-├── trivial-server/app.py        Benchmark control: naive POST-per-file server (§6.3)
+├── benchmarks/trivial-server/app.py        Benchmark control: naive POST-per-file server (§6.3)
 │
 ├── docs/
 │   ├── FULL.md                  This document
