@@ -25,6 +25,11 @@ export interface DataChannelOpts {
   streaming?: boolean;
   /** Batch flush threshold in bytes (default 2 MiB). Only used in batch mode. */
   flushBytes?: number;
+  /** Real NETWORK upload progress (batch mode): called with the cumulative
+   * byte count actually put on the wire, including the in-flight POST's
+   * partial body (XHR upload.onprogress). Streaming mode reports progress
+   * through the chunk writer's backpressure instead. */
+  onUploadProgress?: (bytesOnWire: number) => void;
 }
 
 const DEFAULT_FLUSH_BYTES = 2 * 1024 * 1024; // 2 MiB
@@ -319,18 +324,13 @@ export class DataChannel {
         if (this.opts.signal?.aborted) break;
       }
       try {
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-mfup", "X-MFUP-Token": this.opts.resumeToken },
-          body: body as unknown as BodyInit,
-          signal: this.opts.signal,
-        });
+        const resp = await this._xhrPost(url, body);
 
         if (resp.ok) {
           if (final) {
             // Parse commit result from final POST response
             try {
-              const json = await resp.json();
+              const json = JSON.parse(resp.text);
               if (json.commit) {
                 this.commitResult = { files: json.commit.files, bytes: json.commit.bytes };
               }
@@ -343,7 +343,7 @@ export class DataChannel {
           return;
         }
 
-        const text = await resp.text().catch(() => "");
+        const text = resp.text;
         if (resp.status === 409 && attempt > 0) {
           // Did our previous (failed-looking) attempt actually land?
           try {
@@ -368,6 +368,45 @@ export class DataChannel {
 
     this._failed = true;
     if (lastErr) this._onError?.(lastErr);
+  }
+
+  /**
+   * One batch POST via XMLHttpRequest — the ONLY browser API that exposes
+   * real upload progress (fetch cannot). upload.onprogress reports the bytes
+   * actually on the wire, so a slow link shows a moving bar instead of a
+   * 2 MiB jump per completed POST.
+   */
+  private _xhrPost(url: string, body: Uint8Array): Promise<{ status: number; statusText: string; text: string; ok: boolean }> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.setRequestHeader("Content-Type", "application/x-mfup");
+      xhr.setRequestHeader("X-MFUP-Token", this.opts.resumeToken);
+      xhr.responseType = "text";
+
+      const base = this._bytesSent; // bytes of previously COMPLETED posts
+      xhr.upload.onprogress = (e) => {
+        this.opts.onUploadProgress?.(base + e.loaded);
+      };
+
+      const onAbort = () => xhr.abort();
+      this.opts.signal?.addEventListener("abort", onAbort, { once: true });
+      const cleanup = () => this.opts.signal?.removeEventListener("abort", onAbort);
+
+      xhr.onload = () => {
+        cleanup();
+        resolve({
+          status: xhr.status,
+          statusText: xhr.statusText,
+          text: xhr.responseText ?? "",
+          ok: xhr.status >= 200 && xhr.status < 300,
+        });
+      };
+      xhr.onerror = () => { cleanup(); reject(new TypeError("network error")); };
+      xhr.ontimeout = () => { cleanup(); reject(new TypeError("timeout")); };
+      xhr.onabort = () => { cleanup(); reject(new DOMException("aborted", "AbortError")); };
+      xhr.send(body as unknown as XMLHttpRequestBodyInit);
+    });
   }
 
   private _concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {

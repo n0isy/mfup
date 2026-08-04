@@ -540,6 +540,8 @@ export class MfupSession {
       epoch: this.epoch,
       signal: this.abortCtrl.signal,
       streaming: this._streamingMode,
+      // Batch mode: real wire-level progress from XHR upload events.
+      onUploadProgress: (n) => this.progress.setBodySent(BigInt(n)),
     });
 
     // Forward data channel errors — trigger reconnect for network failures
@@ -917,8 +919,14 @@ export class MfupSession {
         this.safeWrite(chunkFrame);
         offset += BigInt(piece.length);
         // Drive the in-flight progress (rate-limited inside the tracker).
-        this.bodySentTotal += BigInt(piece.length);
-        this.progress.setBodySent(this.bodySentTotal);
+        // Streaming mode only: chunks go to the wire under backpressure, so
+        // the writer's count IS network progress. In batch mode the buffer
+        // fills instantly — there the XHR upload.onprogress callback owns
+        // this metric (see DataChannelOpts.onUploadProgress).
+        if (this._streamingMode === true) {
+          this.bodySentTotal += BigInt(piece.length);
+          this.progress.setBodySent(this.bodySentTotal);
+        }
 
         // Backpressure: in batch mode, flush if buffer exceeds threshold
         if (this.data) {
@@ -1031,6 +1039,7 @@ export class MfupSession {
         epoch: this.epoch,
         signal: this.abortCtrl.signal,
         streaming: this._streamingMode ?? false,
+        onUploadProgress: (n) => this.progress.setBodySent(BigInt(n)),
       });
       const retryDc = this.data;
       this.data.onError((err) => {
