@@ -40,6 +40,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          mkdir -p dist-npm    # npm pack does not create the destination
           npm pack -w @mfup/client -w @mfup/react --pack-destination dist-npm
 
       - uses: actions/setup-python@v5
