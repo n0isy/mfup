@@ -20,7 +20,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "mfup-server": "./bin/mfup-server.mjs"
+    "mfup-server": "bin/mfup-server.mjs"
   },
   "files": [
     "dist",
