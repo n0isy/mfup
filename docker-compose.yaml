@@ -3,9 +3,13 @@
 # would run it — server deps from PyPI, client deps from npm, nothing built
 # from this repo's sources.
 #
-#   docker compose up -d      →  http://localhost:20061
+#   docker compose up -d      →  http://localhost:20061  (Python server)
+#                                http://localhost:20062  (Node server)
 #
-# Uploaded files land in ./uploads/<user_id>/<scope>/… on the host.
+# Uploaded files land on the host in ./uploads/<user_id>/<scope>/… (Python)
+# and ./uploads-node/<user_id>/<scope>/… (Node). The two editions run the
+# SAME React client against the same protocol; only the backend differs.
+# The Node one uses the in-memory session store — no Redis dependency.
 #
 # The INTERNAL dev/test stack (protocol e2e harness, chaos tests, benchmark
 # baseline) lives separately: docker compose -f e2e/docker-compose.yaml up -d
@@ -49,4 +53,38 @@ services:
     volumes:
       - ./examples/multiuser-scopes/client:/app
       # never extract npm packages into the bind-mounted host dir
+      - /app/node_modules
+
+  # ------------------------------------------------------------------
+  # The NODE edition: express + @mfup/server from npm, memory store
+  # (no Redis), same React client on :20062.
+  # ------------------------------------------------------------------
+  server-node:
+    image: node:24-alpine
+    working_dir: /app
+    expose:
+      - "8091"
+    command: sh -c "npm install --no-audit --no-fund --no-package-lock && node server.mjs"
+    environment:
+      DEMO_DATA_DIR: /data/uploads
+      PORT: "8091"
+    volumes:
+      - ./examples/multiuser-scopes-node/server:/app
+      - ./uploads-node:/data/uploads
+      - /app/node_modules
+
+  client-node:
+    image: node:20-alpine
+    working_dir: /app
+    depends_on:
+      - server-node
+    ports:
+      - "20062:20062"
+    # Same client directory as the Python edition — npm ci (read-only lock)
+    # so the two containers never fight over the bind-mounted lockfile.
+    command: sh -c "npm ci --no-audit --no-fund && npm run dev -- --port 20062"
+    environment:
+      EXAMPLE_BACKEND_URL: http://server-node:8091
+    volumes:
+      - ./examples/multiuser-scopes/client:/app
       - /app/node_modules
