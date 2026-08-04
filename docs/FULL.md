@@ -1,6 +1,6 @@
 # MFUP/2 — Multi-File Upload Protocol
 
-**Packages:** `mfup-server` (Python), `@mfup/client` (TypeScript)
+**Packages:** `mfup-core` + `mfup-fastapi` (Python), `@mfup/client` + `@mfup/react` (TypeScript)
 **Languages:** Python 3.10+ · TypeScript 5.5 (ES2022, browser-only)
 **Frameworks:** FastAPI + uvicorn (server) · zero runtime dependencies (client) · Vite 6 (demo)
 **Protocol version:** `MFUP/2`
@@ -122,6 +122,45 @@ match. Where a subsection below still describes old behaviour, §0 wins.
   mapping_error`, staging intact); ingest-time ASK disabled under mapping.
   Quotas, `AuthResult.context` and `meta` are persisted in SQLite (schema
   migration) so they survive restarts / lazy-resume (§ EXTENDING 2b).
+
+**Packaging stage (four publishable packages; monorepo restructured)**
+- **Repo layout**: `client/` → `packages/client` (`@mfup/client`), new
+  `packages/react` (`@mfup/react`); `server/mfup/` split into
+  `server/mfup-core/mfup_core` (protocol, storage, session machine, publish,
+  Redis index, hooks — no FastAPI import) and
+  `server/mfup-fastapi/mfup_fastapi` (config + engine + standalone app).
+  npm workspaces at the root; the demo still builds against package SOURCE
+  via vite aliases.
+- **`MfupEngine` / `MfupConfig`**: no module-level state or import-time env
+  reads in the library path; all routes live on an `APIRouter` built per
+  engine instance, mountable under any prefix (`include_router(prefix=
+  "/api/uploads")` — the client's `serverUrl` may carry the same prefix).
+  Hooks accepted as callables or dotted paths. `python -m mfup_fastapi` /
+  `mfup_fastapi.app:app` is a thin `create_app(MfupConfig.from_env())`.
+- **`on_committed` hook + `engine.publish()`**: server-side commit
+  notification (`CommitEvent` with meta/context); returning `"publish"`
+  publishes immediately; consumer backends can call
+  `engine.publish(session_id)` themselves (typed errors). Hook errors are
+  contained — never damage a commit.
+- **Client event model + snapshot store** (docs/CLIENT.md): file-level
+  events (`file:start/ack/reject`), `ask` events carrying a payload and
+  `respond()` (server ASK enriched with additive `code`/`node_id`/`name`
+  fields), `abort`/`published` events, `settleAsks()`, `publish()` on the
+  session, DnD source extraction (`sourceFromDataTransfer`/`sourceFromInput`)
+  moved from the demo into the SDK, and a coalesced immutable snapshot store
+  (`subscribe`/`getSnapshot`) implementing the `useSyncExternalStore`
+  contract. `export const enum` eliminated (isolatedModules consumers).
+- **`@mfup/react`**: `useMfupUpload` (auto-publish after `settleAsks`,
+  StrictMode-safe, uploads survive unmount by default), `useMfupDropzone`,
+  `useMfupSession`, `MfupProvider`. The demo's `react.html` page is built
+  solely on the public hook surface and is covered by e2e.
+- **Publication hygiene**: MIT LICENSE, per-package READMEs, `py.typed`,
+  exports maps + `sideEffects:false`, versions 0.2.0 everywhere (wire
+  protocol stays `MFUP/2`); CI gained a `packaging` job (npm pack → tarball
+  install → Node import smoke; `python -m build` → `twine check` → wheel
+  install smoke); `.github/workflows/release.yml` publishes all four on a
+  `v*` tag (PyPI trusted publishing + npm provenance; one-time registry
+  setup documented in the workflow).
 
 ---
 

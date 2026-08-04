@@ -44,8 +44,11 @@ import {
   ingestError,
   unknownError,
   probeError,
+  publishConflict,
+  publishFailed,
 } from "./errors.js";
 import { probeStreaming } from "./probe.js";
+import type { UploadSource } from "./dnd.js";
 
 // ---------------------------------------------------------------------------
 // Public config
@@ -74,16 +77,107 @@ export interface MfupSessionConfig {
   reconnectDelayMs?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Interactive server questions (ASK)
+// ---------------------------------------------------------------------------
+
+export type MfupAskAction = "merge_overwrite" | "cancel";
+
+/**
+ * A question the server asked mid-transfer (e.g. the target directory
+ * already contains conflicting entries). The UI answers via respond();
+ * the transfer keeps running while the question is pending — that is the
+ * whole point of the non-blocking control channel.
+ */
+export interface MfupAsk {
+  /** Monotonic per-session id, usable as a React key. */
+  readonly id: number;
+  /** Question kind. Currently always "target_conflict". */
+  readonly code: string;
+  /** Node id of the entry that triggered the question, when known. */
+  readonly nodeId: number | null;
+  /** Basename of the conflicting entry, when known. */
+  readonly name: string | null;
+  /** The answer given via respond(), or null while pending. */
+  readonly answered: MfupAskAction | null;
+  /** Answer the question. "cancel" is terminal for the whole session. */
+  respond(action: MfupAskAction): void;
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/** Identity of one tracked file, attached to every file:* event. */
+export interface MfupFileRef {
+  nodeId: number;
+  /** Client-relative path ("dir/sub/name.ext"), reconstructed from the scan. */
+  path: string;
+  size: bigint;
+}
+
 export interface MfupSessionEvents {
+  /** Aggregate progress. Fires on every mutation — coalesce in UIs
+   * (snapshot subscribers get coalescing for free). */
   progress: ProgressSnapshot;
   state: SessionState;
   committed: { files: number; bytes: number };
-  ask: void;
+  /** Result of publish() — files were moved into the target directory. */
+  published: { published: string[] };
+  /** The server asked an interactive question; answer via ev.respond(). */
+  ask: MfupAsk;
+  /** A pending ask was answered (from any tab/code path). */
+  "ask:answered": MfupAsk;
+  /** A file's body started streaming to the server. */
+  "file:start": MfupFileRef;
+  /** The server durably accepted bytes for a file (FILE_ACK).
+   * complete=true → the whole file is on the server. */
+  "file:ack": MfupFileRef & { acceptedBytes: bigint; complete: boolean };
+  /** The server (or the NACK budget) permanently skipped a file. */
+  "file:reject": MfupFileRef & { code: string; reason: string };
+  /** Terminal teardown, client- or server-initiated. */
+  abort: { by: "client" | "server"; code: string; reason: string };
   error: MfupError;
   reconnecting: { attempt: number; delay: number; maxAttempts: number | null };
 }
 
 type Listener<T> = (ev: T) => void;
+
+// ---------------------------------------------------------------------------
+// Immutable state snapshot (for useSyncExternalStore-style consumers)
+// ---------------------------------------------------------------------------
+
+export interface MfupSessionSnapshot {
+  sessionId: string;
+  state: SessionState;
+  epoch: number;
+  /** null until the streaming probe ran. */
+  streaming: boolean | null;
+  progress: ProgressSnapshot;
+  /** Blended 0–1 fraction (copy of progress.fraction for convenience). */
+  fraction: number | null;
+  /** All asks raised so far, in order. */
+  asks: readonly MfupAsk[];
+  /** Number of asks still awaiting respond(). */
+  pendingAsks: number;
+  /** Non-null while a reconnect loop is running. */
+  reconnect: { attempt: number; delay: number; maxAttempts: number | null } | null;
+  /** Set once COMMIT_OK arrived. */
+  committed: { files: number; bytes: number } | null;
+  /** Set once publish() succeeded. */
+  published: readonly string[] | null;
+  /** The file currently streaming, or null. */
+  currentFile: MfupFileRef | null;
+  /** Last few errors (ring of 20, newest last). */
+  recentErrors: readonly MfupError[];
+  /** First fatal error, if any — the reason the session died. */
+  fatalError: MfupError | null;
+}
+
+/** How long snapshot notifications may be coalesced (ms). State-changing
+ * events (state/ask/committed/abort) flush immediately; only high-frequency
+ * progress ticks ride the timer. */
+const SNAPSHOT_THROTTLE_MS = 33;
 
 /**
  * crypto.randomUUID() exists only in secure contexts (https / localhost).
@@ -175,6 +269,26 @@ export class MfupSession {
   // Events
   private listeners = new Map<string, Set<Listener<any>>>();
 
+  // Snapshot store (useSyncExternalStore contract: subscribe + getSnapshot)
+  private _snapVersion = 0;
+  private _snapCache: MfupSessionSnapshot | null = null;
+  private _snapCacheVersion = -1;
+  private _snapSubs = new Set<() => void>();
+  private _snapTimer: ReturnType<typeof setTimeout> | null = null;
+  private _snapLastFlush = 0;
+
+  // Interactive asks
+  private asks: MfupAsk[] = [];
+  private _askSeq = 0;
+
+  // Terminal results / diagnostics for the snapshot
+  private _committed: { files: number; bytes: number } | null = null;
+  private _published: string[] | null = null;
+  private _currentFileRef: MfupFileRef | null = null;
+  private _reconnectInfo: { attempt: number; delay: number; maxAttempts: number | null } | null = null;
+  private _recentErrors: MfupError[] = [];
+  private _fatalError: MfupError | null = null;
+
   // Reconnect
   private maxReconnectAttempts: number | null;
   private reconnectDelayMs: number;
@@ -227,6 +341,13 @@ export class MfupSession {
     if (config.lastKnownEpoch != null) {
       this.epoch = config.lastKnownEpoch;
     }
+
+    // Progress mutations feed both the typed event bus and the snapshot
+    // store, so on("progress") and useSyncExternalStore see the same stream.
+    this.progress.on((snap) => {
+      this.emit("progress", snap);
+      this.markSnapshotDirty();
+    });
   }
 
   // -- public accessors ----------------------------------------------------
@@ -237,7 +358,17 @@ export class MfupSession {
   get currentEpoch(): number { return this.epoch; }
   get streamingMode(): boolean | null { return this._streamingMode; }
 
-  sendAction(action: "merge_overwrite" | "cancel"): void {
+  sendAction(action: MfupAskAction): void {
+    // The ACTION is session-wide — settle every pending ask with it so the
+    // snapshot and ask:answered listeners stay coherent regardless of
+    // whether the UI answered via ask.respond() or sendAction() directly.
+    for (const ask of this.asks) {
+      if (ask.answered === null) {
+        (ask as { answered: MfupAskAction | null }).answered = action;
+        this.emit("ask:answered", ask);
+      }
+    }
+    this.markSnapshotDirty(true);
     this.control?.sendAction(action);
     if (action === "cancel") {
       // A conflict cancel is terminal: the server aborts the session and
@@ -249,6 +380,66 @@ export class MfupSession {
   }
 
   onProgress(fn: ProgressListener): () => void { return this.progress.on(fn); }
+
+  // -- snapshot store (useSyncExternalStore contract) ------------------------
+
+  /** Subscribe to snapshot changes. Notifications are coalesced (~33ms) for
+   * high-frequency progress ticks; state-changing events flush immediately. */
+  subscribe(fn: () => void): () => void {
+    this._snapSubs.add(fn);
+    return () => { this._snapSubs.delete(fn); };
+  }
+
+  /** Immutable state snapshot. Referentially stable until something changes —
+   * safe to hand to React's useSyncExternalStore as getSnapshot. */
+  getSnapshot(): MfupSessionSnapshot {
+    if (this._snapCacheVersion !== this._snapVersion || this._snapCache === null) {
+      const progress = this.progress.snapshot();
+      let pendingAsks = 0;
+      for (const a of this.asks) if (a.answered === null) pendingAsks++;
+      this._snapCache = {
+        sessionId: this.sessionId,
+        state: this._state,
+        epoch: this.epoch,
+        streaming: this._streamingMode,
+        progress,
+        fraction: progress.fraction,
+        asks: this.asks.slice(),
+        pendingAsks,
+        reconnect: this._reconnectInfo,
+        committed: this._committed,
+        published: this._published,
+        currentFile: this._currentFileRef,
+        recentErrors: this._recentErrors.slice(),
+        fatalError: this._fatalError,
+      };
+      this._snapCacheVersion = this._snapVersion;
+    }
+    return this._snapCache;
+  }
+
+  private markSnapshotDirty(immediate = false): void {
+    this._snapVersion++;
+    if (this._snapSubs.size === 0) return;
+    const now = Date.now();
+    if (immediate || now - this._snapLastFlush >= SNAPSHOT_THROTTLE_MS) {
+      this.flushSnapshot();
+    } else if (this._snapTimer === null) {
+      this._snapTimer = setTimeout(() => {
+        this._snapTimer = null;
+        this.flushSnapshot();
+      }, SNAPSHOT_THROTTLE_MS);
+    }
+  }
+
+  private flushSnapshot(): void {
+    if (this._snapTimer !== null) {
+      clearTimeout(this._snapTimer);
+      this._snapTimer = null;
+    }
+    this._snapLastFlush = Date.now();
+    for (const fn of this._snapSubs) fn();
+  }
 
   on<K extends keyof MfupSessionEvents>(event: K, fn: Listener<MfupSessionEvents[K]>): () => void {
     let set = this.listeners.get(event);
@@ -372,6 +563,7 @@ export class MfupSession {
       },
     );
 
+    this._reconnectInfo = null;
     this.setState("active");
     this.reconnectCount = 0;
   }
@@ -408,7 +600,7 @@ export class MfupSession {
     return this.finalizeScan();
   }
 
-  async uploadFileList(files: FileList): Promise<void> {
+  async uploadFileList(files: ArrayLike<File>): Promise<void> {
     const filter = this.makeIngestFilter();
     try {
       await ingestFromFileList(files, ROOT_NODE_ID, this.ids, this.onDiscover.bind(this), filter);
@@ -430,6 +622,96 @@ export class MfupSession {
       throw mfupErr;
     }
     return this.finalizeScan();
+  }
+
+  /**
+   * Upload from a normalised source — the output of sourceFromDataTransfer /
+   * sourceFromInput (see dnd.ts) — or a plain FileList / File[].
+   */
+  async upload(source: UploadSource | FileList | File[]): Promise<void> {
+    if (Array.isArray(source)) return this.uploadFiles(source);
+    if (typeof FileList !== "undefined" && source instanceof FileList) {
+      return this.uploadFileList(source);
+    }
+    const s = source as UploadSource;
+    switch (s.kind) {
+      case "handles": return this.uploadHandles(await s.handles);
+      case "entries": return this.uploadEntries(s.entries);
+      case "filelist": return this.uploadFileList(s.files);
+      case "files": return this.uploadFiles(s.files);
+    }
+  }
+
+  /**
+   * Wait until every pending ask has been answered (by any code path).
+   *
+   * Returns "cancel" if any answer was cancel, "merge_overwrite" if asks
+   * were raised and all resolved positively, or null when no ask was ever
+   * raised. Resolves early (with the current verdict) if the session hits a
+   * terminal state while a question is still open — never hangs.
+   *
+   * Typical flow: `await upload(...); if (await settleAsks() !== "cancel") await publish();`
+   */
+  async settleAsks(): Promise<MfupAskAction | null> {
+    const terminal = () =>
+      this._state === "committed" ? false
+        : this._state === "aborted" || this._state === "failed";
+    while (this.asks.some((a) => a.answered === null) && !terminal()) {
+      await new Promise<void>((resolve) => {
+        const offs: (() => void)[] = [];
+        const done = () => { for (const off of offs) off(); resolve(); };
+        offs.push(this.on("ask:answered", done));
+        offs.push(this.on("state", done));
+      });
+    }
+    for (const a of this.asks) if (a.answered === "cancel") return "cancel";
+    return this.asks.length > 0 ? "merge_overwrite" : null;
+  }
+
+  /**
+   * Publish the committed session: the server moves staged files into the
+   * target directory (atomic renames) and forgets the session.
+   *
+   * On a 409 target conflict, throws MfupError(PUBLISH_CONFLICT) with
+   * detail.conflictingFiles — ask the user, sendAction("merge_overwrite"),
+   * and call publish() again (or sendAction("cancel") to drop everything).
+   */
+  async publish(): Promise<{ published: string[] }> {
+    const url = `${this.serverUrl}/mfup/sessions/${this.sessionId}/publish`;
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: { "X-MFUP-Token": this.resumeToken },
+      });
+    } catch (cause) {
+      const err = publishFailed(0, cause instanceof Error ? cause.message : String(cause));
+      this.emitError(err);
+      throw err;
+    }
+
+    if (resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      const published: string[] = data.published ?? [];
+      this._published = published;
+      this.markSnapshotDirty(true);
+      this.emit("published", { published });
+      return { published };
+    }
+
+    const body = await resp.text().catch(() => "");
+    if (resp.status === 409) {
+      let parsed: any = null;
+      try { parsed = JSON.parse(body); } catch { /* not JSON */ }
+      if (parsed && parsed.error === "conflict_files") {
+        const err = publishConflict(parsed.conflicting_files ?? []);
+        this.emitError(err);
+        throw err;
+      }
+    }
+    const err = publishFailed(resp.status, body);
+    this.emitError(err);
+    throw err;
   }
 
   abort(code = "client_cancel", reason = "user cancelled"): void {
@@ -454,6 +736,7 @@ export class MfupSession {
     this.control?.close();
     this.abortCtrl.abort();
     this.setState("aborted");
+    this.emit("abort", { by: "client", code, reason });
     // Reject any pending commit wait
     this._commitReject?.(new Error("aborted"));
   }
@@ -555,6 +838,8 @@ export class MfupSession {
           throw mfupErr;
         }
         this.activeFile = null;
+        this._currentFileRef = null;
+        this.markSnapshotDirty();
       }
     } finally {
       this.pumping = false;
@@ -563,6 +848,9 @@ export class MfupSession {
 
   private async streamFile(file: TrackedFile): Promise<void> {
     file.status = "streaming";
+    this._currentFileRef = this.fileRef(file.nodeId, file.size);
+    this.markSnapshotDirty();
+    this.emit("file:start", this._currentFileRef);
 
     const openFrame: FileOpenFrame = {
       tag: FrameTag.FILE_OPEN,
@@ -674,8 +962,7 @@ export class MfupSession {
       // In batch mode, the final POST response may already contain the commit result.
       if (this._state === "committing" && this.data?.commitResult) {
         const cr = this.data.commitResult;
-        this.setState("committed");
-        this.emit("committed", { files: cr.files, bytes: cr.bytes });
+        this.markCommitted(cr.files, cr.bytes);
         return;
       }
 
@@ -780,13 +1067,47 @@ export class MfupSession {
     await new Promise<void>((resolve) => { this.pauseResolve = resolve; });
   }
 
+  private markCommitted(files: number, bytes: number): void {
+    this._committed = { files, bytes };
+    this.setState("committed");
+    this.emit("committed", { files, bytes });
+  }
+
   private setState(s: SessionState): void {
     this._state = s;
+    if (s === "committed" || s === "aborted" || s === "failed") {
+      this._reconnectInfo = null;
+      this._currentFileRef = null;
+    }
+    this.markSnapshotDirty(true);
     this.emit("state", s);
   }
 
   private emitError(err: MfupError): void {
+    this._recentErrors.push(err);
+    if (this._recentErrors.length > 20) this._recentErrors.shift();
+    if (err.fatal && this._fatalError === null) this._fatalError = err;
+    this.markSnapshotDirty(err.fatal);
     this.emit("error", err);
+  }
+
+  /** Reconstruct a node's client-relative path from the scan metadata. */
+  private nodePath(nodeId: number): string {
+    const parts: string[] = [];
+    let cur = this.nodeMeta.get(nodeId);
+    const seen = new Set<number>();
+    while (cur && !seen.has(cur.nodeId)) {
+      seen.add(cur.nodeId);
+      parts.push(cur.name);
+      if (cur.parentId === ROOT_NODE_ID) break;
+      cur = this.nodeMeta.get(cur.parentId);
+    }
+    return parts.reverse().join("/");
+  }
+
+  private fileRef(nodeId: number, size: bigint): MfupFileRef {
+    const path = this.nodePath(nodeId);
+    return { nodeId, path: path || String(nodeId), size };
   }
 
   /** Write to data channel with error propagation instead of silent drops */
@@ -827,6 +1148,7 @@ export class MfupSession {
       // publish, and any future RESUME.
       this.resumeToken = msg.resume_token;
       this.progress.setExpiresAt(msg.expires_at);
+      this.markSnapshotDirty(true);
     });
 
     this.control.on("resume_ok", (msg) => {
@@ -849,12 +1171,16 @@ export class MfupSession {
           // so a file that recovers after some NACKs is not falsely dropped.
           file.nackCount = 0;
         }
-        if (file.status === "sent" && file.acceptedOffset >= file.size) {
+        const complete = file.status === "sent" && file.acceptedOffset >= file.size;
+        // Resolve the path BEFORE nodeMeta forgets a completed file.
+        const ref = this.fileRef(msg.node_id, file.size);
+        if (complete) {
           file.status = "acked";
           // Fully accepted — the server durably knows this node.
           this.nodeMeta.delete(msg.node_id);
           this.progress.acceptFile();
         }
+        this.emit("file:ack", { ...ref, acceptedBytes: file.acceptedOffset, complete });
       }
     });
 
@@ -869,6 +1195,11 @@ export class MfupSession {
           if (file.status !== "rejected") {
             file.status = "rejected";
             this.progress.skipFile();
+            this.emit("file:reject", {
+              ...this.fileRef(msg.node_id, file.size),
+              code: "nack_budget",
+              reason: `gave up after ${file.nackCount} NACKs (${msg.reason})`,
+            });
           }
           this.emitError(nackChunk(msg.node_id, msg.expected_offset, msg.reason));
           return;
@@ -917,6 +1248,11 @@ export class MfupSession {
       if (file) {
         file.status = "rejected";
         this.progress.skipFile();
+        this.emit("file:reject", {
+          ...this.fileRef(msg.node_id, file.size),
+          code: msg.code,
+          reason: msg.reason,
+        });
       }
     });
 
@@ -933,13 +1269,13 @@ export class MfupSession {
       this._reconnectResolve = null;
       this._scanGateResolve?.();
       this._scanGateResolve = null;
+      this.emit("abort", { by: "server", code: msg.code, reason: msg.reason });
       this.emitError(sessionAbortedByServer(msg.code, msg.reason));
       this._commitReject?.(new Error(`session aborted: ${msg.code}`));
     });
 
     this.control.on("commit_ok", (msg) => {
-      this.setState("committed");
-      this.emit("committed", { files: msg.files, bytes: msg.bytes });
+      this.markCommitted(msg.files, msg.bytes);
       this._commitResolve?.();
     });
 
@@ -975,8 +1311,23 @@ export class MfupSession {
       this._commitResolve?.();
     });
 
-    this.control.on("ask", () => {
-      this.emit("ask", undefined as any);
+    this.control.on("ask", (msg) => {
+      const ask: MfupAsk = {
+        id: this._askSeq++,
+        code: msg.code ?? "target_conflict",
+        nodeId: msg.node_id ?? null,
+        name: msg.name ?? null,
+        answered: null,
+        // The ACTION is session-wide, so respond() routes through
+        // sendAction(), which settles every pending ask coherently.
+        respond: (action: MfupAskAction) => {
+          if (ask.answered !== null) return;
+          this.sendAction(action);
+        },
+      };
+      this.asks.push(ask);
+      this.markSnapshotDirty(true);
+      this.emit("ask", ask);
     });
 
     this.control.on("close", () => {
@@ -1059,11 +1410,13 @@ export class MfupSession {
       );
 
       // Emit reconnecting event BEFORE the delay so UI updates immediately
-      this.emit("reconnecting", {
+      this._reconnectInfo = {
         attempt: this.reconnectCount,
         delay,
         maxAttempts: this.maxReconnectAttempts,
-      });
+      };
+      this.markSnapshotDirty(true);
+      this.emit("reconnecting", this._reconnectInfo);
 
       this.emitError(sessionReconnectFailed(this.reconnectCount, err));
 

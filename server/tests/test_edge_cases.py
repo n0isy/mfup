@@ -9,7 +9,7 @@ import pytest
 
 from pathlib import Path
 
-from mfup.protocol import (
+from mfup_core.protocol import (
     NodeKind,
     NodeFrame,
     FileOpenFrame,
@@ -19,8 +19,8 @@ from mfup.protocol import (
     SessionState,
     crc32c,
 )
-from mfup.session_manager import LiveSession, FileWriter, MAX_COMMIT_RETRIES
-from mfup.storage import open_session_db, validate_node_name, resolve_payload_path, staging_dir
+from mfup_core.session_manager import LiveSession, FileWriter, MAX_COMMIT_RETRIES
+from mfup_core.storage import open_session_db, validate_node_name, resolve_payload_path, staging_dir
 
 
 class FakeWS:
@@ -272,14 +272,14 @@ async def test_oversized_chunk_nacked(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_load_hook_valid():
-    from mfup.hooks import load_hook
+    from mfup_core.hooks import load_hook
     fn = load_hook("os.path:join")
     assert fn("a", "b") == "a/b"
 
 
 @pytest.mark.parametrize("bad", ["", "no_colon", "nonexistent.module:fn", "os.path:nonexistent"])
 def test_load_hook_invalid_raises(bad):
-    from mfup.hooks import load_hook
+    from mfup_core.hooks import load_hook
     with pytest.raises((ImportError, AttributeError, ModuleNotFoundError)):
         load_hook(bad)
 
@@ -290,8 +290,8 @@ def test_load_hook_invalid_raises(bad):
 
 @pytest.mark.asyncio
 async def test_per_session_base_dir_staging_and_publish(tmp_path):
-    from mfup.session_manager import SessionRegistry
-    from mfup.publish import publish_session
+    from mfup_core.session_manager import SessionRegistry
+    from mfup_core.publish import publish_session
 
     global_base = tmp_path / "global"
     home = tmp_path / "homes" / "alice"
@@ -328,7 +328,7 @@ async def test_per_session_base_dir_staging_and_publish(tmp_path):
 
 @pytest.mark.asyncio
 async def test_recover_session_derives_base_from_staging_parent(tmp_path):
-    from mfup.session_manager import SessionRegistry
+    from mfup_core.session_manager import SessionRegistry
 
     global_base = tmp_path / "global"
     home = tmp_path / "homes" / "bob"
@@ -355,8 +355,9 @@ async def test_recover_session_derives_base_from_staging_parent(tmp_path):
 # Per-file mapping at publish (map_file hook) + auth/meta persistence
 # ---------------------------------------------------------------------------
 
-async def _upload_tree(s, files):
-    """files: list of (node_id, parent_id, name, content) with parent dirs
+async def _send_tree(s, files):
+    """Stream a tree (frames + SESSION_END) without committing.
+    files: list of (node_id, parent_id, name, content) with parent dirs
     given as (node_id, parent_id, name, None) rows first."""
     for nid, pid, name, content in files:
         kind = NodeKind.DIR if content is None else NodeKind.FILE
@@ -371,13 +372,17 @@ async def _upload_tree(s, files):
     total = sum(len(c) for _, _, _, c in files if c is not None)
     await s.process_frame(SessionEndFrame(scan_done_units=n_nodes, scan_est_units=n_nodes,
                                           body_done_bytes=total, body_est_bytes=total), "leg1")
+
+
+async def _upload_tree(s, files):
+    await _send_tree(s, files)
     result = await s.try_commit()
     assert result and result["t"] == "COMMIT_OK", result
 
 
 @pytest.mark.asyncio
 async def test_mapped_publish_by_type(tmp_path):
-    from mfup.publish import list_payload_files, publish_session_mapped
+    from mfup_core.publish import list_payload_files, publish_session_mapped
 
     s = make_session(tmp_path, sid="map1")
     await _upload_tree(s, [
@@ -407,7 +412,7 @@ async def test_mapped_publish_by_type(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mapped_publish_rejects_escape_and_collision(tmp_path):
-    from mfup.publish import publish_session_mapped, MappingError
+    from mfup_core.publish import publish_session_mapped, MappingError
 
     s = make_session(tmp_path, sid="map2")
     await _upload_tree(s, [
@@ -428,7 +433,7 @@ async def test_mapped_publish_rejects_escape_and_collision(tmp_path):
 @pytest.mark.asyncio
 async def test_auth_and_meta_persist_across_recovery(tmp_path):
     import json as _json
-    from mfup.session_manager import SessionRegistry
+    from mfup_core.session_manager import SessionRegistry
 
     reg1 = SessionRegistry(tmp_path)
     s1 = await reg1.create(
@@ -447,3 +452,121 @@ async def test_auth_and_meta_persist_across_recovery(tmp_path):
     assert s2.quota_max_bytes == 12345
     assert s2.quota_max_files == 10
     assert s2.auth_context == {"user_id": "alice"}
+
+
+# ---------------------------------------------------------------------------
+# on_committed hook + programmatic MfupEngine.publish()
+# ---------------------------------------------------------------------------
+
+class FakeIndex:
+    """Only what engine.publish touches."""
+    def __init__(self):
+        self.removed = []
+
+    async def remove(self, sid):
+        self.removed.append(sid)
+
+
+def make_engine(tmp_path, on_committed=None):
+    from mfup_core.session_manager import SessionRegistry
+    from mfup_fastapi import MfupConfig, MfupEngine
+
+    eng = MfupEngine(MfupConfig(base_dir=tmp_path, on_committed=on_committed))
+    # Unit tests skip startup() (no Redis): wire the two state objects by hand.
+    eng.registry = SessionRegistry(tmp_path)
+    eng.index = FakeIndex()
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_on_committed_notification_fields(tmp_path):
+    import json as _json
+    events = []
+
+    async def hook(ev):
+        events.append(ev)
+        return None  # notification only — publish stays client-driven
+
+    eng = make_engine(tmp_path, on_committed=hook)
+    s = await eng.registry.create(
+        "oc1", "tok", "leg1", "2099-01-01T00:00:00+00:00", target_dir="out",
+        meta_json=_json.dumps({"scope": "docs"}),
+    )
+    s.ws = FakeWS()
+    s.apply_auth(None, None, {"user_id": "alice"})
+
+    await _send_tree(s, [(1, 0, "a.txt", b"hello")])
+    result = await eng._try_commit(s)
+    assert result and result["t"] == "COMMIT_OK"
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.session_id == "oc1"
+    assert ev.target_dir == "out"
+    assert ev.files == 1 and ev.bytes == 5
+    assert ev.meta == {"scope": "docs"}
+    assert ev.context == {"user_id": "alice"}
+    assert Path(ev.staging_dir).exists()
+    # None verdict → nothing published, session still live.
+    assert eng.registry.get("oc1") is not None
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.asyncio
+async def test_on_committed_publish_verdict(tmp_path):
+    async def hook(ev):
+        return "publish"  # server-side decision: publish immediately
+
+    eng = make_engine(tmp_path, on_committed=hook)
+    s = await eng.registry.create("oc2", "tok", "leg1", "2099-01-01T00:00:00+00:00", target_dir="out")
+    s.ws = FakeWS()
+
+    await _send_tree(s, [(1, 0, "b.txt", b"world!")])
+    result = await eng._try_commit(s)
+    assert result and result["t"] == "COMMIT_OK"
+
+    assert (tmp_path / "out" / "b.txt").read_bytes() == b"world!"
+    assert eng.registry.get("oc2") is None
+    assert eng.index.removed == ["oc2"]
+    assert not (tmp_path / ".incoming.oc2").exists()
+
+
+@pytest.mark.asyncio
+async def test_on_committed_hook_error_is_contained(tmp_path):
+    async def hook(ev):
+        raise RuntimeError("consumer bug")
+
+    eng = make_engine(tmp_path, on_committed=hook)
+    s = await eng.registry.create("oc3", "tok", "leg1", "2099-01-01T00:00:00+00:00", target_dir="out")
+    s.ws = FakeWS()
+
+    await _send_tree(s, [(1, 0, "c.txt", b"data")])
+    result = await eng._try_commit(s)
+    # A broken consumer hook must not damage the commit.
+    assert result and result["t"] == "COMMIT_OK"
+    assert s.ws.of_type("COMMIT_OK")
+    assert s.state == SessionState.COMMITTED
+    assert eng.registry.get("oc3") is not None
+    assert (tmp_path / ".incoming.oc3").exists()
+
+
+@pytest.mark.asyncio
+async def test_engine_publish_typed_errors(tmp_path):
+    from mfup_fastapi import NotCommitted, SessionNotFound
+
+    eng = make_engine(tmp_path)
+    with pytest.raises(SessionNotFound):
+        await eng.publish("nope")
+
+    s = await eng.registry.create("pe1", "tok", "leg1", "2099-01-01T00:00:00+00:00", target_dir="out")
+    s.ws = FakeWS()
+    with pytest.raises(NotCommitted):
+        await eng.publish("pe1")  # still ACTIVE
+
+    await _send_tree(s, [(1, 0, "d.txt", b"zz")])
+    result = await eng._try_commit(s)
+    assert result and result["t"] == "COMMIT_OK"
+    published = await eng.publish("pe1")
+    assert published == ["d.txt"]
+    assert (tmp_path / "out" / "d.txt").read_bytes() == b"zz"
+    assert eng.index.removed == ["pe1"]

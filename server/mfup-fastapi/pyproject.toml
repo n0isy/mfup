@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mfup-fastapi"
+version = "0.2.0"
+description = "FastAPI integration for the MFUP/2 upload engine: MfupEngine + APIRouter you mount into your own app, or a ready-to-run standalone server."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "n0isy" }]
+keywords = ["upload", "resumable", "multi-file", "fastapi", "mfup"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mfup-core==0.2.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "httpx"]
+
+[project.urls]
+Homepage = "https://github.com/n0isy/mfup"
+Repository = "https://github.com/n0isy/mfup"
+Issues = "https://github.com/n0isy/mfup/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mfup_fastapi"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

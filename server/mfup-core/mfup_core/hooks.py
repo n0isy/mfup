@@ -115,6 +115,37 @@ class FileMapRequest:
 MapFileHook = Callable[[FileMapRequest], Awaitable[Optional[str]]]
 
 
+@dataclass(frozen=True)
+class CommitEvent:
+    """A session just committed — input to the on_committed hook."""
+
+    session_id: str
+    #: The session's (authorized/mapped) target_dir.
+    target_dir: str
+    #: The session's base directory (per-user home or the global base).
+    base_dir: str
+    #: Absolute staging directory holding the committed payload.
+    staging_dir: str
+    #: Committed file count / total payload bytes (as sent in COMMIT_OK).
+    files: int
+    bytes: int
+    #: Client-attached session meta (see AuthRequest.meta). Untrusted.
+    meta: Any
+    #: AuthResult.context from the authorize hook.
+    context: Mapping[str, Any]
+
+
+#: async (CommitEvent) -> str | None
+#:   "publish" — the server publishes immediately (server-side decision:
+#:               scan passed, billing ok, …). The browser's own publish call,
+#:               if any, will find the session gone (404) — harmless.
+#:   None      — do nothing; publish stays client-driven (or the consumer
+#:               backend calls MfupEngine.publish() later).
+#: Raising is logged and treated as None — a broken consumer hook must not
+#: strand committed sessions.
+OnCommittedHook = Callable[[CommitEvent], Awaitable[Optional[str]]]
+
+
 def load_hook(dotted: str) -> Callable[..., Any]:
     """Import ``pkg.module:attr`` and return the attribute.
 
@@ -150,3 +181,23 @@ def load_map_file_hook(dotted: str | None) -> MapFileHook | None:
     hook = load_hook(dotted)
     logger.info("map_file hook loaded: %s", dotted)
     return hook  # type: ignore[return-value]
+
+
+def load_on_committed_hook(dotted: str | None) -> OnCommittedHook | None:
+    """Resolve MFUP_ON_COMMITTED. None (unset) → client-driven publish."""
+    if not dotted:
+        return None
+    hook = load_hook(dotted)
+    logger.info("on_committed hook loaded: %s", dotted)
+    return hook  # type: ignore[return-value]
+
+
+def resolve_hook(ref: Callable[..., Any] | str | None) -> Callable[..., Any] | None:
+    """Accept a hook given either as the callable itself (library embedding:
+    ``MfupConfig(authorize=my_func)``) or as a dotted path (env-driven:
+    ``"pkg.module:callable"``). None passes through."""
+    if ref is None:
+        return None
+    if callable(ref):
+        return ref
+    return load_hook(ref)

@@ -5,50 +5,58 @@
 // ---------------------------------------------------------------------------
 // Error codes — exhaustive, greppable
 // ---------------------------------------------------------------------------
-export const enum MfupErrorCode {
+// Plain const objects, not `const enum` — const enums break for consumers
+// building with isolatedModules (esbuild/swc/vite), i.e. everyone.
+export const MfupErrorCode = {
   // Control channel
-  WS_CONNECT_FAILED    = "WS_CONNECT_FAILED",
-  WS_HANDSHAKE_FAILED  = "WS_HANDSHAKE_FAILED",
-  WS_CLOSED_UNEXPECTED = "WS_CLOSED_UNEXPECTED",
-  WS_MESSAGE_PARSE     = "WS_MESSAGE_PARSE",
-  WS_SEND_FAILED       = "WS_SEND_FAILED",
+  WS_CONNECT_FAILED:    "WS_CONNECT_FAILED",
+  WS_HANDSHAKE_FAILED:  "WS_HANDSHAKE_FAILED",
+  WS_CLOSED_UNEXPECTED: "WS_CLOSED_UNEXPECTED",
+  WS_MESSAGE_PARSE:     "WS_MESSAGE_PARSE",
+  WS_SEND_FAILED:       "WS_SEND_FAILED",
 
   // Data channel
-  DATA_OPEN_FAILED     = "DATA_OPEN_FAILED",
-  DATA_HTTP_ERROR      = "DATA_HTTP_ERROR",
-  DATA_WRITE_FAILED    = "DATA_WRITE_FAILED",
-  DATA_STREAM_ERROR    = "DATA_STREAM_ERROR",
-  DATA_CHANNEL_CLOSED  = "DATA_CHANNEL_CLOSED",
+  DATA_OPEN_FAILED:     "DATA_OPEN_FAILED",
+  DATA_HTTP_ERROR:      "DATA_HTTP_ERROR",
+  DATA_WRITE_FAILED:    "DATA_WRITE_FAILED",
+  DATA_STREAM_ERROR:    "DATA_STREAM_ERROR",
+  DATA_CHANNEL_CLOSED:  "DATA_CHANNEL_CLOSED",
 
   // Session
-  SESSION_ABORTED_BY_SERVER = "SESSION_ABORTED_BY_SERVER",
-  SESSION_ABORT_FAILED      = "SESSION_ABORT_FAILED",
-  SESSION_RECONNECT_FAILED  = "SESSION_RECONNECT_FAILED",
-  SESSION_RECONNECT_EXHAUSTED = "SESSION_RECONNECT_EXHAUSTED",
-  SESSION_COMMIT_FAILED     = "SESSION_COMMIT_FAILED",
-  SESSION_ENDED_BAD_STATE   = "SESSION_ENDED_BAD_STATE",
+  SESSION_ABORTED_BY_SERVER:   "SESSION_ABORTED_BY_SERVER",
+  SESSION_ABORT_FAILED:        "SESSION_ABORT_FAILED",
+  SESSION_RECONNECT_FAILED:    "SESSION_RECONNECT_FAILED",
+  SESSION_RECONNECT_EXHAUSTED: "SESSION_RECONNECT_EXHAUSTED",
+  SESSION_COMMIT_FAILED:       "SESSION_COMMIT_FAILED",
+  SESSION_ENDED_BAD_STATE:     "SESSION_ENDED_BAD_STATE",
+
+  // Publish
+  PUBLISH_CONFLICT:     "PUBLISH_CONFLICT",
+  PUBLISH_FAILED:       "PUBLISH_FAILED",
 
   // Ingestion
-  INGEST_HANDLE_ERROR  = "INGEST_HANDLE_ERROR",
-  INGEST_READ_ERROR    = "INGEST_READ_ERROR",
+  INGEST_HANDLE_ERROR:  "INGEST_HANDLE_ERROR",
+  INGEST_READ_ERROR:    "INGEST_READ_ERROR",
 
   // Protocol
-  NACK_BAD_CHECKSUM    = "NACK_BAD_CHECKSUM",
-  NACK_BAD_OFFSET      = "NACK_BAD_OFFSET",
-  NACK_STALE_EPOCH     = "NACK_STALE_EPOCH",
-  NACK_SERVER_POLICY   = "NACK_SERVER_POLICY",
+  NACK_BAD_CHECKSUM:    "NACK_BAD_CHECKSUM",
+  NACK_BAD_OFFSET:      "NACK_BAD_OFFSET",
+  NACK_STALE_EPOCH:     "NACK_STALE_EPOCH",
+  NACK_SERVER_POLICY:   "NACK_SERVER_POLICY",
 
   // Generic
-  UNKNOWN              = "UNKNOWN",
-}
+  UNKNOWN:              "UNKNOWN",
+} as const;
+export type MfupErrorCode = (typeof MfupErrorCode)[keyof typeof MfupErrorCode];
 
-export const enum MfupErrorLayer {
-  CONTROL  = "control",
-  DATA     = "data",
-  SESSION  = "session",
-  INGEST   = "ingest",
-  PROTOCOL = "protocol",
-}
+export const MfupErrorLayer = {
+  CONTROL:  "control",
+  DATA:     "data",
+  SESSION:  "session",
+  INGEST:   "ingest",
+  PROTOCOL: "protocol",
+} as const;
+export type MfupErrorLayer = (typeof MfupErrorLayer)[keyof typeof MfupErrorLayer];
 
 // ---------------------------------------------------------------------------
 // Structured error
@@ -260,6 +268,29 @@ export function nackChunk(nodeId: number, expectedOffset: number, reason: string
       : "Server rejected the data. Check server logs.",
     fatal: reason === "stale_epoch",
     detail: { nodeId, expectedOffset, reason },
+  });
+}
+
+export function publishConflict(conflictingFiles: string[]): MfupError {
+  return new MfupError({
+    code: MfupErrorCode.PUBLISH_CONFLICT,
+    layer: MfupErrorLayer.SESSION,
+    message: `Publish blocked: ${conflictingFiles.length} entr${conflictingFiles.length === 1 ? "y" : "ies"} already exist in the target directory`,
+    action: "Ask the user, then sendAction(\"merge_overwrite\") and publish() again — or sendAction(\"cancel\").",
+    fatal: false,
+    detail: { conflictingFiles },
+  });
+}
+
+export function publishFailed(status: number, body: string): MfupError {
+  return new MfupError({
+    code: MfupErrorCode.PUBLISH_FAILED,
+    layer: MfupErrorLayer.SESSION,
+    message: `Publish failed: HTTP ${status} ${body.slice(0, 200)}`,
+    action: status === 404 ? "Session unknown to the server (already published or cleaned up)."
+      : "Check server logs.",
+    fatal: status === 404,
+    detail: { status, body: body.slice(0, 500) },
   });
 }
 

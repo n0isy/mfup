@@ -22,8 +22,16 @@ export default defineConfig({
   root: ".",
   publicDir: "public",
   resolve: {
+    // @mfup/react source (aliased below) would otherwise resolve react from
+    // the workspace root while example code resolves its own copy — two
+    // React instances break the hooks dispatcher. Force one.
+    dedupe: ["react", "react-dom"],
     alias: {
-      "@mfup/client": path.resolve(__dirname, "../client/src"),
+      // Exact-file aliases: the demo builds against the SOURCE of the sibling
+      // packages (hot reload across the package boundary). Consumers install
+      // the built packages and import the same specifiers.
+      "@mfup/client": path.resolve(__dirname, "../packages/client/src/index.ts"),
+      "@mfup/react": path.resolve(__dirname, "../packages/react/src/index.ts"),
     },
   },
   build: {
@@ -32,6 +40,7 @@ export default defineConfig({
         main: path.resolve(__dirname, "index.html"),
         compare: path.resolve(__dirname, "compare.html"),
         e2e: path.resolve(__dirname, "e2e.html"),
+        react: path.resolve(__dirname, "react.html"),
       },
     },
   },
@@ -42,7 +51,7 @@ export default defineConfig({
     allowedHosts: true,
     fs: {
       // repo root (native runs) + the docker-compose mount points
-      allow: [path.resolve(__dirname, ".."), "/client", "/app"],
+      allow: [path.resolve(__dirname, ".."), "/packages", "/app"],
     },
     proxy: PROXY,
   },

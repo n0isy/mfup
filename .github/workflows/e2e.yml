@@ -16,10 +16,62 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install server package (with dev deps)
-        run: pip install "./server[dev]"
+      - name: Install server packages (with dev deps)
+        run: pip install ./server/mfup-core "./server/mfup-fastapi[dev]"
       - name: Run unit tests
         run: cd server && python -m pytest tests -q
+
+  # ---------------------------------------------------------------------
+  # Packaging smoke: the four artifacts must BUILD and INSTALL cleanly —
+  # npm tarballs import in Node, wheels pass twine check and import.
+  # Catches exports-map / const-enum / metadata regressions before publish.
+  # ---------------------------------------------------------------------
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build + pack npm workspaces
+        run: |
+          npm ci
+          npm run build
+          mkdir -p /tmp/pack
+          npm pack -w @mfup/client -w @mfup/react --pack-destination /tmp/pack
+
+      - name: Install tarballs in a scratch project and import
+        run: |
+          mkdir /tmp/smoke && cd /tmp/smoke && npm init -y >/dev/null
+          npm install --no-audit --no-fund /tmp/pack/mfup-client-*.tgz /tmp/pack/mfup-react-*.tgz react@18
+          node --input-type=module -e "
+          import * as c from '@mfup/client';
+          import * as r from '@mfup/react';
+          if (typeof c.MfupSession !== 'function') throw new Error('MfupSession missing');
+          if (c.FrameTag.NODE !== 1) throw new Error('FrameTag broken');
+          if (typeof r.useMfupUpload !== 'function') throw new Error('useMfupUpload missing');
+          console.log('npm pack smoke OK');
+          "
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build + check + install Python packages
+        run: |
+          pip install build twine
+          python -m build server/mfup-core -o /tmp/dist-py
+          python -m build server/mfup-fastapi -o /tmp/dist-py
+          twine check /tmp/dist-py/*
+          pip install /tmp/dist-py/mfup_core-*.whl /tmp/dist-py/mfup_fastapi-*.whl
+          python -c "
+          from mfup_fastapi import MfupEngine, MfupConfig
+          e = MfupEngine(MfupConfig())
+          assert len(e.router.routes) == 8, e.router.routes
+          print('wheel smoke OK')
+          "
 
   # ---------------------------------------------------------------------
   # Full-stack e2e on Linux: the real docker-compose stack inside the
@@ -100,10 +152,10 @@ jobs:
 
       - name: Start MFUP backend
         run: |
-          pip install ./server
+          pip install ./server/mfup-core ./server/mfup-fastapi
           MFUP_BASE_DIR="$GITHUB_WORKSPACE/uploads" \
           REDIS_URL=redis://localhost:6379/0 \
-          nohup python -m uvicorn mfup.app:app --port 8070 > backend.log 2>&1 &
+          nohup python -m uvicorn mfup_fastapi.app:app --port 8070 > backend.log 2>&1 &
 
       - uses: actions/setup-node@v4
         with:

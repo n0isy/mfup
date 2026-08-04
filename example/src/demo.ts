@@ -12,7 +12,15 @@
  * persistent references that survive the handler and support lazy streaming.
  */
 
-import { MfupSession, MfupError, type ProgressSnapshot, type SessionState } from "@mfup/client/index.js";
+import {
+  MfupSession,
+  MfupError,
+  sourceFromDataTransfer,
+  sourceFromInput,
+  type UploadSource,
+  type ProgressSnapshot,
+  type SessionState,
+} from "@mfup/client";
 
 // ---------------------------------------------------------------------------
 // DOM refs
@@ -184,10 +192,7 @@ function renderState(state: SessionState) {
 // ---------------------------------------------------------------------------
 // Upload launcher
 // ---------------------------------------------------------------------------
-type UploadMode = "handles" | "entries" | "filelist" | "files";
-type UploadSource = FileSystemHandle[] | FileSystemEntry[] | FileList | File[];
-
-async function startUpload(mode: UploadMode, source: UploadSource) {
+async function startUpload(source: UploadSource) {
   // Show progress panel
   progressPanel.classList.add("visible");
   dropzone.classList.add("uploading");
@@ -201,22 +206,22 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
 
   session.onProgress(scheduleProgress);
   session.on("state", (s) => { renderState(s); log(`State -> ${s}`, "info"); });
-  session.on("ask", () => {
-    log("Server: file conflicts detected in target directory", "warn");
+  session.on("ask", (ask) => {
+    log(`Server: conflict in target directory${ask.name ? ` ("${ask.name}")` : ""}`, "warn");
     conflictOverlay.classList.add("visible");
 
     conflictPromise = new Promise((resolve) => { conflictResolve = resolve; });
 
     const onOverwrite = () => {
       cleanup();
-      session!.sendAction("merge_overwrite");
+      ask.respond("merge_overwrite");
       log("User chose: merge & overwrite", "info");
       conflictResolve?.("merge_overwrite");
     };
     const onCancel = () => {
       cleanup();
       cancelled = true;
-      session!.sendAction("cancel");
+      ask.respond("cancel");
       log("User chose: cancel", "warn");
       conflictResolve?.("cancel");
     };
@@ -249,19 +254,10 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
       return;
     }
     try {
-      const resp = await fetch(`${serverUrl}/mfup/sessions/${session!.id}/publish`, {
-        method: "POST",
-        headers: { "X-MFUP-Token": session!.token },
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        log(`Published: ${data.published.join(", ")}`, "ok");
-      } else {
-        const data = await resp.json().catch(() => ({}));
-        log(`Publish failed: ${data.error ?? resp.statusText}`, "warn");
-      }
+      const { published } = await session!.publish();
+      log(`Published: ${published.join(", ")}`, "ok");
     } catch (err: any) {
-      log(`Publish error: ${err.message}`, "warn");
+      log(`Publish failed: ${err.message}`, "warn");
     }
   });
   session.on("reconnecting", (ev) => {
@@ -291,20 +287,7 @@ async function startUpload(mode: UploadMode, source: UploadSource) {
     const mode_label = session.streamingMode ? "streaming (duplex:half)" : "batch (sequential POST)";
     log(`Connected  epoch=${session.currentEpoch}  data=${mode_label}`, "ok");
 
-    switch (mode) {
-      case "handles":
-        await session.uploadHandles(source as FileSystemHandle[]);
-        break;
-      case "entries":
-        await session.uploadEntries(source as FileSystemEntry[]);
-        break;
-      case "filelist":
-        await session.uploadFileList(source as FileList);
-        break;
-      case "files":
-        await session.uploadFiles(source as File[]);
-        break;
-    }
+    await session.upload(source);
     log("Upload complete.", "ok");
   } catch (err: any) {
     // Don't treat abort as a fatal error
@@ -336,53 +319,13 @@ dropzone.addEventListener("drop", (e) => {
   dropzone.classList.remove("dragover");
   if (session) return; // already uploading
 
-  const items = e.dataTransfer?.items;
-  if (!items || items.length === 0) return;
-
-  // --- 1. Try getAsFileSystemHandle (Chrome/Edge) ---
-  // Returns promises of FileSystemHandle; must call synchronously in handler.
-  const handles: FileSystemHandle[] = [];
-  let hasHandles = true;
-  for (let i = 0; i < items.length; i++) {
-    const h = (items[i] as any).getAsFileSystemHandle?.();
-    if (h) {
-      handles.push(h);
-    } else {
-      hasHandles = false;
-      break;
-    }
-  }
-
-  if (hasHandles && handles.length > 0) {
-    Promise.all(handles).then((resolved) => {
-      log(`Drop: ${resolved.length} handle(s) via File System Access API`, "info");
-      startUpload("handles", resolved);
-    });
-    return;
-  }
-
-  // --- 2. Try webkitGetAsEntry (Firefox/Safari) ---
-  // Returns FileSystemEntry objects that persist after the handler.
-  // Supports directory traversal and lazy file reading — no memory buffering.
-  const entries: FileSystemEntry[] = [];
-  for (let i = 0; i < items.length; i++) {
-    const entry = items[i].webkitGetAsEntry?.();
-    if (entry) entries.push(entry);
-  }
-
-  if (entries.length > 0) {
-    log(`Drop: ${entries.length} entry(ies) via webkitGetAsEntry`, "info");
-    startUpload("entries", entries);
-    return;
-  }
-
-  // --- 3. Fallback: e.dataTransfer.files ---
-  // Last resort — may fail on Firefox (blob data invalidated after handler).
-  const rawFiles = Array.from(e.dataTransfer?.files ?? []);
-  if (rawFiles.length > 0) {
-    log(`Drop: ${rawFiles.length} file(s) via DataTransfer.files (fallback)`, "warn");
-    startUpload("files", rawFiles);
-  }
+  // sourceFromDataTransfer encodes the browser priority chain
+  // (getAsFileSystemHandle → webkitGetAsEntry → DataTransfer.files) and MUST
+  // run synchronously in the drop handler — it does.
+  const src = e.dataTransfer ? sourceFromDataTransfer(e.dataTransfer) : null;
+  if (!src) return;
+  log(`Drop: source via ${src.kind}`, "info");
+  startUpload(src);
 });
 
 // ---------------------------------------------------------------------------
@@ -406,16 +349,19 @@ dropzone.addEventListener("click", () => {
 });
 
 fileInput.addEventListener("change", () => {
-  if (session || !fileInput.files?.length) return;
-  const files = Array.from(fileInput.files);
-  log(`Browse: ${files.length} file(s)`, "info");
-  startUpload("files", files);
+  if (session) return;
+  const src = sourceFromInput(fileInput);
+  if (!src) return;
+  log(`Browse: ${fileInput.files!.length} file(s)`, "info");
+  startUpload(src);
 });
 
 folderInput.addEventListener("change", () => {
-  if (session || !folderInput.files?.length) return;
-  log(`Browse: folder with ${folderInput.files.length} file(s)`, "info");
-  startUpload("filelist", folderInput.files);
+  if (session) return;
+  const src = sourceFromInput(folderInput);
+  if (!src) return;
+  log(`Browse: folder with ${folderInput.files!.length} file(s)`, "info");
+  startUpload(src);
 });
 
 // ---------------------------------------------------------------------------

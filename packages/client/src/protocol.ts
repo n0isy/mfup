@@ -5,32 +5,40 @@ export const ROOT_NODE_ID = 0;
 
 // ---------------------------------------------------------------------------
 // Frame tags (single-byte discriminator in wire format)
+//
+// Plain const objects, not `const enum`: const enums are erased at compile
+// time and break for consumers building with isolatedModules / esbuild / swc,
+// which is every modern bundler. The `type X = value-union` alias keeps the
+// ergonomics (`tag: FrameTag`) identical.
 // ---------------------------------------------------------------------------
-export const enum FrameTag {
-  NODE         = 0x01,
-  SUMMARY      = 0x02,
-  FILE_OPEN    = 0x03,
-  FILE_CHUNK   = 0x04,
-  FILE_CLOSE   = 0x05,
-  DIR_CLOSE    = 0x06,
-  SESSION_END  = 0x07,
-  CLIENT_ABORT = 0x08,
-}
+export const FrameTag = {
+  NODE:         0x01,
+  SUMMARY:      0x02,
+  FILE_OPEN:    0x03,
+  FILE_CHUNK:   0x04,
+  FILE_CLOSE:   0x05,
+  DIR_CLOSE:    0x06,
+  SESSION_END:  0x07,
+  CLIENT_ABORT: 0x08,
+} as const;
+export type FrameTag = (typeof FrameTag)[keyof typeof FrameTag];
 
 // ---------------------------------------------------------------------------
 // Node kind
 // ---------------------------------------------------------------------------
-export const enum NodeKind {
-  DIR  = 0x00,
-  FILE = 0x01,
-}
+export const NodeKind = {
+  DIR:  0x00,
+  FILE: 0x01,
+} as const;
+export type NodeKind = (typeof NodeKind)[keyof typeof NodeKind];
 
 // ---------------------------------------------------------------------------
 // Checksum / hash kinds
 // ---------------------------------------------------------------------------
-export const enum ChecksumKind {
-  CRC32C = 0x01,
-}
+export const ChecksumKind = {
+  CRC32C: 0x01,
+} as const;
+export type ChecksumKind = (typeof ChecksumKind)[keyof typeof ChecksumKind];
 
 // HashKind removed — CRC32C per-chunk is sufficient; SHA-256 was never verified server-side.
 
@@ -38,7 +46,7 @@ export const enum ChecksumKind {
 // Data frame types (logical, before serialisation)
 // ---------------------------------------------------------------------------
 export interface NodeFrame {
-  tag: FrameTag.NODE;
+  tag: typeof FrameTag.NODE;
   nodeId: number;
   parentId: number;
   kind: NodeKind;
@@ -48,7 +56,7 @@ export interface NodeFrame {
 }
 
 export interface SummaryFrame {
-  tag: FrameTag.SUMMARY;
+  tag: typeof FrameTag.SUMMARY;
   nodeId: number;
   scanDoneUnits: bigint;
   scanEstUnits: bigint;
@@ -58,14 +66,14 @@ export interface SummaryFrame {
 }
 
 export interface FileOpenFrame {
-  tag: FrameTag.FILE_OPEN;
+  tag: typeof FrameTag.FILE_OPEN;
   nodeId: number;
   size: bigint;
   mtimeMs: bigint | null;
 }
 
 export interface FileChunkFrame {
-  tag: FrameTag.FILE_CHUNK;
+  tag: typeof FrameTag.FILE_CHUNK;
   nodeId: number;
   offset: bigint;
   length: number;
@@ -75,18 +83,18 @@ export interface FileChunkFrame {
 }
 
 export interface FileCloseFrame {
-  tag: FrameTag.FILE_CLOSE;
+  tag: typeof FrameTag.FILE_CLOSE;
   nodeId: number;
   sizeSent: bigint;
 }
 
 export interface DirCloseFrame {
-  tag: FrameTag.DIR_CLOSE;
+  tag: typeof FrameTag.DIR_CLOSE;
   nodeId: number;
 }
 
 export interface SessionEndFrame {
-  tag: FrameTag.SESSION_END;
+  tag: typeof FrameTag.SESSION_END;
   rootSummary: {
     scanDoneUnits: bigint;
     scanEstUnits: bigint;
@@ -97,7 +105,7 @@ export interface SessionEndFrame {
 }
 
 export interface ClientAbortFrame {
-  tag: FrameTag.CLIENT_ABORT;
+  tag: typeof FrameTag.CLIENT_ABORT;
   code: string;
   reason: string;
 }
@@ -241,6 +249,14 @@ export interface ProbeAckMsg {
 
 export interface AskMsg {
   t: "ASK";
+  /** What the server is asking about. Currently only "target_conflict":
+   * an entry in the target directory collides with an incoming one.
+   * Absent on older servers — treat as "target_conflict". */
+  code?: string;
+  /** Node id of the incoming entry that triggered the question (if known). */
+  node_id?: number;
+  /** Basename of the conflicting entry (if known). */
+  name?: string;
 }
 
 export interface CommitRetryMsg {

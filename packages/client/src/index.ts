@@ -76,6 +76,17 @@ export { probeStreaming, type ProbeResult } from "./probe.js";
 // Errors
 export { MfupError, MfupErrorCode, MfupErrorLayer } from "./errors.js";
 
+// Drop-source extraction (drag-and-drop / <input> helpers)
+export { sourceFromDataTransfer, sourceFromInput } from "./dnd.js";
+export type { UploadSource } from "./dnd.js";
+
 // Session (main entry point)
 export { MfupSession } from "./session.js";
-export type { MfupSessionConfig, MfupSessionEvents } from "./session.js";
+export type {
+  MfupSessionConfig,
+  MfupSessionEvents,
+  MfupSessionSnapshot,
+  MfupAsk,
+  MfupAskAction,
+  MfupFileRef,
+} from "./session.js";

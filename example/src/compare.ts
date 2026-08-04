@@ -8,7 +8,7 @@
  * Both lanes show a live timer (0.1s precision) + progress bar.
  */
 
-import { MfupSession, type ProgressSnapshot } from "@mfup/client/index.js";
+import { MfupSession, type ProgressSnapshot } from "@mfup/client";
 
 // ---------------------------------------------------------------------------
 // DOM refs

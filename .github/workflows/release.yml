@@ -1,0 +1,89 @@
+# Release: build + publish all four packages on a version tag (v0.2.0, …).
+#
+# One-time setup before the first release:
+#   - PyPI: create projects mfup-core / mfup-fastapi with a Trusted Publisher
+#     (this repo, workflow release.yml, environment "release"); no token needed.
+#   - npm: create the @mfup org, add an automation token as the NPM_TOKEN
+#     repo secret.
+#
+# Versions: keep package.json / pyproject.toml versions == the tag.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Build npm packages
+        run: |
+          npm ci
+          npm run build
+          npm pack -w @mfup/client -w @mfup/react --pack-destination dist-npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Python packages
+        run: |
+          pip install build twine
+          python -m build server/mfup-core -o dist-py
+          python -m build server/mfup-fastapi -o dist-py
+          twine check dist-py/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-npm
+          path: dist-npm/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-py
+          path: dist-py/
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Publish @mfup/client and @mfup/react
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm ci
+          npm run build
+          npm publish -w @mfup/client --access public --provenance
+          npm publish -w @mfup/react --access public --provenance
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    environment: release
+    permissions:
+      id-token: write   # PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-py
+          path: dist-py/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-py/

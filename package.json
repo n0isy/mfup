@@ -1,0 +1,12 @@
+{
+  "name": "mfup-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/client",
+    "packages/react"
+  ],
+  "scripts": {
+    "build": "npm run build -w @mfup/client && npm run build -w @mfup/react",
+    "check": "npm run check -w @mfup/client && npm run check -w @mfup/react"
+  }
+}

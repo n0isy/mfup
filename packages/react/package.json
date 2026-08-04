@@ -1,0 +1,41 @@
+{
+  "name": "@mfup/react",
+  "version": "0.2.0",
+  "description": "React bindings for the MFUP/2 upload client: useMfupUpload, useMfupDropzone, snapshot-driven state via useSyncExternalStore",
+  "keywords": ["react", "hooks", "upload", "resumable", "drag-and-drop", "mfup"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/n0isy/mfup.git",
+    "directory": "packages/react"
+  },
+  "homepage": "https://github.com/n0isy/mfup#readme",
+  "bugs": { "url": "https://github.com/n0isy/mfup/issues" },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@mfup/client": "^0.2.0",
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@mfup/client": "*",
+    "@types/react": "^18.3.0",
+    "react": "^18.3.0",
+    "typescript": "^5.5.0"
+  }
+}

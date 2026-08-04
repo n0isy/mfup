@@ -332,10 +332,17 @@ class LiveSession:
                 self.conflict_state = "conflict_dir"
                 logger.info("Session %s: conflict_dir (dir %s exists)", self.session_id, dest.name)
         else:
-            # File-file or type mismatch: send ASK once
+            # File-file or type mismatch: send ASK once. code/node_id/name are
+            # additive fields (older clients ignore them); name is the
+            # conflicting basename only — never a server-side path.
             self.conflict_state = "conflict_files"
             logger.info("Session %s: conflict_files (file %s exists)", self.session_id, dest.name)
-            await self.send_control({"t": "ASK"})
+            await self.send_control({
+                "t": "ASK",
+                "code": "target_conflict",
+                "node_id": node_id,
+                "name": dest.name,
+            })
 
     async def _handle_node(self, f: NodeFrame) -> None:
         if self.db.is_pruned(f.node_id):

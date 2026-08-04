@@ -145,7 +145,7 @@ async function walkHandle(
  * the directory tree.
  */
 export async function ingestFromFileList(
-  files: FileList,
+  files: ArrayLike<File>,
   rootParentId: number,
   ids: NodeIdAllocator,
   cb: IngestCallback,

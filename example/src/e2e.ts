@@ -5,7 +5,7 @@
  * ingestFromHandles adapter with genuine FileSystemDirectoryHandle objects.
  */
 
-import { MfupSession, type ProgressSnapshot } from "@mfup/client/index.js";
+import { MfupSession, type ProgressSnapshot } from "@mfup/client";
 
 interface ManifestEntry {
   path: string; // relative path inside the root, "/"-separated
@@ -147,16 +147,16 @@ async function run(opts: RunOpts): Promise<RunResult> {
   // or after COMMIT_OK.
   let conflictAnswered!: () => void;
   const conflictDone = new Promise<void>((r) => { conflictAnswered = r; });
-  session.on("ask", async () => {
+  session.on("ask", async (ask) => {
     askSeen = true;
-    log.push("ask");
+    log.push("ask:" + ask.code + (ask.name ? ":" + ask.name : ""));
     const c = opts.conflict;
     if (!c) return;
     if (c.when === "after_commit") {
       await committedPromise;
     }
     log.push("answer:" + c.action);
-    session.sendAction(c.action);
+    ask.respond(c.action);
     conflictAnswered();
   });
 
@@ -186,16 +186,19 @@ async function run(opts: RunOpts): Promise<RunResult> {
   if (committed && !cancelled) {
     statusEl.textContent = "publishing...";
     // ACTION travels over WS while publish is HTTP — a merge_overwrite
-    // answer may still be in flight. Retry a conflict_files 409 briefly.
+    // answer may still be in flight. Retry a PUBLISH_CONFLICT briefly.
     for (let attempt = 0; attempt < 4; attempt++) {
-      const resp = await fetch(`/mfup/sessions/${session.id}/publish`, {
-        method: "POST",
-        headers: { "X-MFUP-Token": session.token },
-      });
-      publishStatus = resp.status;
-      published = await resp.json().catch(() => null);
-      if (resp.status !== 409) break;
-      await new Promise((r) => setTimeout(r, 300));
+      try {
+        const result = await session.publish();
+        publishStatus = 200;
+        published = result;
+        break;
+      } catch (e: any) {
+        publishStatus = e?.detail?.status ?? (e?.code === "PUBLISH_CONFLICT" ? 409 : null);
+        published = { error: e?.code ?? String(e) };
+        if (e?.code !== "PUBLISH_CONFLICT") break;
+        await new Promise((r) => setTimeout(r, 300));
+      }
     }
   }
 

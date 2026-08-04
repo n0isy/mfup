@@ -1,12 +1,55 @@
 # Extending MFUP/2 — the integration contract
 
 This document is the contract for embedding the MFUP/2 upload engine into
-your product **without** waiting for it to become a packaged library. You run
-the server as-is (container or `python -m uvicorn mfup.app:app`) and plug
-your code in through configuration. Everything here is considered stable;
-anything not documented here is internal and may change.
+your product. Everything here is considered stable; anything not documented
+here is internal and may change.
 
 Audience assumptions: your backend is Python, your frontend is TypeScript.
+
+The code ships as four packages:
+
+| Package | Registry | Contents |
+|---|---|---|
+| `mfup-core` | PyPI | engine: protocol, session machine, storage, publish, hook contracts |
+| `mfup-fastapi` | PyPI | `MfupEngine` + `APIRouter` + standalone server |
+| `@mfup/client` | npm | browser SDK (events + snapshot store, see `docs/CLIENT.md`) |
+| `@mfup/react` | npm | hooks: `useMfupUpload`, `useMfupDropzone`, `useMfupSession` |
+
+---
+
+## 0. Two ways to run the server
+
+**Standalone** (container / bare process) — config from `MFUP_*` env vars,
+hooks as dotted paths:
+
+```bash
+MFUP_BASE_DIR=/srv/uploads MFUP_AUTHORIZE=myapp.uploads:authorize \
+  python -m mfup_fastapi          # or: uvicorn mfup_fastapi.app:app
+```
+
+**Embedded** into your own FastAPI app — config as a dataclass, hooks as
+plain callables, mounted under any prefix:
+
+```python
+from fastapi import FastAPI
+from mfup_fastapi import MfupConfig, MfupEngine
+
+engine = MfupEngine(MfupConfig(
+    base_dir=Path("/srv/uploads"),
+    redis_url="redis://localhost:6379/0",
+    authorize=my_authorize,              # callable OR "pkg.mod:func"
+    on_committed=my_on_committed,
+))
+app = FastAPI(lifespan=engine.lifespan)  # or call engine.startup()/shutdown()
+app.include_router(engine.router, prefix="/api/uploads")
+```
+
+The router keeps the protocol's fixed `/mfup/*` namespace (plus `/health`)
+under your prefix. Point the browser SDK at the same prefix —
+`new MfupSession({ serverUrl: "https://host/api/uploads" })` — and every
+path lines up. There is no module-level state: two engines in one process
+are two independent instances. `MfupConfig.from_env()` is the exact env
+mapping the standalone server uses (§6).
 
 ---
 
@@ -25,7 +68,8 @@ that.
 
 ## 2. The authorize hook (`MFUP_AUTHORIZE`)
 
-Point `MFUP_AUTHORIZE` at an async callable using a dotted path:
+Pass a callable in `MfupConfig(authorize=...)`, or point `MFUP_AUTHORIZE`
+at it with a dotted path:
 
 ```bash
 MFUP_AUTHORIZE="myapp.uploads:authorize"     # package.module:callable
@@ -38,7 +82,7 @@ into the container, or extend `PYTHONPATH`). A path that fails to import
 ### Signature
 
 ```python
-from mfup.hooks import AuthRequest, AuthResult
+from mfup_core import AuthRequest, AuthResult
 
 async def authorize(req: AuthRequest) -> AuthResult | None:
     ...
@@ -173,17 +217,33 @@ demo triggers it from the browser — but in a product you will usually want
 the **backend** to decide (virus scan, moderation, billing) before
 publishing. Two supported patterns:
 
-1. **Client-driven** (demo style): frontend calls `publish` with
-   `session.token` after the `committed` event. Simplest; fine when commit
-   itself is the only gate.
-2. **Backend-driven**: your frontend tells *your* backend "session X
-   committed"; your backend validates whatever it wants and calls `publish`
-   itself (it can read the token from its own records — pair it with
-   `AuthResult.context` to know whose session it is). The staging dir stays
+1. **Client-driven** (demo style): frontend calls `session.publish()` after
+   the `committed` event (the SDK sends the token and types the errors —
+   `PUBLISH_CONFLICT` carries the conflicting file list). Simplest; fine
+   when commit itself is the only gate.
+2. **Backend-driven**: your backend validates whatever it wants and calls
+   `engine.publish(session_id)` (typed errors: `SessionNotFound`,
+   `NotCommitted`, `ConflictError`, `MappingError`). Pair it with
+   `AuthResult.context` to know whose session it is. The staging dir stays
    resumable/sweepable until you do.
+3. **`on_committed` hook** (`MFUP_ON_COMMITTED` / `MfupConfig(on_committed=...)`):
 
-A server-side `on_committed` hook (config-driven, like authorize) is the
-planned third pattern; not shipped yet — see §7.
+   ```python
+   from mfup_core import CommitEvent
+
+   async def on_committed(ev: CommitEvent) -> str | None:
+       # ev: session_id, target_dir, base_dir, staging_dir, files, bytes,
+       #     meta (untrusted client JSON), context (from authorize)
+       if await scan_ok(ev.staging_dir):
+           return "publish"        # server publishes immediately
+       return None                 # leave it staged; decide later
+   ```
+
+   Returning `"publish"` publishes server-side right after `COMMIT_OK`; the
+   browser's own `publish()` call, if any, then finds the session gone
+   (404) — the SDK treats that as informational. Raising is logged and
+   treated as `None`: a broken consumer hook never strands a committed
+   session.
 
 ---
 
@@ -225,13 +285,16 @@ version bump. After it, `MFUP/2` is frozen and changes go to `MFUP/3`.
 
 ## 6. Server configuration reference
 
-All read at process start (import time). Restart to apply.
+Every env var maps 1:1 to a `MfupConfig` field (`MfupConfig.from_env()`).
+The standalone server reads them once at start; embedded engines take the
+dataclass. Restart to apply either way.
 
 | Env var | Default | Purpose |
 |---|---|---|
 | `MFUP_BASE_DIR` | `/tmp/mfup-uploads` | Root for staging dirs and relative targets |
 | `MFUP_AUTHORIZE` | *(unset = allow-all + warning)* | Dotted path of the authorize hook |
 | `MFUP_MAP_FILE` | *(unset = keep client layout)* | Dotted path of the per-file mapping hook (§2b) |
+| `MFUP_ON_COMMITTED` | *(unset = client-driven publish)* | Dotted path of the on_committed hook (§3) |
 | `MFUP_MAX_META_BYTES` | `16384` | Size cap for `HELLO.meta` JSON |
 | `MFUP_ADMIN_TOKEN` | *(unset = admin routes disabled)* | Bearer for `/mfup/sessions*`, `/mfup/sweep` |
 | `REDIS_URL` | `redis://redis:6379/0` | Session index |
@@ -264,8 +327,9 @@ So integrators size their expectations correctly:
 - **No cross-language protocol kit.** `protocol.py` / `protocol.ts` are
   hand-mirrored; shared test vectors are planned before any third
   implementation.
-- **No server-side `on_committed` / `on_published` hooks yet** — publish
-  orchestration is yours (§3).
-- **Package publication** (PyPI/npm) is a separate step; today you embed by
-  running this server and bundling `client/src` (the demo consumes it via a
-  build-time alias).
+- **No `on_published` hook** — `on_committed` (§3) plus `engine.publish()`
+  cover the shipped orchestration surface; a post-publish notification is
+  not promised yet.
+- **Packages are built and pack-smoked in CI but not yet published** to
+  PyPI/npm; the first `v*` tag triggers `.github/workflows/release.yml`
+  (needs the one-time registry setup described in that file).

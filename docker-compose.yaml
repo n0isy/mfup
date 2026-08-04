@@ -13,11 +13,13 @@ services:
       - "8070"
     command: >
       sh -c "pip install --quiet fastapi uvicorn[standard] websockets redis crc32c &&
-             python -m uvicorn mfup.app:app --host 0.0.0.0 --port 8070 --log-level info"
+             python -m uvicorn mfup_fastapi.app:app --host 0.0.0.0 --port 8070 --log-level info"
     environment:
       MFUP_BASE_DIR: /data/uploads
       REDIS_URL: redis://redis:6379/0
       MFUP_ADMIN_TOKEN: dev-admin-token
+      # Both split packages straight from the bind mount (no pip -e).
+      PYTHONPATH: /app/mfup-core:/app/mfup-fastapi
     volumes:
       - ./server:/app
       - ./uploads:/data/uploads
@@ -52,7 +54,8 @@ services:
     command: sh -c "npm ci && npm run dev"
     volumes:
       - ./example:/app
-      - ./client:/client
+      # vite alias ../packages/client/src → /packages/client/src in-container
+      - ./packages/client:/packages/client
       # per-container node_modules (anonymous volume): never extract npm
       # packages into the bind-mounted host dir, and never share them.
       - /app/node_modules
@@ -63,7 +66,7 @@ services:
     command: sh -c "npm ci && npm run build"
     volumes:
       - ./example:/app
-      - ./client:/client
+      - ./packages/client:/packages/client
       - /app/node_modules
 
   caddy:

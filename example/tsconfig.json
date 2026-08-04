@@ -7,7 +7,18 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "paths": {
+      "@mfup/client": ["../packages/client/src/index.ts"],
+      "@mfup/client/*": ["../packages/client/src/*"],
+      "@mfup/react": ["../packages/react/src/index.ts"]
+    }
   },
-  "include": ["src/**/*.ts", "../client/src/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "../packages/client/src/**/*.ts",
+    "../packages/react/src/**/*.ts"
+  ]
 }

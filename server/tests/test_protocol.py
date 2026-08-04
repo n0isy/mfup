@@ -1,7 +1,7 @@
 """Test binary frame decoding and CRC-32C."""
 
 import struct
-from mfup.protocol import (
+from mfup_core.protocol import (
     FrameTag,
     NodeKind,
     ChecksumKind,
