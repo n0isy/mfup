@@ -931,7 +931,10 @@ export class MfupSession {
         // Backpressure: in batch mode, flush if buffer exceeds threshold
         if (this.data) {
           await this.data.drain();
-          if (this.data.failed) return; // channel died — bail out
+          // Bail on a CLOSED channel too, not only a failed one — otherwise
+          // a close() racing this writer made streamFile silently chew the
+          // rest of the file into a dead channel and mark it "sent".
+          if (this.data.failed || this.data.closed) return;
         }
 
         // NACK recovery: server rejected a chunk — restart from its offset.
@@ -962,8 +965,13 @@ export class MfupSession {
     // Wait for the file pump to fully drain
     await this.pumpDone;
 
-    // If a disconnect happened during pumping, wait for reconnect then re-drain
-    while (this._state === "waiting_resume" || this.fileQueue.length > 0) {
+    // If a disconnect happened during pumping, wait for reconnect then
+    // re-drain. `this.pumping` MUST be part of the condition: after a
+    // reconnect the fresh pump may have already shifted the only queued
+    // file into activeFile — an empty queue does not mean the transfer is
+    // done, and entering the commit loop mid-stream closes the data channel
+    // under the writer (SESSION_END races the file body).
+    while (this._state === "waiting_resume" || this.fileQueue.length > 0 || this.pumping) {
       if (this._reconnectPromise) {
         await this._reconnectPromise;
       }
@@ -972,8 +980,9 @@ export class MfupSession {
       }
       if (this.fileQueue.length > 0) {
         this.kickPump();
-        await this.pumpDone;
       }
+      // Await the LIVE pump run (kickPump keeps pumpDone pointing at it).
+      await this.pumpDone;
     }
 
     // Commit loop: send SESSION_END, wait for COMMIT_OK or COMMIT_RETRY
@@ -1063,16 +1072,21 @@ export class MfupSession {
       this.kickPump();
       await this.pumpDone;
 
-      // Drain any remaining after reconnect (state may change async after awaits)
-      while ((this._state as string) === "waiting_resume" || this.fileQueue.length > 0) {
+      // Drain any remaining after reconnect (state may change async after
+      // awaits). Same invariant as above: no commit while the pump runs.
+      while (
+        (this._state as string) === "waiting_resume" ||
+        this.fileQueue.length > 0 ||
+        this.pumping
+      ) {
         if (this._reconnectPromise) await this._reconnectPromise;
         if (this._state === "failed" || this._state === "aborted") {
           throw new Error(`session ended in state: ${this._state}`);
         }
         if (this.fileQueue.length > 0) {
           this.kickPump();
-          await this.pumpDone;
         }
+        await this.pumpDone;
       }
     }
   }
