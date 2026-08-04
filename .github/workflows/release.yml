@@ -1,11 +1,21 @@
 # Release: build + publish all four packages on a version tag (v0.2.0, …).
 #
-# One-time setup before the first release:
-#   - PyPI: create projects mfup-core / mfup-fastapi with a Trusted Publisher
-#     (this repo, workflow release.yml, environment "release"); no token needed.
-#   - npm: create the @mfup org, add an automation token as the NPM_TOKEN
-#     repo secret.
+# NO long-lived tokens anywhere — both registries use OIDC trusted publishing.
 #
+# One-time setup before the first release:
+#   - PyPI (works for FIRST publish): pypi.org → Account → Publishing →
+#     "Add a new pending publisher" TWICE (mfup-core, mfup-fastapi) with:
+#     owner=n0isy, repository=mfup, workflow=release.yml, environment=release.
+#     The first tag then CREATES the projects via OIDC.
+#   - npm has no "pending publisher": the FIRST publish of @mfup/client and
+#     @mfup/react must be done manually once (npm login with 2FA; from repo
+#     root: npm publish -w @mfup/client -w @mfup/react --access public).
+#     Then on npmjs.com for EACH package: Settings → Publishing access →
+#     add Trusted Publisher (GitHub Actions: n0isy/mfup, release.yml,
+#     environment release) and select "Require two-factor authentication
+#     and disallow tokens". Subsequent tags publish via OIDC below.
+#
+# Also create the "release" GitHub environment (Settings → Environments).
 # Versions: keep package.json / pyproject.toml versions == the tag.
 
 name: release
@@ -57,20 +67,23 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     environment: release
+    permissions:
+      id-token: write   # npm trusted publishing (OIDC) — no NPM_TOKEN
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24        # trusted publishing needs Node >= 22.14
           registry-url: https://registry.npmjs.org
-      - name: Publish @mfup/client and @mfup/react
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Ensure npm >= 11.5.1 (OIDC support)
+        run: npm install -g npm@latest && npm --version
+      - name: Publish @mfup/client and @mfup/react (OIDC, provenance auto)
         run: |
           npm ci
           npm run build
-          npm publish -w @mfup/client --access public --provenance
-          npm publish -w @mfup/react --access public --provenance
+          npm publish -w @mfup/client --access public
+          npm publish -w @mfup/react --access public
 
   publish-pypi:
     needs: build

@@ -35,20 +35,132 @@ docker compose up -d          # redis + backend + demo build + caddy on :20060
 # react demo:  http://localhost:20060/react.html
 ```
 
-Minimal consumer wiring — backend:
+## Integration guide — standalone, step by step
+
+The full walkthrough for wiring MFUP into your product as a separate upload
+service. (The alternative — embedding `engine.router` into your own FastAPI
+app — is one `include_router` call; see `docs/EXTENDING.md` §0.)
+
+### 1. Install the server
+
+```bash
+pip install mfup-fastapi            # pulls mfup-core; needs Python 3.10+
+# not on PyPI yet? straight from the repo:
+pip install "mfup-core @ git+https://github.com/n0isy/mfup#subdirectory=server/mfup-core" \
+            "mfup-fastapi @ git+https://github.com/n0isy/mfup#subdirectory=server/mfup-fastapi"
+```
+
+Requirements: **Redis** (session expiry index) and a **POSIX filesystem**
+for `MFUP_BASE_DIR` — publish is a same-filesystem `rename`, so the base dir
+and your target dirs must live on one mount (per-user homes from the
+authorize hook each stage inside themselves, so separate mounts per user
+are fine).
+
+### 2. Write your authorize hook (do not skip)
+
+Without it the server runs allow-all and warns loudly. One async function:
 
 ```python
-engine = MfupEngine(MfupConfig(base_dir=Path("/srv/uploads"), authorize=my_authorize))
-app = FastAPI(lifespan=engine.lifespan)
-app.include_router(engine.router, prefix="/api/uploads")
+# myapp/uploads.py
+from mfup_core import AuthRequest, AuthResult
+
+async def authorize(req: AuthRequest) -> AuthResult | None:
+    user = await session_from_cookies(req.headers)   # your auth
+    if user is None:
+        return None                                  # deny → auth_failed
+    return AuthResult(
+        base_dir=f"/srv/homes/{user.id}",            # per-user home
+        max_total_bytes=10 * 2**30,
+        max_files=200_000,
+        context={"user_id": user.id},                # yours, in later hooks
+    )
 ```
 
-frontend:
+Optional, same pattern: `map_file` (final per-file layout at publish) and
+`on_committed` (server-side publish decision) — contracts in
+`docs/EXTENDING.md` §2b/§3.
+
+### 3. Run it
+
+```bash
+MFUP_BASE_DIR=/srv/uploads \
+REDIS_URL=redis://localhost:6379/0 \
+MFUP_AUTHORIZE=myapp.uploads:authorize \
+MFUP_ADMIN_TOKEN=$(openssl rand -hex 24) \
+python -m mfup_fastapi              # listens on :8070 (MFUP_HOST/MFUP_PORT)
+```
+
+`myapp` just has to be importable (installed or on `PYTHONPATH`); a broken
+hook path kills startup by design. Full env reference: `docs/EXTENDING.md` §6.
+
+Verify:
+
+```bash
+curl -s localhost:8070/health
+# {"status":"ok","protocol":"MFUP/2","crc32c":"native"}   ← "native" matters
+```
+
+### 4. Put it behind your reverse proxy
+
+Route one prefix to the service; three things matter:
+
+- **WebSocket upgrade** on `<prefix>/mfup/control`;
+- **request buffering OFF** for `<prefix>/mfup/data/` (nginx:
+  `proxy_request_buffering off`) — otherwise the streaming probe fails and
+  clients silently fall back to batched POSTs (correct, just slower);
+- **body size** ≥ `MFUP_MAX_BUFFERED_BODY` (default 16 MiB) for the batch path.
+
+```nginx
+location /api/uploads/ {
+    proxy_pass http://127.0.0.1:8070/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;      # WS
+    proxy_set_header Connection "upgrade";
+    proxy_request_buffering off;                  # streaming data leg
+    client_max_body_size 20m;                     # batch data leg
+    proxy_read_timeout 3600s;                     # long-lived control WS
+}
+```
+
+### 5. Wire the frontend
+
+```bash
+npm install @mfup/client            # + @mfup/react react — if you use React
+```
+
+React (full UX in one hook pair — progress, conflict dialogs, auto-publish):
 
 ```tsx
-const { snapshot, pendingAsks, start } = useMfupUpload({ serverUrl: "/api/uploads" });
-const { getRootProps, getInputProps } = useMfupDropzone({ onSource: start });
+const { snapshot, pendingAsks, busy, start, abort } = useMfupUpload({
+  serverUrl: "/api/uploads",        // your proxy prefix from step 4
+  meta: { scope: "attachments" },   // arrives in your authorize hook
+});
+const { isDragActive, getRootProps, getInputProps } = useMfupDropzone({
+  disabled: busy, onSource: start,
+});
 ```
+
+Vanilla TS: `MfupSession` + `sourceFromDataTransfer` — the imperative
+five-liner and the whole event/snapshot reference are in `docs/CLIENT.md`.
+
+### 6. Smoke-test the loop
+
+Drop a folder → watch `FILE_ACK`s stream → `committed` → files appear
+atomically under the target dir. Drop the same folder again → the server
+ASKs mid-transfer → answer Overwrite/Cancel — the upload never pauses.
+Kill the server mid-upload and restart it → the client reconnects and
+resumes from the accepted offsets.
+
+### 7. Production checklist
+
+- [ ] `MFUP_AUTHORIZE` set (no allow-all warning in the log)
+- [ ] `/health` says `"crc32c":"native"`
+- [ ] `MFUP_ADMIN_TOKEN` set (or admin routes stay disabled — also fine)
+- [ ] quotas set in `AuthResult` (`max_total_bytes` / `max_files`)
+- [ ] one worker per engine, or replicas with **sticky routing** on
+      `session_id` (lazy-resume covers failover; round-robin is unsupported)
+- [ ] retention untouched defaults are sane: TTL 1 h, sweeper 5 min,
+      orphan reconciliation as the safety net
 
 ## Docs
 
