@@ -1,6 +1,6 @@
 {
   "name": "@mfup/client",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "MFUP/2 resumable multi-file upload client: folder drag-and-drop, streaming or batched transport, interactive conflict handling, reconnect/resume",
   "keywords": [
     "upload",

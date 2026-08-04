@@ -1110,6 +1110,11 @@ export class MfupSession {
   }
 
   private markCommitted(files: number, bytes: number): void {
+    // Idempotent: in batch mode the commit arrives TWICE — echoed in the
+    // final POST response body and as COMMIT_OK on the control socket.
+    // Without this guard `committed` fired twice, consumers published twice,
+    // and the second publish hit a fatal 404 (session already removed).
+    if (this._committed !== null) return;
     this._committed = { files, bytes };
     this.setState("committed");
     this.emit("committed", { files, bytes });
