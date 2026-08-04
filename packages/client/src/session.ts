@@ -872,6 +872,14 @@ export class MfupSession {
     this.markSnapshotDirty();
     this.emit("file:start", this._currentFileRef);
 
+    // Fence this writer to the CURRENT data channel — the client-side
+    // analogue of the server's leg fence. A reconnect or commit-retry
+    // replaces this.data; a stale streamFile parked in drain() would then
+    // wake up and pour chunks at its OLD offset into the NEW channel,
+    // triggering a bad_offset NACK storm that burns the file's NACK budget
+    // while the legitimate re-pump is still starting.
+    const dc = this.data;
+
     const openFrame: FileOpenFrame = {
       tag: FrameTag.FILE_OPEN,
       nodeId: file.nodeId,
@@ -894,6 +902,10 @@ export class MfupSession {
         // Terminal states stop the writer immediately — without this an
         // abort() kept slicing the file into a dead channel.
         if (this._state === "aborted" || this._state === "failed") return;
+
+        // Channel replaced (reconnect / commit-retry) — this writer is a
+        // ghost now; the file was requeued and a fresh pump owns it.
+        if (this.data !== dc) return;
 
         if (this.rejectedFiles.has(file.nodeId)) {
           file.status = "rejected";
@@ -928,13 +940,16 @@ export class MfupSession {
           this.progress.setBodySent(this.bodySentTotal);
         }
 
-        // Backpressure: in batch mode, flush if buffer exceeds threshold
-        if (this.data) {
-          await this.data.drain();
+        // Backpressure: in batch mode, flush if buffer exceeds threshold.
+        // Await the channel THIS writer is bound to — not this.data, which
+        // a reconnect may have swapped underneath us mid-await.
+        if (dc) {
+          await dc.drain();
           // Bail on a CLOSED channel too, not only a failed one — otherwise
           // a close() racing this writer made streamFile silently chew the
-          // rest of the file into a dead channel and mark it "sent".
-          if (this.data.failed || this.data.closed) return;
+          // rest of the file into a dead channel and mark it "sent". And
+          // re-check the fence: the swap may have happened during drain().
+          if (dc.failed || dc.closed || this.data !== dc) return;
         }
 
         // NACK recovery: server rejected a chunk — restart from its offset.
@@ -947,6 +962,9 @@ export class MfupSession {
       }
     }
 
+    // Never FILE_CLOSE into a foreign leg: if the channel changed while the
+    // last read completed, the re-pump owns this file's lifecycle now.
+    if (this.data !== dc) return;
     const closeFrame: FileCloseFrame = {
       tag: FrameTag.FILE_CLOSE,
       nodeId: file.nodeId,
