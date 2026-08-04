@@ -57,9 +57,10 @@ Done on 2026-08-04 against the actually published `mfup-fastapi 0.2.0`,
    snippet suggested `serverUrl: "/api/uploads"`, but the client derived
    the WebSocket URL with a plain `http→ws` replace, which requires an
    absolute URL. Workaround used here:
-   `serverUrl: \`${location.origin}/api/mfup\``. Fixed in the client
-   (relative URLs now resolve against `location.origin`) — ships in the
-   next release.
+   `serverUrl: \`${location.origin}/api/mfup\``. Fixed the same day and
+   released as `@mfup/client@0.2.1` (relative URLs now resolve against
+   `location.origin`) — the fix itself was published by the tag-driven
+   OIDC release pipeline, which made this walk a full-cycle test.
 2. A zone's listing fetch could reject during dev-server restarts and
    surfaced as an unhandled "Failed to fetch" — example code now catches
    it. Not a library issue, but a reminder that example code is read as
