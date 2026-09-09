@@ -43,6 +43,7 @@ import {
 import { ConflictError, MappingError } from "./publish.js";
 import {
   FrameReader,
+  IncompleteFrameError,
   FrameTag,
   PROTOCOL_VERSION,
   CRC32C_IMPL,
@@ -55,7 +56,7 @@ import {
   SessionUnknownError,
   type ControlSocket,
 } from "./session.js";
-import { stagingDir } from "./storage.js";
+import { stagingDir, validateSessionId } from "./storage.js";
 
 const logger = createLogger("mfup.handler");
 
@@ -415,6 +416,7 @@ class MfupImpl implements Mfup {
     let frameCount = 0;
     let sessionEndSeen = false;
     let errorDetail: string | null = null;
+    let incompleteFrame = false;
 
     if (buffered) {
       const chunks: Buffer[] = [];
@@ -450,6 +452,7 @@ class MfupImpl implements Mfup {
       try {
         reader.feed(body);
         const frames = reader.drain();
+        reader.finish();
         for (const frame of frames) {
           await session.processFrame(frame, legId);
           frameCount += 1;
@@ -457,6 +460,7 @@ class MfupImpl implements Mfup {
         }
         bodyReceived = body.length;
       } catch (exc) {
+        incompleteFrame = exc instanceof IncompleteFrameError;
         errorDetail = `${(exc as Error).constructor?.name ?? "Error"}: ${(exc as Error).message ?? exc}`;
         logger.error(
           `Frame processing error for session ${sessionId} leg ${legId} seq=${seq}: ${(exc as Error).stack ?? exc}`,
@@ -496,7 +500,9 @@ class MfupImpl implements Mfup {
           }
           bodyReceived += (chunk as Buffer).length;
         }
+        reader.finish();
       } catch (exc) {
+        incompleteFrame = exc instanceof IncompleteFrameError;
         errorDetail = `${(exc as Error).constructor?.name ?? "Error"}: ${(exc as Error).message ?? exc}`;
         logger.error(
           `Data stream error for session ${sessionId} leg ${legId} seq=${seq}: ${(exc as Error).stack ?? exc}`,
@@ -514,13 +520,14 @@ class MfupImpl implements Mfup {
 
     // Only attempt commit when final=1 or SESSION_END was in the frames
     let commitResult: { files: number; bytes: number } | null = null;
-    if ((final === 1 || sessionEndSeen) && session.state === SessionState.COMMITTING) {
+    if (!errorDetail && (final === 1 || sessionEndSeen) && session.state === SessionState.COMMITTING) {
       commitResult = await this.engine.tryCommit(session);
     }
 
     if (errorDetail) {
-      json(res, 500, {
-        error: "data_stream_error",
+      if (incompleteFrame && session.state === SessionState.COMMITTING) session.db.setState(SessionState.ACTIVE);
+      json(res, incompleteFrame ? 400 : 500, {
+        error: incompleteFrame ? "incomplete_frame" : "data_stream_error",
         detail: errorDetail,
         bytes_received: bodyReceived,
       });
@@ -743,12 +750,22 @@ class MfupImpl implements Mfup {
     });
 
     let session: LiveSession | null = null;
+    let controlEpoch: number | null = null;
 
     try {
       // First message must be HELLO or RESUME
       const first = (await q.next()) as Record<string, unknown> | null;
       if (first === null) return;
       const t = first.t;
+
+      if (t === "HELLO" || t === "RESUME") {
+        try {
+          validateSessionId(first.session_id);
+        } catch {
+          await abortAndClose("bad_session_id", "invalid session_id");
+          return;
+        }
+      }
 
       if (t === "HELLO") {
         if (first.v !== PROTOCOL_VERSION) {
@@ -884,6 +901,7 @@ class MfupImpl implements Mfup {
         }
 
         session.ws = controlSock;
+        controlEpoch = session.epoch;
         await send({
           t: "HELLO_OK",
           epoch: session.epoch,
@@ -932,6 +950,7 @@ class MfupImpl implements Mfup {
         }
 
         session.ws = controlSock;
+        controlEpoch = session.epoch;
         // Ensure the expiry callback is wired for resumed sessions
         session.onExpiryChange = (sid, exp) => store.updateExpiry(sid, exp);
         await send(session.buildResumeOk());
@@ -944,6 +963,8 @@ class MfupImpl implements Mfup {
       while (true) {
         const m = (await q.next()) as Record<string, unknown> | null;
         if (m === null) break; // disconnected
+        if (!session || registry.get(session.sessionId) !== session ||
+            session.epoch !== controlEpoch || session.ws !== controlSock) break;
         const mt = m.t;
 
         if (mt === "CLIENT_ABORT") {
@@ -976,7 +997,7 @@ class MfupImpl implements Mfup {
       // while this socket was still open: publish does exactly that.
       // Touching session.state/db then throws inside this finally after a
       // perfectly good upload. Nothing is left to clean up in that case.
-      if (session && registry.get(session.sessionId) !== session) {
+      if (session && (registry.get(session.sessionId) !== session || session.epoch !== controlEpoch)) {
         if (session.ws === controlSock) session.ws = null;
         session = null;
       }
@@ -986,6 +1007,8 @@ class MfupImpl implements Mfup {
           if (session.state === SessionState.COMMITTING) {
             await engine.tryCommit(session);
           }
+          // Commit can yield to a resumed control leg or remove the session.
+          if (registry.get(session.sessionId) !== session || session.epoch !== controlEpoch) return;
           if (session.ws === controlSock) session.ws = null;
           if (
             session.legId &&

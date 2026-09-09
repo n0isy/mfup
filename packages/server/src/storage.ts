@@ -271,9 +271,12 @@ export class SessionDB {
     mtimeMs: number | null = null,
   ): boolean {
     const kindStr = kind === NodeKind.DIR ? "dir" : "file";
-    this.db
-      .prepare("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?)")
+    const node = this.db
+      .prepare("INSERT INTO nodes VALUES (?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE " +
+        "SET size=excluded.size, mtime_ms=excluded.mtime_ms " +
+        "WHERE nodes.parent_id=excluded.parent_id AND nodes.kind=excluded.kind AND nodes.name=excluded.name")
       .run(nodeId, parentId, kindStr, name, size, mtimeMs, NodeStatus.OPEN);
+    if (node.changes === 0) throw new Error("node_id cannot change its parent, kind or name");
     let newFile = false;
     if (kind === NodeKind.FILE) {
       const res = this.db
@@ -302,6 +305,10 @@ export class SessionDB {
 
   setAcceptedOffset(nodeId: number, offset: number): void {
     this.db.prepare("UPDATE files SET accepted_offset=? WHERE node_id=?").run(offset, nodeId);
+  }
+
+  setFilePath(nodeId: number, localPath: string): void {
+    this.db.prepare("UPDATE files SET local_tmp_path=? WHERE node_id=?").run(localPath, nodeId);
   }
 
   setFileFinal(nodeId: number, finalSize: number, localPath: string): void {
@@ -434,11 +441,18 @@ export class SessionDB {
 
 export const DEFAULT_STAGING_PREFIX = ".incoming";
 
+export function validateSessionId(sessionId: unknown): asserts sessionId is string {
+  if (typeof sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)) {
+    throw new Error("session_id must be 1–128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit");
+  }
+}
+
 export function stagingDir(
   baseDir: string,
   sessionId: string,
   prefix: string = DEFAULT_STAGING_PREFIX,
 ): string {
+  validateSessionId(sessionId);
   return path.join(baseDir, `${prefix}.${sessionId}`);
 }
 

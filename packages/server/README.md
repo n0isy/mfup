@@ -11,7 +11,7 @@ on-disk session journal, same Redis key layout — the browser packages
 [`@mfup/react`](https://www.npmjs.com/package/@mfup/react) work against
 either.
 
-**Zero native dependencies.** SQLite comes from `node:sqlite` (Node ≥ 22.5),
+**Zero native dependencies.** SQLite comes from `node:sqlite` (Node ≥ 22.13),
 CRC-32C is a table-driven JS implementation (V8 runs it at hundreds of MB/s),
 and the only runtime dependency is `ws`. `redis` is an optional peer, needed
 only if you opt into the Redis session store.

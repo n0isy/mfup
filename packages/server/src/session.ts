@@ -74,13 +74,13 @@ export class FileWriter {
   private fd: number;
   private closed = false;
 
-  constructor(filePath: string, nodeId: number, acceptedOffset = 0) {
+  constructor(filePath: string, nodeId: number, acceptedOffset = 0, createExclusive = false) {
     this.path = filePath;
     this.nodeId = nodeId;
     this.acceptedOffset = acceptedOffset;
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     if (acceptedOffset === 0) {
-      this.fd = fs.openSync(filePath, "w");
+      this.fd = fs.openSync(filePath, createExclusive ? "wx" : "w");
     } else {
       // Resuming: discard any bytes past the last durably-recorded offset.
       this.fd = fs.openSync(filePath, "r+");
@@ -411,7 +411,7 @@ export class LiveSession {
   }
 
   private async handleNode(f: NodeFrame): Promise<void> {
-    if (this.db.isPruned(f.nodeId)) return;
+    if (this.db.isPruned(f.nodeId) || this.db.isRejected(f.nodeId)) return;
     try {
       validateNodeName(f.name);
     } catch {
@@ -503,7 +503,23 @@ export class LiveSession {
     }
     let writer: FileWriter;
     try {
-      writer = new FileWriter(filePath, f.nodeId, accepted);
+      // The existing journal column records ownership, without another index
+      // or path map. New files use an exclusive create instead of truncation.
+      const createExclusive = accepted === 0 && !fileRow?.local_tmp_path;
+      try {
+        writer = new FileWriter(filePath, f.nodeId, accepted, createExclusive);
+      } catch (exc) {
+        if (!createExclusive || (exc as NodeJS.ErrnoException).code !== "EEXIST") throw exc;
+        // Recovery may leave an unjournaled file after a batch was interrupted.
+        // Inspect existing metadata only on this exceptional path.
+        const otherOwner = this.db.getAllFiles().some((file) => {
+          if (file.node_id === f.nodeId || file.status === "rejected" || file.status === "pruned") return false;
+          return resolvePayloadPath(this.baseDir, this.sessionId, this.db, file.node_id, this.stagingPrefix) === filePath;
+        });
+        if (otherOwner) throw exc;
+        writer = new FileWriter(filePath, f.nodeId, accepted);
+      }
+      if (!fileRow?.local_tmp_path) this.db.setFilePath(f.nodeId, writer.path);
     } catch (exc) {
       // Opening the payload file failed persistently — e.g. a DIR node
       // already occupies this path (EISDIR), or the disk is full. A capacity

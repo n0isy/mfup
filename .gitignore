@@ -6,6 +6,7 @@ __pycache__/
 uploads/
 uploads-node/
 repomix-output.md
+REPORT.md
 *.url
 repomix.sh
 # e2e artifacts

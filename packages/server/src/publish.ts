@@ -153,6 +153,12 @@ export async function publishSessionMapped(
 
   let conflicts = 0;
   for (const [, destRel] of plan) {
+    // Reuse the complete destination map. No extra filesystem reads or index.
+    for (let slash = destRel.lastIndexOf("/"); slash !== -1; slash = destRel.lastIndexOf("/", slash - 1)) {
+      if (seen.has(destRel.slice(0, slash))) {
+        throw new MappingError(`mapped file is also a parent directory: ${JSON.stringify(destRel)}`);
+      }
+    }
     if (await exists(path.join(targetDir, destRel))) conflicts += 1;
   }
   if (conflicts > 0 && action === null) {
@@ -261,17 +267,9 @@ export async function publishSession(
     throw new ConflictError(conflicts);
   }
 
-  let published: string[];
-  if (conflicts > 0 && action === "merge_overwrite") {
-    published = await mergeTree(payload, targetDir);
-  } else {
-    // Clean path — no conflicts: one rename per top-level entry.
-    published = [];
-    for (const entry of await fsp.readdir(payload)) {
-      await fsp.rename(path.join(payload, entry), path.join(targetDir, entry));
-      published.push(entry);
-    }
-  }
+  // Existing directories need merging even when all file names are distinct.
+  // mergeTree still renames a whole subtree when its destination is absent.
+  const published = await mergeTree(payload, targetDir);
 
   for (const name of published) {
     logger.info(`Published session ${sessionId}: ${name}`);

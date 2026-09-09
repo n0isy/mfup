@@ -48,7 +48,7 @@ from mfup_core.hooks import (
     load_authorize_hook,
     resolve_hook,
 )
-from mfup_core.protocol import CRC32C_IMPL, PROTOCOL_VERSION, FrameReader, SessionEndFrame, SessionState
+from mfup_core.protocol import CRC32C_IMPL, PROTOCOL_VERSION, FrameReader, IncompleteFrameError, SessionEndFrame, SessionState
 from mfup_core.session_manager import SessionRegistry, LiveSession
 from mfup_core.publish import (
     ConflictError,
@@ -58,7 +58,7 @@ from mfup_core.publish import (
     publish_session_mapped,
 )
 from mfup_core.redis_index import SessionIndex
-from mfup_core.storage import staging_dir
+from mfup_core.storage import staging_dir, validate_session_id
 
 from .config import MfupConfig
 
@@ -441,11 +441,20 @@ class MfupEngine:
             await ws.accept()
             registry = engine._require_registry()
             session: LiveSession | None = None
+            control_epoch: int | None = None
 
             try:
                 # First message must be HELLO or RESUME
                 msg = await ws.receive_json()
                 t = msg.get("t")
+
+                if t in ("HELLO", "RESUME"):
+                    try:
+                        validate_session_id(msg.get("session_id"))
+                    except ValueError:
+                        await ws.send_json({"t": "SESSION_ABORT", "code": "bad_session_id", "reason": "invalid session_id"})
+                        await ws.close()
+                        return
 
                 if t == "HELLO":
                     if msg.get("v") != PROTOCOL_VERSION:
@@ -596,6 +605,7 @@ class MfupEngine:
                         )
 
                     session.ws = ws
+                    control_epoch = session.epoch
                     await ws.send_json({
                         "t": "HELLO_OK",
                         "epoch": session.epoch,
@@ -658,6 +668,7 @@ class MfupEngine:
                         return
 
                     session.ws = ws
+                    control_epoch = session.epoch
                     # Ensure expiry callback is wired for resumed sessions
                     idx = engine._require_index()
                     session._on_expiry_change = lambda sid, exp: idx.update_expiry(sid, exp)
@@ -676,6 +687,9 @@ class MfupEngine:
                 # Main control loop — CLIENT_ABORT / ACTION
                 while True:
                     msg = await ws.receive_json()
+                    if (session is None or registry.get(session.session_id) is not session
+                            or session.epoch != control_epoch or session.ws is not ws):
+                        break
                     t = msg.get("t")
 
                     if t == "CLIENT_ABORT":
@@ -697,7 +711,7 @@ class MfupEngine:
             except WebSocketDisconnect:
                 logger.info("Control WS disconnected for session %s (state=%s)",
                             session.session_id if session else "unknown",
-                            session.state.value if session else "n/a")
+                            session.state.value if session and registry.get(session.session_id) is session else "n/a")
             except Exception:
                 logger.exception("Control WS error for session %s",
                                  session.session_id if session else "unknown")
@@ -708,7 +722,7 @@ class MfupEngine:
                 # sqlite3.ProgrammingError inside this finally and surfaces
                 # as a bogus ASGI exception after a perfectly good upload.
                 # Nothing is left to clean up in that case.
-                if session and registry.get(session.session_id) is not session:
+                if session and (registry.get(session.session_id) is not session or session.epoch != control_epoch):
                     if session.ws is ws:
                         session.ws = None
                     session = None
@@ -716,6 +730,9 @@ class MfupEngine:
                     # If in COMMITTING state, attempt commit before detaching
                     if session.state == SessionState.COMMITTING:
                         await engine._try_commit(session)
+                    # Commit can yield to a resumed control leg or remove the session.
+                    if registry.get(session.session_id) is not session or session.epoch != control_epoch:
+                        return
                     if session.ws is ws:
                         session.ws = None
                     if session.leg_id and session.state not in (
@@ -835,6 +852,7 @@ class MfupEngine:
             frame_count = 0
             session_end_seen = False
             error_detail: str | None = None
+            incomplete_frame = False
 
             if buffered:
                 body = bytearray()
@@ -869,6 +887,7 @@ class MfupEngine:
                 try:
                     reader.feed(bytes(body))
                     frames = reader.drain()
+                    reader.finish()
                     for frame in frames:
                         await session.process_frame(frame, leg_id)
                         frame_count += 1
@@ -876,6 +895,7 @@ class MfupEngine:
                             session_end_seen = True
                     body_received = len(body)
                 except Exception as exc:
+                    incomplete_frame = isinstance(exc, IncompleteFrameError)
                     error_detail = f"{type(exc).__name__}: {exc}"
                     logger.exception("Frame processing error for session %s leg %s seq=%d", session_id, leg_id, seq)
                 finally:
@@ -912,7 +932,10 @@ class MfupEngine:
                             frames_since_flush = 0
                         body_received += len(chunk)
 
+                    reader.finish()
+
                 except Exception as exc:
+                    incomplete_frame = isinstance(exc, IncompleteFrameError)
                     error_detail = f"{type(exc).__name__}: {exc}"
                     logger.exception("Data stream error for session %s leg %s seq=%d", session_id, leg_id, seq)
                 finally:
@@ -926,13 +949,15 @@ class MfupEngine:
 
             # Only attempt commit when final=1 or SESSION_END was in frames
             commit_result = None
-            if (final == 1 or session_end_seen) and session.state == SessionState.COMMITTING:
+            if not error_detail and (final == 1 or session_end_seen) and session.state == SessionState.COMMITTING:
                 commit_result = await engine._try_commit(session)
 
             if error_detail:
+                if incomplete_frame and session.state == SessionState.COMMITTING:
+                    session.db.set_state(SessionState.ACTIVE)
                 return JSONResponse(
-                    {"error": "data_stream_error", "detail": error_detail, "bytes_received": body_received},
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    {"error": "incomplete_frame" if incomplete_frame else "data_stream_error", "detail": error_detail, "bytes_received": body_received},
+                    status_code=status.HTTP_400_BAD_REQUEST if incomplete_frame else status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
             resp: dict = {"ok": True, "bytes_received": body_received, "frames": frame_count}

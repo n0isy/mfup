@@ -276,6 +276,10 @@ def decode_frame_payload(tag: int, payload: memoryview) -> Frame:
         raise ValueError(f"unknown frame tag: {tag:#04x}")
 
 
+class IncompleteFrameError(ValueError):
+    pass
+
+
 class FrameReader:
     """Incremental frame reader that buffers partial data from a streaming body.
 
@@ -296,6 +300,11 @@ class FrameReader:
 
     def feed(self, data: bytes) -> None:
         self._buf.extend(data)
+
+    def finish(self) -> None:
+        """Check EOF after drain in O(1), without reparsing the body."""
+        if self._buf:
+            raise IncompleteFrameError("incomplete frame at end of request")
 
     def drain(self) -> list[Frame]:
         frames: list[Frame] = []

@@ -6,10 +6,11 @@ here is internal and may change.
 
 Audience assumptions: your backend is Python, your frontend is TypeScript.
 
-The code ships as four packages:
+The code ships as five packages:
 
 | Package | Registry | Contents |
 |---|---|---|
+| `@mfup/server` | npm | Node server: HTTP/WebSocket handlers, memory or Redis store |
 | `mfup-core` | PyPI | engine: protocol, session machine, storage, publish, hook contracts |
 | `mfup-fastapi` | PyPI | `MfupEngine` + `APIRouter` + standalone server |
 | `@mfup/client` | npm | browser SDK (events + snapshot store, see `docs/CLIENT.md`) |
@@ -94,7 +95,7 @@ Called once per `HELLO`, before any session state is created.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `session_id` | `str` | Client-proposed session id (UUID) |
+| `session_id` | `str` | Client-proposed session id (UUID by default). 1–128 ASCII letters, digits, `.`, `_`, `-`; starts with a letter or digit. Invalid IDs receive `bad_session_id` before hooks or staging |
 | `target_dir` | `str` | Client-requested target, relative to `MFUP_BASE_DIR` |
 | `headers` | `Mapping[str, str]` | HTTP headers of the WS handshake — cookies, `Authorization`, etc. |
 | `client` | `str` | `"ip:port"` of the peer (as seen by the ASGI server) |
@@ -114,7 +115,7 @@ resolve the user, validate `req.meta` (it names *what* is being uploaded —
 | `max_files` | `int \| None` | File-count quota; same abort semantics |
 | `base_dir` | `str \| None` | **Per-session base directory** (absolute), e.g. the user's home. Replaces `MFUP_BASE_DIR` for this session: the staging dir is created *inside* it (publish stays a same-filesystem rename even when homes are separate mounts), relative targets resolve against it, containment confines the session to it. Created if missing. A relative path is a config error → deny |
 | `target_dir` | `str \| None` | Replace **or map** the client's request — the hook receives the client value in `req.target_dir` and may rewrite it. Contained within the session's base dir regardless |
-| `context` | `dict` | Your correlation bag (user id, org id, …). In-memory only; never persisted, never sent to the client |
+| `context` | `dict` | Your correlation bag (user id, org id, …). JSON-serializable context is persisted in the session journal for recovery; never sent to the client |
 
 Raising an exception from the hook is treated as a deny (logged with
 traceback server-side, generic reason to the client).
@@ -123,7 +124,7 @@ traceback server-side, generic reason to the client).
 
 ```python
 # myapp/uploads.py
-from mfup.hooks import AuthRequest, AuthResult
+from mfup_core import AuthRequest, AuthResult
 from myapp.auth import resolve_user  # your code
 
 async def authorize(req: AuthRequest) -> AuthResult | None:
@@ -173,7 +174,7 @@ MFUP_MAP_FILE="myapp.uploads:map_file"
 ```
 
 ```python
-from mfup.hooks import FileMapRequest
+from mfup_core import FileMapRequest
 
 async def map_file(req: FileMapRequest) -> str | None:
     scope = req.context.get("scope", "misc")        # from your authorize hook
@@ -241,7 +242,9 @@ publishing. Two supported patterns:
 
    Returning `"publish"` publishes server-side right after `COMMIT_OK`; the
    browser's own `publish()` call, if any, then finds the session gone
-   (404) — the SDK treats that as informational. Raising is logged and
+   (404) — the SDK currently throws `PUBLISH_FAILED`. Set React
+   `autoPublish: false` when the backend owns publication; a 404 alone does
+   not distinguish publication from expiry. Raising is logged and
    treated as `None`: a broken consumer hook never strands a committed
    session.
 
@@ -330,6 +333,6 @@ So integrators size their expectations correctly:
 - **No `on_published` hook** — `on_committed` (§3) plus `engine.publish()`
   cover the shipped orchestration surface; a post-publish notification is
   not promised yet.
-- **Packages are built and pack-smoked in CI but not yet published** to
-  PyPI/npm; the first `v*` tag triggers `.github/workflows/release.yml`
-  (needs the one-time registry setup described in that file).
+- **Packages are published to PyPI/npm and built and pack-smoked in CI.**
+  Version tags trigger `.github/workflows/release.yml`; registry setup and
+  first-publication details are documented in that workflow.

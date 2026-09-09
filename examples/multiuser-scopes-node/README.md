@@ -22,7 +22,7 @@ docker compose up -d server-node client-node
 # → http://localhost:20062
 ```
 
-Or natively (server needs **Node ≥ 22.5** — `node:sqlite`):
+Or natively (server needs **Node ≥ 22.13** — `node:sqlite`):
 
 ```bash
 # Terminal 1 — server (:8091; data lands in ./data/<uid>/<scope>/,

@@ -8,6 +8,7 @@ Each session lives in:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -215,10 +216,14 @@ class SessionDB:
         (i.e. this is the first time we see this FILE node) — used by the
         caller to maintain the file-count quota without SQL aggregates."""
         kind_str = "dir" if kind == NodeKind.DIR else "file"
-        self._conn.execute(
-            "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?)",
+        node = self._conn.execute(
+            "INSERT INTO nodes VALUES (?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE "
+            "SET size=excluded.size, mtime_ms=excluded.mtime_ms "
+            "WHERE nodes.parent_id=excluded.parent_id AND nodes.kind=excluded.kind AND nodes.name=excluded.name",
             (node_id, parent_id, kind_str, name, size, mtime_ms, NodeStatus.OPEN.value),
         )
+        if node.rowcount == 0:
+            raise ValueError("node_id cannot change its parent, kind or name")
         new_file = False
         if kind == NodeKind.FILE:
             cur = self._conn.execute(
@@ -251,6 +256,10 @@ class SessionDB:
         self._conn.execute(
             "UPDATE files SET accepted_offset=? WHERE node_id=?", (offset, node_id)
         )
+        self._maybe_commit()
+
+    def set_file_path(self, node_id: int, local_path: str) -> None:
+        self._conn.execute("UPDATE files SET local_tmp_path=? WHERE node_id=?", (local_path, node_id))
         self._maybe_commit()
 
     def set_file_final(self, node_id: int, final_size: int, local_path: str) -> None:
@@ -378,7 +387,13 @@ class SessionDB:
 DEFAULT_STAGING_PREFIX = ".incoming"
 
 
+def validate_session_id(session_id: object) -> None:
+    if not isinstance(session_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id) is None:
+        raise ValueError("session_id must be 1–128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit")
+
+
 def staging_dir(base_dir: Path, session_id: str, prefix: str = DEFAULT_STAGING_PREFIX) -> Path:
+    validate_session_id(session_id)
     return base_dir / f"{prefix}.{session_id}"
 
 

@@ -211,10 +211,10 @@ resumes from the accepted offsets.
 
 ## Testing
 
-- `server/tests` — pytest hardening suite for the Python server (34 tests →
-  41 cases: protocol vectors, traversal, quotas, recovery, hooks).
-- `packages/server/test` — vitest (69 cases): byte-level codec pinned
-  against the client encoders, a mirror of the Python hardening suite, and
+- `server/tests` — pytest: protocol vectors, path validation, quotas,
+  recovery, publication, control-channel ownership and hooks.
+- `packages/server/test` — vitest: byte-level codec pinned
+  against the client encoders, shared cases with the Python suite, and
   wire-level integration over real http + WebSocket (incl. RESUME).
 - `e2e/` — Playwright suites on chromium/firefox/webkit, incl. chaos tests
   (backend killed mid-transfer, byte-exact disk verification).

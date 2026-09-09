@@ -277,6 +277,8 @@ export function decodeFramePayload(tag: number, payload: Uint8Array): Frame {
  * malicious 4-byte prefix claiming a multi-gigabyte frame would grow the
  * buffer without limit while the reader waits for it to "complete".
  */
+export class IncompleteFrameError extends Error {}
+
 export class FrameReader {
   // 1 MiB default: comfortably above MAX_CHUNK_BYTES (256 KiB) + headers
   // and any NODE frame with a long UTF-8 name.
@@ -295,6 +297,11 @@ export class FrameReader {
       this.chunks.push(data);
       this.buffered += data.length;
     }
+  }
+
+  /** Check EOF in O(1), after drain(); never reparses the body. */
+  finish(): void {
+    if (this.buffered !== 0) throw new IncompleteFrameError("incomplete frame at end of request");
   }
 
   drain(): Frame[] {

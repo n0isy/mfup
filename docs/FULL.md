@@ -1,7 +1,7 @@
 # MFUP/2 — Multi-File Upload Protocol
 
 **Packages:** `mfup-core` + `mfup-fastapi` (PyPI) · `@mfup/client` + `@mfup/react` + `@mfup/server` (npm)
-**Languages:** Python 3.10+ · TypeScript 5.5 (ES2022; browser for the client, Node ≥ 22.5 for the server)
+**Languages:** Python 3.10+ · TypeScript 5.5 (ES2022; browser for the client, Node ≥ 22.13 for the server)
 **Frameworks:** FastAPI + uvicorn or any Node HTTP stack (server) · zero runtime dependencies (client) · Vite 6 (demo)
 **Protocol version:** `MFUP/2`
 **Stores:** SQLite (one DB per session) · Redis or in-memory (session expiry index) · POSIX filesystem
@@ -1093,13 +1093,13 @@ Optional `dev` extra: `pytest`, `pytest-asyncio`, `httpx`. `[tool.pytest.ini_opt
 
 ## 5. @mfup/server — Node Server
 
-`@mfup/server` is a second, independent MFUP/2 server implementation: the same protocol, the same on-disk session journal, and the same Redis key layout as `mfup-fastapi`, written in TypeScript for Node. The browser packages talk to either without knowing which is behind the socket — that wire-compatibility is enforced in CI, where the entire Playwright suite runs twice, once per backend (§9.8). Version `0.2.0`, MIT, ESM-only (`"type": "module"`, `"sideEffects": false`), `engines.node >= 22.5.0`.
+`@mfup/server` is a second, independent MFUP/2 server implementation: the same protocol, the same on-disk session journal, and the same Redis key layout as `mfup-fastapi`, written in TypeScript for Node. The browser packages talk to either without knowing which is behind the socket — that wire-compatibility is enforced in CI, where the entire Playwright suite runs twice, once per backend (§9.8). Version `0.2.0`, MIT, ESM-only (`"type": "module"`, `"sideEffects": false`), `engines.node >= 22.13.0`.
 <!-- ⬆️ 130 ⬆️ -->
 
 Source: `packages/server/src/` — `session.ts` (1124 lines), `handler.ts` (1024), `engine.ts` (602), `storage.ts` (517), `protocol.ts` (369), `publish.ts` (291), `store.ts` (134), `hooks.ts` (128), `store-redis.ts` (121), `index.ts` (98), `vite.ts` (63), `logger.ts` (46), plus `bin/mfup-server.mjs` (116).
 <!-- ⬆️ 131 ⬆️ -->
 
-**Zero native dependencies.** SQLite comes from `node:sqlite` (the reason for the Node ≥ 22.5 floor), CRC-32C is a table-driven JS implementation, and `ws` is the only runtime dependency. `redis` is an *optional* peer (`peerDependenciesMeta.redis.optional`), needed only for the Redis session store. This is the deliberate counterpart to the Python server's hard `crc32c` C-extension requirement (§3.2): there a pure-Python fallback was removed for being too slow; here the JS table implementation is fast enough on V8 that no native module is needed. `CRC32C_IMPL` is correspondingly the constant `"js-table"`, against `"native"` on the Python side.
+**Zero native dependencies.** SQLite comes from `node:sqlite` (the reason for the Node ≥ 22.13 floor), CRC-32C is a table-driven JS implementation, and `ws` is the only runtime dependency. `redis` is an *optional* peer (`peerDependenciesMeta.redis.optional`), needed only for the Redis session store. This is the deliberate counterpart to the Python server's hard `crc32c` C-extension requirement (§3.2): there a pure-Python fallback was removed for being too slow; here the JS table implementation is fast enough on V8 that no native module is needed. `CRC32C_IMPL` is correspondingly the constant `"js-table"`, against `"native"` on the Python side.
 <!-- ⬆️ 132 ⬆️ -->
 
 ### 5.1 The universal handler (`handler.ts`)
@@ -2436,7 +2436,7 @@ The same example against `@mfup/server` instead of `mfup-fastapi`, proving the w
 It runs with **no Redis at all** — the default memory session store, with live sessions re-discovered after a restart by scanning `DATA_DIR` for staging directories (§5.2). Data lands in `./uploads-node/<uid>/<scope>/`, against `./uploads/…` for the Python edition. Crucially the **React client is reused unchanged** from `examples/multiuser-scopes/client`: both editions bind-mount the same client directory, so nothing on the browser side is aware of which server it is talking to.
 <!-- ⬆️ 288 ⬆️ -->
 
-From the repo root, `docker compose up -d server-node client-node` serves the app on `http://localhost:20062`. Natively the server needs **Node ≥ 22.5** for `node:sqlite`: `npm install && node server.mjs` in `examples/multiuser-scopes-node/server` (listens on `:8091`, data under `./data/<uid>/<scope>/`, overridable with `DEMO_DATA_DIR`; setting `REDIS_URL` switches the memory store for the Redis one), then `npm install && EXAMPLE_BACKEND_URL=http://localhost:8091 npm run dev -- --port 20062` in `examples/multiuser-scopes/client` — the shared client directory from the Python edition.
+From the repo root, `docker compose up -d server-node client-node` serves the app on `http://localhost:20062`. Natively the server needs **Node ≥ 22.13** for `node:sqlite`: `npm install && node server.mjs` in `examples/multiuser-scopes-node/server` (listens on `:8091`, data under `./data/<uid>/<scope>/`, overridable with `DEMO_DATA_DIR`; setting `REDIS_URL` switches the memory store for the Redis one), then `npm install && EXAMPLE_BACKEND_URL=http://localhost:8091 npm run dev -- --port 20062` in `examples/multiuser-scopes/client` — the shared client directory from the Python edition.
 <!-- ⬆️ 289 ⬆️ -->
 
 ---
@@ -2753,11 +2753,11 @@ Dependencies: `react` / `react-dom` `^18.3.1`. Dev dependencies: `@types/react` 
 MFUP/2 is verified by three independent layers. `server/tests/` is a pytest suite that drives `mfup-core` and `mfup-fastapi` in-process — real per-session SQLite databases in `tmp_path`, a fake WebSocket capturing control messages, no network. `packages/server/test/` is a vitest suite that does the same for `@mfup/server`, plus wire-level integration over a real `http` + `ws` server. `e2e/` is a Playwright suite that drives Chromium, Firefox and WebKit against a full containerized stack (Caddy → backend → Redis, plus a built demo bundle), including chaos tests that `docker compose kill` the backend mid-upload and assert byte-exact recovery; it runs against the Python and the Node backend in turn (§9.8). Both stacks share one bind-mounted `uploads/` directory, which is how the Node-side assertions read what the server actually wrote.
 <!-- ⬆️ 334 ⬆️ -->
 
-| Layer | Location | Runner | Count |
+| Layer | Location | Runner | Coverage |
 |-------|----------|--------|-------|
-| Python unit / hardening | `server/tests/` | `cd server && python -m pytest tests -q` | 34 test functions → 41 collected cases (parametrization) |
-| Node unit / hardening / wire | `packages/server/test/` | `npm test -w @mfup/server` | 55 declared cases → 69 collected cases (`it.each`) |
-| Browser end-to-end | `e2e/tests/` | `cd e2e && npx playwright test` | 11 declared tests → 14 chromium cases + 3 each on firefox/webkit |
+| Python unit / integration | `server/tests/` | `cd server && python -m pytest tests -q` | Protocol, paths, recovery, publication and FastAPI control/data handlers |
+| Node unit / integration | `packages/server/test/` | `npm test -w @mfup/server` | Matching protocol and lifecycle cases plus real HTTP/WebSocket requests |
+| Browser end-to-end | `e2e/tests/` | `cd e2e && npx playwright test` | Chromium, Firefox and WebKit; backend restart and byte comparisons |
 <!-- ⬆️ 335 ⬆️ -->
 
 ### 9.1 Wire-protocol tests (`server/tests/test_protocol.py`)
@@ -2779,7 +2779,7 @@ Eight synchronous tests covering CRC-32C and the incremental `FrameReader`. Fram
 
 ### 9.2 Hardening suite (`server/tests/test_edge_cases.py`)
 
-26 test functions (41 collected cases after parametrization). The shared fixtures are `FakeWS`, which records every control message and exposes `of_type(t)`, and `make_session(tmp_path, sid)`, which opens a real session DB via `open_session_db`, calls `db.init_session(...)`, constructs `LiveSession(sid, "tok", tmp_path, db, target_dir=".")`, attaches leg `"leg1"` and swaps in the fake socket. Two helpers stream whole trees: `_send_tree(s, files)` emits NODE/FILE_OPEN/FILE_CHUNK/FILE_CLOSE per entry plus a terminal `SessionEndFrame`, and `_upload_tree` additionally asserts `try_commit()` returns `COMMIT_OK`.
+The shared fixtures are `FakeWS`, which records every control message and exposes `of_type(t)`, and `make_session(tmp_path, sid)`, which opens a real session DB via `open_session_db`, calls `db.init_session(...)`, constructs `LiveSession(sid, "tok", tmp_path, db, target_dir=".")`, attaches leg `"leg1"` and swaps in the fake socket. Two helpers stream whole trees: `_send_tree(s, files)` emits NODE/FILE_OPEN/FILE_CHUNK/FILE_CLOSE per entry plus a terminal `SessionEndFrame`, and `_upload_tree` additionally asserts `try_commit()` returns `COMMIT_OK`. `test_review.py` adds path ownership, mapped-plan, incomplete-request and control ownership regressions, including requests through the FastAPI router.
 <!-- ⬆️ 338 ⬆️ -->
 
 #### Name validation and path traversal
@@ -2861,7 +2861,7 @@ Eight synchronous tests covering CRC-32C and the incremental `FrameReader`. Fram
 
 ### 9.3 Node server suite (`packages/server/test/`)
 
-A vitest suite covering `@mfup/server` in-process: **55 declared cases expanding to 69 via `it.each` parametrization**, run with `npm test -w @mfup/server`. `helpers.ts` supplies the shared fixtures.
+A vitest suite covering `@mfup/server` in-process and over HTTP/WebSocket, run with `npm test -w @mfup/server`. `helpers.ts` supplies the shared fixtures; `review.test.ts` adds path ownership, mapped-plan and incomplete-frame regressions.
 <!-- ⬆️ 348 ⬆️ -->
 
 | File | Cases | Covers |
@@ -3073,7 +3073,7 @@ CI (`.github/workflows/e2e.yml`) runs five jobs. `server-unit` installs `./serve
 │   │       └── dnd.ts             # sourceFromDataTransfer / sourceFromInput  (87 ln)
 │   ├── react/                     # @mfup/react 0.2.0 — peer: client + react>=18
 │   │   └── src/{index,context,useMfupSession,useMfupUpload,useMfupDropzone}.ts
-│   └── server/                    # @mfup/server 0.2.0 — Node ≥22.5, deps: ws (redis optional)
+│   └── server/                    # @mfup/server 0.2.0 — Node ≥22.13, deps: ws (redis optional)
 │       ├── src/
 │       │   ├── session.ts         # LiveSession, FileWriter, SessionRegistry  (1124 ln)
 │       │   ├── handler.ts         # universal handle()/upgrade() + routes     (1024 ln)
@@ -3086,7 +3086,7 @@ CI (`.github/workflows/e2e.yml`) runs five jobs. `server-unit` installs `./serve
 │       │   ├── store-redis.ts     # RedisStore — Python-compatible key layout  (121 ln)
 │       │   └── index.ts / vite.ts / logger.ts
 │       ├── bin/mfup-server.mjs    # standalone CLI, MFUP_* env parity          (116 ln)
-│       └── test/                  # vitest: 55 declared → 69 cases
+│       └── test/                  # vitest: protocol, lifecycle, HTTP/WebSocket
 │
 ├── server/                        # PyPI packages
 │   ├── mfup-core/mfup_core/       # 0.2.0 — deps: redis>=5, crc32c>=2.7
@@ -3102,7 +3102,7 @@ CI (`.github/workflows/e2e.yml`) runs five jobs. `server-unit` installs `./serve
 │   │   ├── config.py              # MfupConfig + from_env()
 │   │   ├── app.py / __main__.py   # standalone entry points
 │   │   └── __init__.py            # create_app, typed publish errors
-│   └── tests/                     # pytest: 34 functions → 41 cases
+│   └── tests/                     # pytest: protocol, lifecycle, FastAPI router
 │       ├── test_edge_cases.py     # hardening: names, quotas, ENOSPC, hooks
 │       └── test_protocol.py       # CRC vectors + FrameReader
 │

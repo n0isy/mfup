@@ -55,14 +55,14 @@ MAX_COMMIT_RETRIES = 5
 class FileWriter:
     """Wraps an open file handle for a single file being uploaded."""
 
-    def __init__(self, path: Path, node_id: int, accepted_offset: int = 0) -> None:
+    def __init__(self, path: Path, node_id: int, accepted_offset: int = 0, create_exclusive: bool = False) -> None:
         self.path = path
         self.node_id = node_id
         self.accepted_offset = accepted_offset
         # Open with 'ab' to append; if resuming, we truncate to accepted_offset first.
         path.parent.mkdir(parents=True, exist_ok=True)
         if accepted_offset == 0:
-            self._fh = open(path, "wb")
+            self._fh = open(path, "xb" if create_exclusive else "wb")
         else:
             self._fh = open(path, "r+b")
             self._fh.seek(accepted_offset)
@@ -345,7 +345,7 @@ class LiveSession:
             })
 
     async def _handle_node(self, f: NodeFrame) -> None:
-        if self.db.is_pruned(f.node_id):
+        if self.db.is_pruned(f.node_id) or self.db.is_rejected(f.node_id):
             return
         try:
             validate_node_name(f.name)
@@ -417,7 +417,26 @@ class LiveSession:
         if prev is not None:
             prev.close()
         try:
-            writer = FileWriter(path, f.node_id, accepted)
+            # Reuse the existing path column; no extra table, index or path map.
+            create_exclusive = accepted == 0 and not (file_row and file_row["local_tmp_path"])
+            try:
+                writer = FileWriter(path, f.node_id, accepted, create_exclusive)
+            except FileExistsError:
+                if not create_exclusive:
+                    raise
+                # An interrupted batch can leave an unjournaled file. Only
+                # this exceptional path needs a scan of existing metadata.
+                other_owner = any(
+                    file["node_id"] != f.node_id
+                    and file["status"] not in ("rejected", "pruned")
+                    and resolve_payload_path(self.base_dir, self.session_id, self.db, file["node_id"], self.staging_prefix) == path
+                    for file in self.db.get_all_files()
+                )
+                if other_owner:
+                    raise
+                writer = FileWriter(path, f.node_id, accepted)
+            if not (file_row and file_row["local_tmp_path"]):
+                self.db.set_file_path(f.node_id, str(writer.path))
         except OSError as exc:
             # Opening the payload file failed persistently — e.g. a DIR node
             # already occupies this path (IsADirectoryError), or the disk is

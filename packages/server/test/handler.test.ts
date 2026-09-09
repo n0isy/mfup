@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import {
@@ -21,7 +21,7 @@ import {
   FrameTag as CFrameTag,
 } from "@mfup/client";
 
-import { createMfup, stagingDir, type Mfup } from "../src/index.js";
+import { createMfup, SessionState, stagingDir, type Mfup } from "../src/index.js";
 import { mkTmpDir, rmrf } from "./helpers.js";
 
 // ---------------------------------------------------------------------------
@@ -101,6 +101,7 @@ class Ctl {
   }
 
   open(): Promise<void> {
+    if (this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
     return new Promise((res, rej) => {
       this.ws.once("open", res);
       this.ws.once("error", rej);
@@ -230,6 +231,84 @@ function postData(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe("review regressions over HTTP and WebSocket", () => {
+  it.each(["HELLO", "RESUME"])("rejects a path-shaped session id in %s", async t => {
+    const ctl = new Ctl(`ws://127.0.0.1:${port}/mfup/control`);
+    await ctl.open();
+    ctl.send({ t, v: "MFUP/2", session_id: "x/../../other", leg_id: "one" });
+    expect((await ctl.waitFor("SESSION_ABORT")).code).toBe("bad_session_id");
+    ctl.close();
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])("rejects a truncated frame (streaming=%s, sessionEnd=%s)", async (streaming, withEnd) => {
+    const o = await hello(`it-incomplete-${streaming}-${withEnd}`);
+    const tail = Buffer.from([0, 0, 0, 100, 1]);
+    const body = withEnd ? concat([sessionEnd(0, 0), tail]) : tail;
+    let status: number, response: { error?: string };
+    if (streaming) {
+      const result = await new Promise<{ status: number; response: { error?: string } }>((resolve, reject) => {
+        const req = http.request(`${origin}/mfup/data/${o.sid}/${o.leg}?seq=0&final=1&epoch=${o.epoch}`, {
+          method: "POST", headers: { "x-mfup-token": o.token },
+        }, res => {
+          const chunks: Buffer[] = [];
+          res.on("data", data => chunks.push(data));
+          res.on("end", () => resolve({ status: res.statusCode!, response: JSON.parse(Buffer.concat(chunks).toString()) }));
+        });
+        req.on("error", reject); req.write(body); req.end();
+      });
+      ({ status, response } = result);
+    } else {
+      const r = await postData(o, body, 0, 1); status = r.status; response = await r.json();
+    }
+    expect(status).toBe(400); expect(response.error).toBe("incomplete_frame");
+    expect(mfup.engine.registry!.get(o.sid)!.state).toBe(SessionState.ACTIVE);
+    if (!streaming) {
+      expect(mfup.engine.registry!.get(o.sid)!.finalSeqSeen).toBe(false);
+      expect((await postData(o, Buffer.alloc(0), 0, 0)).status).toBe(200);
+    }
+    o.ctl.send({ t: "CLIENT_ABORT" }); o.ctl.close();
+  });
+
+  it.each([null, "cancel", "CLIENT_ABORT"])("old control cannot change a resumed leg (%s)", async action => {
+    const o = await hello(`it-old-${action}`);
+    const ctl = new Ctl(`ws://127.0.0.1:${port}/mfup/control`); await ctl.open();
+    // Even reusing the same leg string must be fenced by the new epoch.
+    ctl.send({ t: "RESUME", session_id: o.sid, resume_token: o.token, leg_id: o.leg });
+    const resumed = await ctl.waitFor("RESUME_OK");
+    if (action) o.ctl.send(action === "CLIENT_ABORT" ? { t: action } : { t: "ACTION", action });
+    o.ctl.close(); await poll(() => o.ctl.closed);
+    expect((await postData({ ...o, epoch: resumed.epoch as number }, Buffer.alloc(0), 0, 0)).status).toBe(200);
+    expect(mfup.engine.registry!.get(o.sid)!.legId).toBe(o.leg);
+    ctl.send({ t: "CLIENT_ABORT" }); ctl.close();
+  });
+
+  it("rechecks control ownership after a pending commit attempt", async () => {
+    const o = await hello("it-old-pending-commit");
+    const s = mfup.engine.registry!.get(o.sid)!;
+    s.db.setState(SessionState.COMMITTING);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    const commit = vi.spyOn(mfup.engine, "tryCommit").mockImplementation(async () => {
+      s.db.setState(SessionState.ACTIVE); entered = true;
+      await gate;
+      return null;
+    });
+    const ctl = new Ctl(`ws://127.0.0.1:${port}/mfup/control`);
+    try {
+      o.ctl.close(); await poll(() => entered);
+      await ctl.open();
+      ctl.send({ t: "RESUME", session_id: o.sid, resume_token: o.token, leg_id: "new-leg" });
+      const resumed = await ctl.waitFor("RESUME_OK");
+      release();
+      expect((await postData({ ...o, leg: "new-leg", epoch: resumed.epoch as number }, Buffer.alloc(0), 0, 0)).status).toBe(200);
+      expect(s.legId).toBe("new-leg");
+    } finally {
+      release(); commit.mockRestore(); ctl.close();
+    }
+  });
+});
 
 describe("HTTP surface", () => {
   it("GET /health", async () => {

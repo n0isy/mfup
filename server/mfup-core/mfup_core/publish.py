@@ -98,7 +98,15 @@ def publish_session_mapped(
         seen[dest_rel] = rel
         plan.append((payload / rel, dest_rel))
 
-    conflicts = sum(1 for _src, dest_rel in plan if (target_dir / dest_rel).exists())
+    conflicts = 0
+    for _src, dest_rel in plan:
+        # Reuse the complete destination map; no additional disk traversal.
+        parent = dest_rel.rpartition("/")[0]
+        while parent:
+            if parent in seen:
+                raise MappingError(f"mapped file is also a parent directory: {dest_rel!r}")
+            parent = parent.rpartition("/")[0]
+        conflicts += (target_dir / dest_rel).exists()
     if conflicts > 0 and action is None:
         raise ConflictError(conflicts)
 
@@ -158,6 +166,8 @@ def _merge_tree(src: Path, dst: Path) -> list[str]:
                 published.append(entry.name)
         else:
             # File: overwrite or create
+            if dest.is_dir():
+                shutil.rmtree(dest)
             if dest.exists():
                 os.replace(str(entry), str(dest))
             else:
@@ -193,15 +203,9 @@ def publish_session(
     if conflicts > 0 and action is None:
         raise ConflictError(conflicts)
 
-    if conflicts > 0 and action == "merge_overwrite":
-        published = _merge_tree(payload, target_dir)
-    else:
-        # Clean path — no conflicts
-        published = []
-        for entry in list(payload.iterdir()):
-            dest = target_dir / entry.name
-            os.rename(str(entry), str(dest))
-            published.append(entry.name)
+    # Matching directories merge even without file conflicts; absent subtrees
+    # still move with a single rename.
+    published = _merge_tree(payload, target_dir)
 
     for name in published:
         logger.info("Published session %s: %s", session_id, name)
