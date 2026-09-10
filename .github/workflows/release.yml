@@ -50,7 +50,7 @@ jobs:
           path: dist-py/
   source:
     needs: build
-    if: ${{ always() && (needs.build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.artifact_run_id != '')) }}
+    if: ${{ !cancelled() && (needs.build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.artifact_run_id != '')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -71,7 +71,7 @@ jobs:
           ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
   npm:
     needs: source
-    if: needs.source.outputs.publish == 'true'
+    if: ${{ !cancelled() && needs.source.result == 'success' && needs.source.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -104,7 +104,7 @@ jobs:
           done
   pypi:
     needs: source
-    if: needs.source.outputs.publish == 'true'
+    if: ${{ !cancelled() && needs.source.result == 'success' && needs.source.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -124,7 +124,7 @@ jobs:
 
   verify:
     needs: [npm, pypi, source]
-    if: needs.source.outputs.publish == 'true'
+    if: ${{ !cancelled() && needs.source.result == 'success' && needs.npm.result == 'success' && needs.pypi.result == 'success' && needs.source.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
