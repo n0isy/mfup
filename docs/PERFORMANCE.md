@@ -40,17 +40,17 @@ The measured lists are flat. A browser folder picker can supply relative file pa
 
 | Payload      | Mode                          | Total ms (median) |    Min-max ms | Backend CPU ms | Main-thread ms |
 | ------------ | ----------------------------- | ----------------: | ------------: | -------------: | -------------: |
-| 1 x 1 KiB    | Raw File                      |               3.0 |       2.8-3.6 |            1.3 |            2.4 |
-| 1 x 1 KiB    | One FormData list             |               3.6 |       3.3-3.7 |            1.3 |            2.8 |
-| 1 x 1 KiB    | One file/request, six workers |               3.2 |       3.2-6.3 |            1.3 |            2.6 |
-| 1 x 1 KiB    | MFUP/3                        |              29.0 |     28.2-34.4 |           10.9 |            7.3 |
-| 1000 x 1 KiB | One FormData list             |             425.4 |   419.0-431.5 |          109.8 |          212.8 |
-| 1000 x 1 KiB | One file/request, six workers |            1128.2 |  973.1-1154.4 |          704.1 |         1006.4 |
-| 1000 x 1 KiB | MFUP/3                        |            1275.9 | 1258.5-1340.4 |         1202.1 |          266.8 |
-| 1 x 64 MiB   | Raw File                      |             140.3 |   108.8-141.2 |          121.5 |            4.1 |
-| 1 x 64 MiB   | One FormData list             |             341.5 |   323.8-363.5 |          352.9 |            3.9 |
-| 1 x 64 MiB   | One file/request, six workers |             408.5 |   323.7-416.0 |          365.5 |            4.4 |
-| 1 x 64 MiB   | MFUP/3                        |             138.4 |   136.3-155.2 |          117.7 |           11.0 |
+| 1 x 1 KiB    | Raw File                      |               3.4 |       2.5-3.9 |            1.5 |            2.8 |
+| 1 x 1 KiB    | One FormData list             |               4.3 |       3.3-4.5 |            1.7 |            3.0 |
+| 1 x 1 KiB    | One file/request, six workers |               3.9 |       3.7-3.9 |            1.8 |            3.2 |
+| 1 x 1 KiB    | MFUP/3                        |              31.6 |     29.2-33.7 |           10.5 |            7.7 |
+| 1000 x 1 KiB | One FormData list             |             446.0 |   408.0-458.3 |          125.3 |          207.5 |
+| 1000 x 1 KiB | One file/request, six workers |            1122.2 | 1104.0-1277.1 |          687.8 |         1017.6 |
+| 1000 x 1 KiB | MFUP/3                        |            1242.3 | 1215.8-1247.4 |         1164.2 |          236.4 |
+| 1 x 64 MiB   | Raw File                      |             133.6 |   114.8-153.0 |          119.9 |            3.3 |
+| 1 x 64 MiB   | One FormData list             |             390.7 |   383.0-411.3 |          406.5 |            4.1 |
+| 1 x 64 MiB   | One file/request, six workers |             436.8 |   411.9-446.4 |          428.3 |            4.9 |
+| 1 x 64 MiB   | MFUP/3                        |             159.4 |   151.1-189.8 |          132.3 |           10.6 |
 
 A large file benefits from native browser serialization and direct range writes. A small upload still pays session/control costs. For many small files, one trivial FormData can be faster because it has no range journal or publication plan. Six workers do not justify one request per small file: grouping avoids repeated request and multipart setup. Results are local measurements, not throughput guarantees for other disks, devices or networks.
 

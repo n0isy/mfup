@@ -252,3 +252,83 @@ it("charges offline range-status probes to the same finite retry budget", async 
   expect(probes).toBe(3);
   s.dispose();
 });
+
+it("does not count active XHR payload twice when snapshots precede out-of-order receipts", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("WebSocket", undefined);
+  const server = endpoint();
+  vi.stubGlobal("fetch", server);
+  const requests: XHR[] = [];
+  class XHR {
+    upload: any = {};
+    status = 200;
+    response: any;
+    onload?: () => void;
+    onabort?: () => void;
+    url = "";
+    body!: FormData;
+    open(_method: string, url: string) {
+      this.url = url;
+    }
+    setRequestHeader() {}
+    send(body: FormData) {
+      this.body = body;
+      requests.push(this);
+    }
+    abort() {
+      this.onabort?.();
+    }
+    progress(fraction: number) {
+      this.upload.onprogress({
+        lengthComputable: true,
+        loaded: fraction * 100,
+        total: 100,
+      });
+    }
+    async accept() {
+      this.response = await (
+        await server(this.url, { method: "POST", body: this.body })
+      ).json();
+    }
+  }
+  vi.stubGlobal("XMLHttpRequest", XHR);
+  const s = new MfupSession({
+    serverUrl: "http://test",
+    trackUploadProgress: true,
+  });
+  const pending = s.upload([
+    new File([new Uint8Array(3072)], "a", { lastModified: 1 }),
+  ]);
+  try {
+    await vi.advanceTimersByTimeAsync(10);
+    expect(requests).toHaveLength(3);
+    requests[0].progress(1);
+    requests[1].progress(1);
+    requests[2].progress(0.5);
+    await requests[0].accept();
+    await requests[1].accept();
+    await s.refresh();
+    expect(s.getSnapshot()).toMatchObject({
+      confirmedBytes: 2048,
+      sentBytes: 2560,
+      totalBytes: 3072,
+    });
+    requests[1].onload!();
+    await vi.advanceTimersByTimeAsync(1);
+    requests[0].onload!();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.getSnapshot().sentBytes).toBe(2560);
+    requests[2].progress(1);
+    await requests[2].accept();
+    requests[2].onload!();
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(s.getSnapshot()).toMatchObject({
+      confirmedBytes: 3072,
+      sentBytes: 3072,
+      state: "published",
+    });
+  } finally {
+    s.dispose();
+  }
+});

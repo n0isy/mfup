@@ -64,6 +64,8 @@ export class MfupSession {
   private progressTimer?: ReturnType<typeof setTimeout>;
   private needsStatus = false;
   private recovering = 0;
+  private acknowledgedBytes = 0;
+  private discoveredBytes = 0;
   private ws?: WebSocket;
   private wsTimer?: ReturnType<typeof setTimeout>;
   private disposed = false;
@@ -124,11 +126,26 @@ export class MfupSession {
   };
   private update(patch: Partial<Snapshot> = {}) {
     const confirmed = patch.confirmedBytes ?? this.snapshot.confirmedBytes;
+    const total = Math.max(
+      this.snapshot.totalBytes,
+      patch.totalBytes ?? 0,
+      this.discoveredBytes,
+      confirmed,
+    );
     this.snapshot = {
       ...this.snapshot,
       ...patch,
-      sentBytes:
-        confirmed + [...this.inFlight.values()].reduce((sum, n) => sum + n, 0),
+      totalBytes: total,
+      // Global confirmation may arrive before a matching XHR receipt. Count that
+      // payload once, keeping local receipt accounting separate from snapshots.
+      sentBytes: Math.min(
+        total,
+        Math.max(
+          confirmed,
+          this.acknowledgedBytes +
+            [...this.inFlight.values()].reduce((sum, n) => sum + n, 0),
+        ),
+      ),
     };
     if (patch.state === "published") {
       clearTimeout(this.progressTimer);
@@ -321,6 +338,7 @@ export class MfupSession {
         epoch: remote.epoch,
         limits: remote.limits,
       };
+      this.acknowledgedBytes = remote.confirmedBytes;
       this.apply(remote);
       this.needsStatus = true;
       this.update({
@@ -454,6 +472,7 @@ export class MfupSession {
     this.ticket.epoch = remote.epoch;
     this.ticket.limits = remote.limits;
     this.needsStatus = true;
+    this.acknowledgedBytes = remote.confirmedBytes;
     this.apply(remote);
     this.paused = false;
     this.update({
@@ -524,7 +543,12 @@ export class MfupSession {
       if (this.cancelled || this.stopping || this.disposed) this.alive();
     }
   }
-  private confirm(receipt: Receipt) {
+  private confirm(receipt: Receipt, bytes: number, epoch: number) {
+    if (epoch === this.ticket!.epoch)
+      this.acknowledgedBytes = Math.min(
+        this.acknowledgedBytes + bytes,
+        Math.max(this.snapshot.confirmedBytes, receipt.confirmedBytes),
+      );
     this.update({
       confirmedBytes: Math.max(
         this.snapshot.confirmedBytes,
@@ -669,7 +693,11 @@ export class MfupSession {
             signal: controller.signal,
           });
         this.inFlight.delete(controller);
-        this.confirm(receipt);
+        this.confirm(
+          receipt,
+          pending.reduce((sum, w) => sum + (w.part?.[4] ?? 0), 0),
+          attemptEpoch,
+        );
         return;
       } catch (error) {
         this.inFlight.delete(controller);
@@ -684,7 +712,11 @@ export class MfupSession {
           const receipt = await this.request<Receipt>(
             this.endpoint(`/batches/${id}`),
           );
-          this.confirm(receipt);
+          this.confirm(
+            receipt,
+            pending.reduce((sum, w) => sum + (w.part?.[4] ?? 0), 0),
+            attemptEpoch,
+          );
           return;
         } catch (receiptError) {
           if (
@@ -830,6 +862,7 @@ export class MfupSession {
           if (!file) throw new MfupError("missing_file", entry.path);
           files++;
           bytes += file.size;
+          this.discoveredBytes = bytes;
           if (Date.now() >= scanUpdateAt) {
             this.update({ discovered: files, totalBytes: bytes });
             scanUpdateAt = Date.now() + 50;

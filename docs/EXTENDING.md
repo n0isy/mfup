@@ -70,16 +70,16 @@ Node exports AuthRequest, AuthResult, FileMapRequest, CommitEvent, StagedFile, O
 
 CommitEvent fields: sessionId, targetDir, baseDir, stagingDir, files, bytes, meta, context. FileMapRequest fields: sessionId, path, name, size, targetDir, meta, context. StagedFile fields: path, size, mtime, localPath.
 
-| Node engine                                    | Python engine                  | Purpose                                                      |
-| ---------------------------------------------- | ------------------------------ | ------------------------------------------------------------ |
-| getSession(id)                                 | get_session(id)                | Server session information, metadata, context and processing |
-| listStaged(id)                                 | list_staged(id)                | Iterate staged file metadata in pages of 256                 |
-| openStaged(id, path)                           | open_staged(id, path)          | ReadStream / binary file for accepted contents               |
-| preparePublish(id)                             | prepare_publish(id)            | Validate and save the destination plan without moving files  |
-| publish(id)                                    | publish(id)                    | Trusted backend publication                                  |
-| retryCommitted(id)                             | retry_committed(id)            | Explicitly retry failed/interrupted processing               |
-| setProperties(id, properties)                  | set_properties(id, properties) | Update session overwrite permission                          |
-| snapshot, resume, answer, cancel, sweep, close | same names                     | Session state and lifecycle                                  |
+| Node engine                                    | Python engine                  | Purpose                                                            |
+| ---------------------------------------------- | ------------------------------ | ------------------------------------------------------------------ |
+| getSession(id)                                 | get_session(id)                | Server session information, metadata, context and processing       |
+| listStaged(id)                                 | list_staged(id)                | Iterate staged file metadata in pages of 256                       |
+| openStaged(id, path)                           | open_staged(id, path)          | ReadStream / binary file for accepted contents                     |
+| preparePublish(id)                             | prepare_publish(id)            | Recheck persisted destinations and permission without moving files |
+| publish(id)                                    | publish(id)                    | Trusted backend publication                                        |
+| retryCommitted(id)                             | retry_committed(id)            | Explicitly retry failed/interrupted processing                     |
+| setProperties(id, properties)                  | set_properties(id, properties) | Update session overwrite permission                                |
+| snapshot, resume, answer, cancel, sweep, close | same names                     | Session state and lifecycle                                        |
 
 Staged access is available after commit, including from onCommitted. mapFile receives metadata during reception and cannot read staging. Close streams/files before publication. Staging does not mirror the source tree; use openStaged or localPath.
 

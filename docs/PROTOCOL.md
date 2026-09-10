@@ -146,4 +146,6 @@ The first operational failure is recorded in `snapshot.error` as `{code,status,p
 
 `confirmedBytes` counts receipt-backed payload. With `trackUploadProgress: true`, XHR upload events estimate active payload for `sentBytes`; notifications are coalesced every 50 ms. A custom fetch takes precedence and does not supply XHR events. Multipart headers and boundaries mean sentBytes is an estimate, not a network-interface byte counter or storage acknowledgment. Aborted estimates are removed; the display can move backwards. The demo shows at most 99% until published, including when all bytes have been sent but approval is pending.
 
+Snapshot confirmation can precede an HTTP receipt. The SDK tracks locally acknowledged bytes separately so `sentBytes` counts overlapping active payload only once. Late receipts from an earlier resume epoch do not add that payload again.
+
 [Russian](ru/PROTOCOL.md)

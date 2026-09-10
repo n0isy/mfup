@@ -41,6 +41,8 @@ export interface RemoteState {
   bytes: number;
   asks: Question[];
   published: string[];
+  publishedCount: number;
+  publishedNext: string | null;
 }
 export interface ResumeFile {
   path: string;

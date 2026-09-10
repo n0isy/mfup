@@ -70,16 +70,16 @@ Node экспортирует AuthRequest, AuthResult, FileMapRequest, CommitEve
 
 Поля CommitEvent: sessionId, targetDir, baseDir, stagingDir, files, bytes, meta, context. FileMapRequest: sessionId, path, name, size, targetDir, meta, context. StagedFile: path, size, mtime, localPath.
 
-| Node engine                                    | Python engine                 | Назначение                                       |
-| ---------------------------------------------- | ----------------------------- | ------------------------------------------------ |
-| getSession(id)                                 | get_session(id)               | Серверные сведения, meta, context и processing   |
-| listStaged(id)                                 | list_staged(id)               | Перечисление staged-метаданных страницами по 256 |
-| openStaged(id,path)                            | open_staged(id,path)          | ReadStream / бинарный файл принятого содержимого |
-| preparePublish(id)                             | prepare_publish(id)           | Проверить и сохранить план без перемещений       |
-| publish(id)                                    | publish(id)                   | Доверенная публикация backend                    |
-| retryCommitted(id)                             | retry_committed(id)           | Явный повтор неудачной/прерванной обработки      |
-| setProperties(id,properties)                   | set_properties(id,properties) | Изменить разрешение перезаписи                   |
-| snapshot, resume, answer, cancel, sweep, close | те же имена                   | Состояние и жизненный цикл                       |
+| Node engine                                    | Python engine                 | Назначение                                                    |
+| ---------------------------------------------- | ----------------------------- | ------------------------------------------------------------- |
+| getSession(id)                                 | get_session(id)               | Серверные сведения, meta, context и processing                |
+| listStaged(id)                                 | list_staged(id)               | Перечисление staged-метаданных страницами по 256              |
+| openStaged(id,path)                            | open_staged(id,path)          | ReadStream / бинарный файл принятого содержимого              |
+| preparePublish(id)                             | prepare_publish(id)           | Проверить сохранённые назначения и разрешение без перемещений |
+| publish(id)                                    | publish(id)                   | Доверенная публикация backend                                 |
+| retryCommitted(id)                             | retry_committed(id)           | Явный повтор неудачной/прерванной обработки                   |
+| setProperties(id,properties)                   | set_properties(id,properties) | Изменить разрешение перезаписи                                |
+| snapshot, resume, answer, cancel, sweep, close | те же имена                   | Состояние и жизненный цикл                                    |
 
 Доступ к staging открыт после commit, включая onCommitted. MapFile получает метаданные во время приёма и не читает staging. Потоки нужно закрыть до публикации. Staging не повторяет дерево источника; используйте openStaged или localPath.
 

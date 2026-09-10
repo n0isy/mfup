@@ -80,4 +80,6 @@ Receipts support recovery after a process restart. Payload fsync for power-loss 
 
 The demo displays both values and caps its bar at 99% until publication. Discovery can increase the total during upload. The optional overwrite prompt and the operational error message each apply to the entire upload. Detailed state and retry behavior are part of the [protocol](PROTOCOL.md).
 
+Snapshot confirmation can precede an HTTP receipt. The SDK tracks locally acknowledged bytes separately so `sentBytes` counts overlapping active payload only once. Late receipts from an earlier resume epoch do not add that payload again.
+
 [Russian](ru/ARCHITECTURE.md)
