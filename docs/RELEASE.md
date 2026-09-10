@@ -38,6 +38,8 @@ Tag runs publish. Manual dispatch with artifact_run_id resumes publication of an
 
 The verification job queries both public registries, checks all versions and npm latest tags, installs the registry packages and executes the same independent consumer examples. Package publication is confirmed by this job, not by a successful build alone.
 
+Registry metadata and installation indexes can become visible at different times. Each npm/Python installation retries after failed attempts with a 10-second delay and a 120-second total deadline, including command execution. Pip bypasses its local cache. Exhaustion fails the job; consumer examples execute once after installation and fail immediately if their checks fail.
+
 The registry requirements are described by [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) and [PyPI publishing](https://docs.pypi.org/trusted-publishers/using-a-publisher/).
 
 [Russian](ru/RELEASE.md)
