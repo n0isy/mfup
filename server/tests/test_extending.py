@@ -76,9 +76,11 @@ def test_embedding_lifecycle_prefix_and_websocket(tmp_path):
     with TestClient(app) as c:
         ticket = create(c).json()
         assert c.get("/mfup/health").status_code == 404
-        with c.websocket_connect("/api/mfup/control") as ws:
-            ws.send_json(dict(type="subscribe", **ticket))
-            assert ws.receive_json()["id"] == ticket["id"]
+        for _ in range(20):
+            with c.websocket_connect("/api/mfup/control") as ws:
+                ws.send_json(dict(type="subscribe", **ticket))
+                assert ws.receive_json()["id"] == ticket["id"]
+        assert c.portal.call(mfup.engine.sweep, 9007199254740991) == 1
     assert mfup.engine.closed
 
 

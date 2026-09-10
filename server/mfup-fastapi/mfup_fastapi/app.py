@@ -5,6 +5,7 @@ import contextlib
 import json
 from contextlib import asynccontextmanager
 
+from anyio import CancelScope
 from fastapi import APIRouter, FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
 from mfup_core import Engine, ProtocolError
@@ -146,11 +147,12 @@ class MfupEngine:
                 with contextlib.suppress(Exception):
                     await ws.close(code=1008)
             finally:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
                 if unsubscribe:
                     unsubscribe()
+                for task in tasks:
+                    task.cancel()
+                with CancelScope(shield=True):
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     async def startup(self):
         if self._sweeper is not None or not self.config.sweep_interval_ms:
