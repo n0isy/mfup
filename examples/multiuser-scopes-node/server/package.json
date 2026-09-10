@@ -7,6 +7,6 @@
     "start": "node server.mjs"
   },
   "dependencies": {
-    "@mfup/server": "3.0.0"
+    "@mfup/server": "3.1.0"
   }
 }

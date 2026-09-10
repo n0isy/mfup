@@ -55,6 +55,8 @@ SetOverwrite(true) разрешает перезапись для всей се�
 
 TrackUploadProgress=true включает native XHR events внутри длинных POST. SentBytes оценивает отправленный payload, confirmedBytes считает payload с receipts. Завершение — state=published, а не только отправка всех байтов. Пользовательский fetch имеет приоритет над XHR.
 
+По умолчанию 1000 повторов с задержкой до 36 секунд поддерживают восстановление около десяти часов. SDK удерживает до 10000 ожидающих записей вместе с активными отправками и продолжает обход при 5000. Не собирайте и не храните дубликат entries/File. После окончательной ошибки вызовите session.retry() без нового источника; ограниченный поток остаётся внутри SDK.
+
 ## Продолжение и React
 
 Сохраните session.exportTicket() после connect. В текущей странице используйте pause/resume. После reload восстановите ticket и повторно выберите те же файлы:
@@ -113,7 +115,7 @@ async def authorize(request):
 app = create_app('./data', authorize=authorize)
 ```
 
-Приложение реализует resolveUser/resolve_user и правила доступа. Авторизация задаёт корни сессий, квоты и context. MapFile/map_file создаёт сохранённый план назначения после commit. OnCommitted/on_committed читает принятые файлы и возвращает boolean для управления серверной публикацией. Server autoPublish по умолчанию false; clientPublish=false оставляет публикацию backend. Подробности: [API расширения](docs/ru/EXTENDING.md).
+Приложение реализует resolveUser/resolve_user и правила доступа. Авторизация задаёт корни сессий, квоты и context. MapFile/map_file маппит метаданные сразу при получении манифеста. OnCommitted/on_committed читает принятые файлы и возвращает boolean для управления серверной публикацией. Server autoPublish по умолчанию false; clientPublish=false оставляет публикацию backend. Подробности: [API расширения](docs/ru/EXTENDING.md).
 
 Один процесс владеет SQLite и выданными корнями; Redis не требуется. Receipts поддерживают перезапуск процесса. Rename файлов атомарны по отдельности; публикация дерева не является одной транзакцией и не хранит копии для отката. Fsync payload для гарантии при потере питания не выполняется. Пустые каталоги доступны через handles/entries, но не FileList. Точное поведение задаёт [протокол](docs/ru/PROTOCOL.md).
 

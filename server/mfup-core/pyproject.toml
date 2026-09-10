@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [project]
 name = "mfup-core"
-version = "3.0.0"
+version = "3.1.0"
 description = "MFUP/3 multipart session engine, durable receipts and interactive publication"
 readme = "README.md"
 license = "MIT"

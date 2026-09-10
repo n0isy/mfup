@@ -1,6 +1,6 @@
 # Package release workflow
 
-The five distributions share version **3.0.0**:
+The five distributions share version **3.1.0**:
 
 | npm          | Python       |
 | ------------ | ------------ |
@@ -25,7 +25,7 @@ npm pack -w @mfup/client -w @mfup/react -w @mfup/server --pack-destination dist-
 python scripts/build-python.py dist-py
 twine check dist-py/*
 python scripts/check-artifacts.py dist-npm dist-py
-python scripts/check-version.py 3.0.0
+python scripts/check-version.py 3.1.0
 ```
 
 Npm tarballs contain compiled JavaScript, TypeScript declarations, package metadata, license and English/Russian READMEs. Python wheels contain the module, py.typed and distribution metadata/license; source tarballs also contain pyproject.toml and both READMEs. Tests, demos, benchmarks, upload data, logs, development environments and local reports are excluded.

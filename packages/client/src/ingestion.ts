@@ -1,21 +1,12 @@
-import type { Entry, Source } from "./types.js";
+import { MfupError, type Entry, type Source } from "./types.js";
 
 /** Files stay native Files. No body reads, full directory materialization or binary framing. */
 export async function* fromFiles(
   files: ArrayLike<File>,
 ): AsyncGenerator<Entry> {
-  const dirs = new Set<string>();
   for (let i = 0; i < files.length; i++) {
     const file = files[i],
       name = (file.webkitRelativePath || file.name).normalize("NFC");
-    const segments = name.split("/");
-    for (let n = 1; n < segments.length; n++) {
-      const dir = segments.slice(0, n).join("/");
-      if (!dirs.has(dir)) {
-        dirs.add(dir);
-        yield { kind: "directory", path: dir };
-      }
-    }
     yield { kind: "file", path: name, file };
   }
 }
@@ -67,10 +58,22 @@ export async function* fromEntries(
   }
 }
 export function sourceFromInput(input: HTMLInputElement): Source {
-  return fromFiles(Array.from(input.files ?? []));
+  const files = input.files;
+  return (async function* () {
+    try {
+      yield* fromFiles(files ?? []);
+    } finally {
+      if (input.files === files) input.value = "";
+    }
+  })();
 }
 /** Invoke synchronously inside drop; browser-owned DataTransfer items expire afterwards. */
 export function sourceFromDataTransfer(data: DataTransfer): Source {
+  if (data.items.length > 10000)
+    throw new MfupError(
+      "selection_too_large",
+      "Drop at most 10000 roots; directories are read incrementally",
+    );
   const items = Array.from(data.items ?? []).filter(
     (item) => item.kind === "file",
   );
@@ -93,7 +96,5 @@ export function sourceFromDataTransfer(data: DataTransfer): Source {
   const entries = items
     .map((item) => item.webkitGetAsEntry?.())
     .filter((x): x is FileSystemEntry => !!x);
-  return entries.length
-    ? fromEntries(entries)
-    : fromFiles(Array.from(data.files));
+  return entries.length ? fromEntries(entries) : fromFiles(data.files);
 }

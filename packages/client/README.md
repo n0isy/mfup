@@ -3,6 +3,8 @@
 Native browser FormData uploads, up to six concurrent baskets, incremental
 directory discovery, interactive questions and resumable file ranges.
 
+The SDK owns the stream: at most 10000 pending records including active baskets, with enumeration resuming at 5000. Do not collect or retain a duplicate entries/File list. The default 1000 retries with backoff capped at 36 seconds provide about ten hours of waiting. After exhaustion, call session.retry() without a source; the SDK retains its bounded queue. sourceFromInput clears the input after enumeration completes.
+
 ```ts
 import { MfupSession, sourceFromInput } from "@mfup/client";
 const session = new MfupSession({

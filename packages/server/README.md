@@ -36,8 +36,8 @@ The browser uses `serverUrl: location.origin + '/api'`. Scopes and identity
 belong to the application. `publishedDirectory(baseDir,targetDir)` resolves
 the corresponding directory for application listing/download handlers.
 
-`mapFile` runs after commit, returns a relative path or null, and persists a
-validated plan before moves. `onCommitted` receives roots, counts, meta/context;
+`mapFile` runs during manifest reception, returns a relative path or null, and persists
+validated destinations before reading bodies. `onCommitted` receives roots, counts, meta/context;
 `engine.listStaged` and `openStaged` expose accepted files for processing.
 A boolean callback result overrides server `autoPublish` (default false).
 `clientPublish: false` reserves publication for `engine.publish(id)` on the

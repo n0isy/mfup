@@ -4,24 +4,28 @@ Files use native `multipart/form-data`. Session control uses JSON HTTP. WebSocke
 
 ## Endpoints
 
-| Method and path                         | Input                                                           | Result                                        |
-| --------------------------------------- | --------------------------------------------------------------- | --------------------------------------------- |
-| GET `/mfup/health`                      | None                                                            | `protocol`, `backend`                         |
-| POST `/mfup/sessions`                   | `protocol: "MFUP/3"`, optional `targetDir`, `meta`, `overwrite` | `id`, `token`, `epoch`, `limits`              |
-| GET `/mfup/sessions/:id`                | Bearer token                                                    | Remote snapshot                               |
-| POST `.../:id/resume`                   | `{}`                                                            | Advanced epoch, snapshot and limits           |
-| GET `.../:id/files?after=...&limit=256` | Path cursor                                                     | Files with received offsets and `next` cursor |
-| POST `.../:id/batches/:batchId`         | Multipart; `X-MFUP-Epoch`                                       | Receipt: `id`, `parts`, `bytes`               |
-| GET `.../:id/batches/:batchId`          | None                                                            | Saved receipt or 404                          |
-| POST `.../:id/commit`                   | `files`, `dirs`, `bytes`                                        | Committed or published snapshot               |
-| POST `.../:id/properties`               | `overwrite: boolean`                                            | Snapshot                                      |
-| POST `.../:id/answers`                  | `id: "overwrite"`, `choice: "overwrite"` or `"cancel"`          | Snapshot                                      |
-| POST `.../:id/publish`                  | `{}`                                                            | Snapshot                                      |
-| POST `.../:id/cancel`                   | `{}`                                                            | Cancelled or already published snapshot       |
+| Method and path                         | Input                                                           | Result                                            |
+| --------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------- |
+| GET `/mfup/health`                      | None                                                            | `protocol`, `backend`                             |
+| POST `/mfup/sessions`                   | `protocol: "MFUP/3"`, optional `targetDir`, `meta`, `overwrite` | `id`, `token`, `epoch`, `limits`                  |
+| GET `/mfup/sessions/:id`                | Bearer token                                                    | Remote snapshot                                   |
+| POST `.../:id/resume`                   | `{}`                                                            | Advanced epoch, snapshot and limits               |
+| GET `.../:id/files?after=...&limit=256` | Path cursor                                                     | Files with received offsets and `next` cursor     |
+| POST `.../:id/batches/:batchId`         | Multipart; `X-MFUP-Epoch`                                       | Receipt: `id`, `parts`, `bytes`, `confirmedBytes` |
+| GET `.../:id/batches/:batchId`          | None                                                            | Saved receipt or 404                              |
+| POST `.../:id/status`                   | `epoch`, `files: FilePart[]` (at most maxParts)                 | `received: boolean[]`, `confirmedBytes`           |
+| GET `.../:id/published?after=...`       | Source-path cursor                                              | At most 256 destination `files`, `next`           |
+| POST `.../:id/commit`                   | `files`, `dirs`, `bytes`                                        | Committed or published snapshot                   |
+| POST `.../:id/properties`               | `overwrite: boolean`                                            | Snapshot                                          |
+| POST `.../:id/answers`                  | `id: "overwrite"`, `choice: "overwrite"` or `"cancel"`          | Snapshot                                          |
+| POST `.../:id/publish`                  | `{}`                                                            | Snapshot                                          |
+| POST `.../:id/cancel`                   | `{}`                                                            | Cancelled or already published snapshot           |
 
 Session-ID endpoints require `Authorization: Bearer <token>`. Application authorization runs on creation. `targetDir` defaults to `uploads`; `meta` defaults to null; `overwrite` defaults to false. Arbitrary application variables belong in `meta`, including a field named `scope`. Their JSON values and nesting are preserved for authorization, processing and mapping. They do not become protocol settings.
 
 Authorization results, destination, metadata and context are persisted. Resume uses the existing session and does not repeat authorization or replace metadata. The default UTF-8 JSON limits are 16 KiB for meta, 64 KiB for server context and 256 KiB for an HTTP control body. Context and absolute storage roots are not sent to the browser.
+
+`POST status` checks only the current basket ranges; the SDK never downloads the entire file index. Snapshots and receipts carry a global `confirmedBytes` counter. `published` contains the first page (at most 256 paths), `publishedCount` the total and `publishedNext` the cursor for GET published. Applications consume result pages one at a time. The default file quota is 1000000.
 
 ## Multipart basket
 
@@ -64,7 +68,13 @@ Resume drains admitted data requests and advances the epoch. New data requests m
 
 Tickets authorize access to one session. After a browser reload, the user selects the source again; matching uses relative path, size and mtime. Accepted ranges are not resent. Pausing aborts active client requests; it is not a server terminal state. Control HTTP has a default 30-second deadline (`requestTimeoutMs`); it does not impose that deadline on long data POSTs.
 
-The SDK retries eligible data failures up to three times by default, with 100/200/400 ms delays and receipt checks. It does not promise indefinite offline retries. Unconfirmed bytes can require retransmission after a lost connection. Published results remain available until session TTL, default 24 hours renewed by operations. A 404 after expiry does not prove an earlier publication result.
+The default `retries: 1000` permits 1000 additional attempts per basket (1001 including the initial attempt). `retryDelayMs` defaults to 1000 and `retryMaxDelayMs` to 36000. Delays are 1, 2, 4, 8, 16, 32, then 36 seconds: 1000 delays total 9 h 57 min 27 s, plus request time. This is an approximate ten-hour recovery dialogue, not a ten-hour expiry deadline. Retry options are nonnegative safe integers; zero retries still permits checking a lost receipt. The delay exponent is bounded for large budgets. Control requests used for connect, resume, commit and publication use the same retry policy. Pause and cancellation interrupt data backoff immediately. A lost creation response can leave an empty session until TTL because session creation has no client idempotency key.
+
+Eligible failures are network errors, timeouts, HTTP 429/500/502/503/504 and 409 busy/range_busy/stale_epoch; `retryable: false` stops automatic retries. Each failed data attempt checks its receipt. An offline or timed-out receipt probe consumes that attempt, never bypasses the remaining budget. A confirmed basket is not resent. Unconfirmed ranges can be resent from their range boundary; a partly accepted basket has no receipt. Defaults are 16 MiB ranges and up to 32 MiB per basket, not a restart of every large file.
+
+The SDK owns the source iterator and at most 10000 pending work records, including active baskets. Enumeration stops at that high-water mark and resumes at 5000, and also stops during retry backoff or a held error. `maxReady` can lower the bound (1–10000); its low-water mark is half that value. Confirmed File/entry references are released. Consumers must pass the source directly and must not collect or retain a duplicate entries/File list. After exhaustion or an operational error, `upload()` rejects but the SDK retains the bounded pending stream. Call `session.retry()` (React `retry()`) without a source to continue after the cause is resolved. Cancel/dispose release the retained transfer. A page reload destroys in-memory access; only that case requires source selection again.
+
+Server retention defaults to 24 hours, renewed by session operations; it exceeds the default recovery delay budget. Published files remain in their application directory. A custom shorter TTL can expire an offline session; retries do not recreate an expired session or prove an earlier publication result.
 
 ## Overwrite and cancellation
 
@@ -96,7 +106,7 @@ The SDK displays `cancelling` until cancellation is confirmed by a response or s
 
 SDK autoPublish defaults to true, server autoPublish to false, and server clientPublish to true. `clientPublish: false` returns `403 server_publish_only` for HTTP publish; trusted backend publication remains available. Unfinished or failed processing blocks client publication with `409 processing_required`. Server autoPublish may publish during commit or after overwrite approval. Approval never bypasses commit completeness.
 
-Mapping runs after commit. The complete validated plan is stored before file moves and reused on retry/restart. A missing staged file before publication is an operational failure, not evidence that the existing destination is correct. A single file rename is atomic; tree publication is not a single transaction and does not provide rollback of replaced files. The application must not modify destinations during unfinished publication.
+Mapping runs when a file first arrives in a basket manifest, before its body is consumed. The hook receives metadata only; content validation belongs in onCommitted using staged streams. Destination checks raise the first overwrite prompt as soon as a mapped destination is known, even while later metadata or bodies are pending. Validated mappings are saved with each accepted manifest and reused for later ranges and resume/restart. Publication iterates this persisted plan in bounded pages. A file rename is atomic; publishing a tree is not one transaction and does not retain rollback copies. Applications must not change destinations during unfinished publication.
 
 SQLite/WAL and session roots have one process owner. partBytes is fixed for the metadata directory. Receipts survive process restart; payload fsync for power-loss guarantees is not performed. See [extension contracts](EXTENDING.md) for application processing and storage layout.
 

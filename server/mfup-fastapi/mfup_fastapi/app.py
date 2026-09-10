@@ -79,6 +79,8 @@ class MfupEngine:
                 if request.method == "GET":
                     if not action:
                         return engine.snapshot(sid)
+                    if action == "published":
+                        return engine.published_page(sid, request.query_params.get("after", ""))
                     if action == "files":
                         raw_limit = request.query_params.get("limit", "256")
                         check(raw_limit.isdecimal(), "bad_number")
@@ -93,6 +95,8 @@ class MfupEngine:
                     if action == "batches" and bid:
                         return await self.receive(request, sid, bid)
                     data = await json_body(request)
+                    if action == "status":
+                        return engine.range_status(sid, data)
                     if action == "resume":
                         return await engine.resume(sid)
                     if action == "commit":

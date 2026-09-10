@@ -42,6 +42,10 @@ interface SessionRow {
   max_bytes: number;
   expires: number;
   published: string;
+  declared_files: number;
+  declared_dirs: number;
+  declared_bytes: number;
+  confirmed_bytes: number;
   base_dir: string;
   map_files: number;
   mapped: number;
@@ -59,14 +63,18 @@ interface NodeRow {
   mtime: number;
   destination: string;
   done: number;
+  mapped: number;
 }
 interface Active {
   done: Promise<void>;
+  cancelled: Promise<void>;
   finish: () => void;
   abort: () => void;
 }
 interface Runtime {
   mutex: Mutex;
+  metadata: Mutex;
+  mappings: Set<Promise<unknown>>;
   active: Set<Active>;
   batches: Set<string>;
   ranges: Set<string>;
@@ -166,6 +174,8 @@ export class Engine {
     if (!r) {
       r = {
         mutex: new Mutex(),
+        metadata: new Mutex(),
+        mappings: new Set(),
         active: new Set(),
         batches: new Set(),
         ranges: new Set(),
@@ -278,7 +288,7 @@ export class Engine {
       typeof auto === "boolean" && typeof client === "boolean",
       "bad_config",
     );
-    const maxFiles = integer(auth.maxFiles ?? 100000),
+    const maxFiles = integer(auth.maxFiles ?? 1000000),
       maxBytes = integer(auth.maxTotalBytes ?? Number.MAX_SAFE_INTEGER);
     const stage = path.join(base, "staging", id);
     fs.mkdirSync(stage, { recursive: true });
@@ -379,17 +389,18 @@ export class Engine {
   }
   snapshot(id: string) {
     const row = this.row(id);
-    const totals = this.store.get<{ files: number; bytes: number }>(
-      "SELECT COUNT(*) AS files, COALESCE(SUM(size),0) AS bytes FROM nodes WHERE sid=? AND kind='file'",
-      id,
-    )!;
     return {
       id,
       epoch: row.epoch,
       state: row.state,
-      ...totals,
+      files: row.declared_files,
+      bytes: row.declared_bytes,
+      confirmedBytes: row.confirmed_bytes,
       asks: this.questions(id),
-      published: JSON.parse(row.published) as string[],
+      published: row.state === "published" ? this.publishedPage(id).files : [],
+      publishedCount: row.state === "published" ? row.declared_files : 0,
+      publishedNext:
+        row.state === "published" ? this.publishedPage(id).next : null,
       clientPublish: Boolean(row.client_publish),
       processing: row.hook_status,
       overwrite: Boolean(row.overwrite),
@@ -559,7 +570,19 @@ export class Engine {
       const done = new Promise<void>((resolve) => {
         finish = resolve;
       });
-      const active = { done, finish, abort };
+      let stop!: () => void;
+      const cancelled = new Promise<void>((resolve) => {
+        stop = resolve;
+      });
+      const active = {
+        done,
+        finish,
+        cancelled,
+        abort: () => {
+          stop();
+          abort();
+        },
+      };
       r.active.add(active);
       r.batches.add(batchId);
       this.touch(id);
@@ -572,7 +595,182 @@ export class Engine {
       id,
       identifier(batchId),
     );
-    return row ? JSON.parse(row.receipt) : null;
+    return row
+      ? {
+          ...JSON.parse(row.receipt),
+          confirmedBytes: this.row(id).confirmed_bytes,
+        }
+      : null;
+  }
+  private *nodes(id: string): Generator<NodeRow> {
+    let after = "";
+    while (true) {
+      const page = this.store.all<NodeRow>(
+        "SELECT * FROM nodes WHERE sid=? AND path>? ORDER BY path LIMIT 256",
+        id,
+        after,
+      );
+      if (!page.length) return;
+      yield* page;
+      after = page.at(-1)!.path;
+    }
+  }
+  publishedPage(id: string, after = "") {
+    const rows = this.store.all<NodeRow>(
+      "SELECT * FROM nodes WHERE sid=? AND kind='file' AND done=1 AND path>? ORDER BY path LIMIT 256",
+      id,
+      after,
+    );
+    return {
+      files: rows.map((n) => n.destination),
+      next: rows.length === 256 ? rows.at(-1)!.path : null,
+    };
+  }
+  rangeStatus(id: string, data: { epoch: number; files: Part[] }) {
+    const row = this.row(id);
+    check(data.epoch === row.epoch, "stale_epoch", 409);
+    check(
+      Array.isArray(data.files) && data.files.length <= this.limits.maxParts,
+      "bad_manifest",
+    );
+    const received = data.files.map((p) => {
+      check(Array.isArray(p) && p.length === 5, "bad_manifest");
+      relativePath(p[0]);
+      p.slice(1).forEach(integer);
+      const node = this.store.get<NodeRow>(
+        "SELECT * FROM nodes WHERE sid=? AND path=?",
+        id,
+        p[0],
+      );
+      if (!node) return false;
+      check(
+        node.kind === "file" && node.size === p[1] && node.mtime === p[2],
+        "file_changed",
+        409,
+      );
+      return Boolean(
+        this.store.get(
+          "SELECT 1 FROM parts WHERE sid=? AND path=? AND offset=? AND length=?",
+          id,
+          p[0],
+          p[3],
+          p[4],
+        ),
+      );
+    });
+    this.touch(id);
+    return { received, confirmedBytes: row.confirmed_bytes };
+  }
+  private checkName(
+    id: string,
+    name: string,
+    kind: string,
+    field: "source" | "destination",
+    owner: string,
+    pending: NodeRow[] = [],
+  ) {
+    const column = field === "source" ? "path" : "destination";
+    const code =
+      field === "destination" && this.row(id).map_files
+        ? "mapping_error"
+        : "path_conflict";
+    const pieces = name.split("/");
+    for (let i = 1; i <= pieces.length; i++) {
+      const prefix = pieces.slice(0, i).join("/"),
+        key = prefix.toLowerCase();
+      const exact = this.store.get<NodeRow>(
+        `SELECT * FROM nodes WHERE sid=? AND ${field}_key=? LIMIT 1`,
+        id,
+        key,
+      );
+      if (exact && exact.path !== owner)
+        check(
+          exact[column] === prefix &&
+            i < pieces.length &&
+            exact.kind === "directory",
+          code,
+          409,
+        );
+      for (const other of pending) {
+        if (
+          other.path === owner ||
+          (field === "destination" &&
+            this.row(id).map_files &&
+            other.kind === "directory")
+        )
+          continue;
+        const value = other[column],
+          lower = value.toLowerCase();
+        if (lower === key)
+          check(
+            value === prefix && i < pieces.length && other.kind === "directory",
+            code,
+            409,
+          );
+        if (lower.startsWith(key + "/"))
+          check(
+            value.startsWith(prefix + "/") &&
+              (i < pieces.length || kind === "directory"),
+            code,
+            409,
+          );
+      }
+      const child = this.store.get<NodeRow>(
+        `SELECT * FROM nodes WHERE sid=? AND ${field}_key>=? AND ${field}_key<? ORDER BY ${field}_key LIMIT 1`,
+        id,
+        key + "/",
+        key + "0",
+      );
+      if (child && child.path !== owner)
+        check(
+          child[column].startsWith(prefix + "/") &&
+            (i < pieces.length || kind === "directory"),
+          code,
+          409,
+        );
+    }
+  }
+  private async mappedDestination(
+    row: SessionRow,
+    name: string,
+    size: number,
+    batch?: Batch,
+  ) {
+    if (!row.map_files) return name;
+    check(this.options.mapFile, "hook_unavailable", 503);
+    const r = this.runtime(row.id);
+    const task = Promise.resolve().then(() =>
+      this.options.mapFile!({
+        sessionId: row.id,
+        path: name,
+        name: name.split("/").at(-1)!,
+        size,
+        targetDir: row.target,
+        context: JSON.parse(row.context),
+        meta: JSON.parse(row.meta),
+      }),
+    );
+    r.mappings.add(task);
+    void task.then(
+      () => r.mappings.delete(task),
+      () => r.mappings.delete(task),
+    );
+    try {
+      const result = batch
+        ? await Promise.race([
+            task,
+            batch.active.cancelled.then(() => {
+              throw new ProtocolError(409, "bad_state");
+            }),
+          ])
+        : await task;
+      return relativePath(result === null ? name : result);
+    } catch (error) {
+      if (this.row(row.id).state === "cancelled")
+        throw new ProtocolError(409, "bad_state");
+      this.report("mapFile", row.id, error);
+      throw new ProtocolError(409, "mapping_error");
+    }
   }
   async prepare(batch: Batch, raw: unknown) {
     check(raw && typeof raw === "object", "bad_manifest");
@@ -612,7 +810,7 @@ export class Engine {
       .update(JSON.stringify({ files, dirs }))
       .digest("hex");
     const row = this.row(batch.sid);
-    return this.runtime(batch.sid).mutex.run(() => {
+    return this.runtime(batch.sid).metadata.run(async () => {
       const r = this.runtime(batch.sid),
         current = this.row(batch.sid);
       check(current.epoch === batch.epoch, "stale_epoch", 409);
@@ -624,7 +822,10 @@ export class Engine {
       );
       if (old) {
         check(old.signature === signature, "batch_conflict", 409);
-        return JSON.parse(old.receipt);
+        return {
+          ...JSON.parse(old.receipt),
+          confirmedBytes: this.row(batch.sid).confirmed_bytes,
+        };
       }
       const keys = files.map((p) => `${p[0]}\0${p[3]}`);
       check(
@@ -633,103 +834,107 @@ export class Engine {
         "range_busy",
         409,
       );
-      const existing = this.store.all<NodeRow>(
-        "SELECT * FROM nodes WHERE sid=?",
-        batch.sid,
-      );
-      const nodes = new Map(existing.map((n) => [n.path, n]));
-      const destinations = new Map(
-        existing.map((n) => [n.destination.toLowerCase(), n]),
-      );
-      const spelling = new Map<string, string>();
-      const checkSpelling = (name: string) => {
-        const pieces = name.split("/");
-        for (let i = 1; i <= pieces.length; i++) {
-          const prefix = pieces.slice(0, i).join("/"),
-            key = prefix.toLowerCase();
-          check(
-            !spelling.has(key) || spelling.get(key) === prefix,
-            "path_conflict",
-            409,
-          );
-          spelling.set(key, prefix);
-        }
-      };
-      for (const n of existing) checkSpelling(n.destination);
       const additions: NodeRow[] = [];
-      const add = (
+      let addedFiles = 0,
+        addedBytes = 0;
+      const add = async (
         name: string,
         kind: NodeRow["kind"],
         size: number,
         mtime: number,
-        destination: string,
       ) => {
-        const previous = nodes.get(name);
+        const previous =
+          additions.find((n) => n.path === name) ??
+          this.store.get<NodeRow>(
+            "SELECT * FROM nodes WHERE sid=? AND path=?",
+            batch.sid,
+            name,
+          );
         if (previous) {
           check(
             previous.kind === kind &&
               previous.size === size &&
-              previous.mtime === mtime &&
-              previous.destination === destination,
+              previous.mtime === mtime,
             "file_changed",
             409,
           );
           return;
         }
-        checkSpelling(destination);
-        const lower = destination.toLowerCase();
-        const conflict = destinations.get(lower);
-        check(!conflict, "path_conflict", 409);
-        for (let parent = lower; parent.includes("/");) {
-          parent = parent.slice(0, parent.lastIndexOf("/"));
-          check(
-            destinations.get(parent)?.kind !== "file",
-            "path_conflict",
-            409,
+        this.checkName(batch.sid, name, kind, "source", name, additions);
+        const destination =
+          kind === "file"
+            ? await this.mappedDestination(row, name, size, batch)
+            : name;
+        const current = this.row(batch.sid);
+        check(
+          current.epoch === batch.epoch &&
+            current.state === "uploading" &&
+            !r.transition,
+          "bad_state",
+          409,
+        );
+        if (!row.map_files || kind === "file")
+          this.checkName(
+            batch.sid,
+            destination,
+            kind,
+            "destination",
+            name,
+            additions,
           );
-        }
-        if (kind === "file")
-          check(
-            ![...destinations.keys()].some((p) => p.startsWith(lower + "/")),
-            "path_conflict",
-            409,
-          );
-        const n: NodeRow = {
+        check(
+          current.declared_files + addedFiles + Number(kind === "file") <=
+            row.max_files &&
+            current.declared_files +
+              current.declared_dirs +
+              additions.length +
+              1 <=
+              row.max_files * 4 + 1024 &&
+            current.declared_bytes + addedBytes + size <= row.max_bytes,
+          "quota_exceeded",
+          413,
+        );
+        additions.push({
           path: name,
           kind,
           size,
           mtime,
           destination,
           done: 0,
-        };
-        nodes.set(name, n);
-        destinations.set(lower, n);
-        additions.push(n);
+          mapped: 1,
+        });
+        addedFiles += Number(kind === "file");
+        addedBytes += size;
+        const asked = this.needsOverwrite(this.row(batch.sid));
+        if (!row.map_files || kind === "file")
+          this.conflicts(batch.sid, current, destination, kind);
+        if (!asked && this.needsOverwrite(this.row(batch.sid)))
+          this.emit(batch.sid);
       };
-      for (const dir of dirs) add(dir, "directory", 0, 0, dir);
-      for (const p of files) add(p[0], "file", p[1], p[2], p[0]);
-      const fileNodes = [...nodes.values()].filter((n) => n.kind === "file");
+      for (const dir of dirs) await add(dir, "directory", 0, 0);
+      for (const p of files) await add(p[0], "file", p[1], p[2]);
       check(
-        nodes.size <= row.max_files * 4 + 1024 &&
-          fileNodes.length <= row.max_files &&
-          fileNodes.reduce((n, f) => n + f.size, 0) <= row.max_bytes,
-        "quota_exceeded",
-        413,
+        this.row(batch.sid).epoch === batch.epoch &&
+          this.row(batch.sid).state === "uploading" &&
+          !r.transition,
+        "bad_state",
+        409,
       );
       this.store.transaction(() => {
-        for (const n of additions) {
+        for (const n of additions)
           this.store.run(
-            "INSERT INTO nodes(sid,path,kind,size,mtime,destination) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO nodes(sid,path,kind,size,mtime,destination,source_key,destination_key,mapped) VALUES(?,?,?,?,?,?,?,?,1)",
             batch.sid,
             n.path,
             n.kind,
             n.size,
             n.mtime,
             n.destination,
+            n.path.toLowerCase(),
+            row.map_files && n.kind === "directory"
+              ? null
+              : n.destination.toLowerCase(),
           );
-          if (!row.map_files)
-            this.conflicts(batch.sid, row, n.destination, n.kind);
-        }
       });
       batch.manifest = { files, dirs };
       batch.signature = signature;
@@ -769,6 +974,7 @@ export class Engine {
         id: batch.id,
         parts: batch.manifest.files.length,
         bytes: batch.manifest.files.reduce((sum, p) => sum + p[4], 0),
+        confirmedBytes: 0,
       };
       this.store.transaction(() => {
         for (const p of batch.manifest!.files)
@@ -779,6 +985,7 @@ export class Engine {
             p[3],
             p[4],
           );
+        receipt.confirmedBytes = this.row(batch.sid).confirmed_bytes;
         this.store.run(
           "INSERT INTO batches(sid,id,signature,receipt) VALUES(?,?,?,?)",
           batch.sid,
@@ -866,22 +1073,15 @@ export class Engine {
         "busy",
         409,
       );
-      const files = this.store.all<NodeRow>(
-        "SELECT * FROM nodes WHERE sid=? AND kind='file'",
-        id,
-      );
-      const dirs = this.store.get<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM nodes WHERE sid=? AND kind='directory'",
-        id,
-      )!.n;
       check(
-        integer(totals.files) === files.length &&
-          integer(totals.dirs) === dirs &&
-          integer(totals.bytes) === files.reduce((n, f) => n + f.size, 0),
+        integer(totals.files) === row.declared_files &&
+          integer(totals.dirs) === row.declared_dirs &&
+          integer(totals.bytes) === row.declared_bytes,
         "scan_mismatch",
         409,
       );
-      for (const f of files) {
+      for (const f of this.nodes(id)) {
+        if (f.kind !== "file") continue;
         const p = this.store.get<{ n: number; bytes: number }>(
           "SELECT COUNT(*) AS n,COALESCE(SUM(length),0) AS bytes FROM parts WHERE sid=? AND path=?",
           id,
@@ -988,77 +1188,24 @@ export class Engine {
         return row;
       });
       if (row.state === "published") return;
-      if (row.map_files && !row.mapped) {
-        check(this.options.mapFile, "hook_unavailable", 503);
-        const files = this.store.all<NodeRow>(
-          "SELECT * FROM nodes WHERE sid=? AND kind='file' ORDER BY path",
-          id,
-        );
-        const plan: { path: string; destination: string }[] = [];
-        try {
-          for (const f of files) {
-            const dest = await this.options.mapFile({
-              sessionId: id,
-              path: f.path,
-              name: f.path.split("/").at(-1)!,
-              size: f.size,
-              targetDir: row.target,
-              context: JSON.parse(row.context),
-              meta: JSON.parse(row.meta),
-            });
-            plan.push({
-              path: f.path,
-              destination: relativePath(dest === null ? f.path : dest),
-            });
-          }
-          const names = new Set<string>(),
-            spelling = new Map<string, string>();
-          for (const f of plan) {
-            const lower = f.destination.toLowerCase();
-            check(!names.has(lower), "mapping_error", 409);
-            names.add(lower);
-            const parts = f.destination.split("/");
-            for (let i = 1; i <= parts.length; i++) {
-              const prefix = parts.slice(0, i).join("/"),
-                key = prefix.toLowerCase();
-              check(
-                !spelling.has(key) || spelling.get(key) === prefix,
-                "mapping_error",
-                409,
-              );
-              spelling.set(key, prefix);
-            }
-          }
-          for (const f of plan) {
-            const parts = f.destination.toLowerCase().split("/");
-            for (let i = 1; i < parts.length; i++)
-              check(
-                !names.has(parts.slice(0, i).join("/")),
-                "mapping_error",
-                409,
-              );
-          }
-        } catch (error) {
-          this.report("mapFile", id, error);
-          throw new ProtocolError(409, "mapping_error");
-        }
-        await r.mutex.run(() => {
+      if (row.map_files) {
+        for (const f of this.nodes(id)) {
+          if (f.kind !== "file" || f.mapped) continue;
+          const destination = await this.mappedDestination(row, f.path, f.size);
           check(
             this.row(id).state === "committed" && !r.transition,
             "bad_state",
             409,
           );
-          this.store.transaction(() => {
-            for (const f of plan)
-              this.store.run(
-                "UPDATE nodes SET destination=? WHERE sid=? AND path=?",
-                f.destination,
-                id,
-                f.path,
-              );
-            this.store.run("UPDATE sessions SET mapped=1 WHERE id=?", id);
-          });
-        });
+          this.checkName(id, destination, "file", "destination", f.path);
+          this.store.run(
+            "UPDATE nodes SET destination=?,destination_key=?,mapped=1 WHERE sid=? AND path=?",
+            destination,
+            destination.toLowerCase(),
+            id,
+            f.path,
+          );
+        }
       }
     })();
     r.planning = task;
@@ -1074,11 +1221,7 @@ export class Engine {
     const r = this.runtime(id);
     await r.mutex.run(() => {
       const current = this.row(id);
-      const nodes = this.store.all<NodeRow>(
-        "SELECT * FROM nodes WHERE sid=?",
-        id,
-      );
-      for (const n of nodes) {
+      for (const n of this.nodes(id)) {
         if (current.map_files && n.kind === "directory") continue;
         if (
           !n.done &&
@@ -1128,10 +1271,8 @@ export class Engine {
           "bad_state",
           409,
         );
-        const nodes = this.store
-          .all<NodeRow>("SELECT * FROM nodes WHERE sid=? ORDER BY path", id)
-          .filter((n) => !row.map_files || n.kind === "file");
-        for (const n of nodes.filter((n) => !n.done)) {
+        for (const n of this.nodes(id)) {
+          if (n.done || (row.map_files && n.kind === "directory")) continue;
           const present =
             n.kind === "directory" || fs.existsSync(this.payload(id, n.path));
           if (!present && row.state === "committed")
@@ -1161,8 +1302,8 @@ export class Engine {
           }
         };
         this.store.run("UPDATE sessions SET state='publishing' WHERE id=?", id);
-        for (const n of nodes) {
-          if (n.done) continue;
+        for (const n of this.nodes(id)) {
+          if (n.done || (row.map_files && n.kind === "directory")) continue;
           const dest = this.destination(row, n.destination);
           if (n.kind === "directory") {
             await ensureDirectory(n.destination);
@@ -1183,16 +1324,13 @@ export class Engine {
             } else check(fs.existsSync(dest), "missing_payload", 409);
           }
         }
-        const published = nodes
-          .filter((n) => n.kind === "file")
-          .map((n) => n.destination);
         // The saved plan plus source/destination presence recover interrupted renames.
         // Finish metadata in one transaction, avoiding a WAL commit per file.
         this.store.transaction(() => {
           this.store.run("UPDATE nodes SET done=1 WHERE sid=?", id);
           this.store.run(
             "UPDATE sessions SET state='published',published=? WHERE id=?",
-            JSON.stringify(published),
+            "[]",
             id,
           );
           this.touch(id);
@@ -1240,7 +1378,7 @@ export class Engine {
         this.report("cancel_cleanup", id, error);
       }
     };
-    const callbacks = [r.processing, r.planning].filter(Boolean);
+    const callbacks = [r.processing, r.planning, ...r.mappings].filter(Boolean);
     if (callbacks.length) {
       const task = Promise.allSettled(callbacks).then(cleanup);
       this.cleanups.add(task);
@@ -1267,6 +1405,7 @@ export class Engine {
           r.active.size ||
           r.transition ||
           r.planning ||
+          r.mappings.size ||
           r.processing ||
           r.listeners.size
         )
@@ -1293,7 +1432,7 @@ export class Engine {
     await Promise.all(all.map((a) => a.done));
     await Promise.allSettled(
       [...this.runtimes.values()].flatMap((r) =>
-        [r.processing, r.planning].filter(Boolean),
+        [r.processing, r.planning, ...r.mappings].filter(Boolean),
       ),
     );
     await Promise.allSettled(

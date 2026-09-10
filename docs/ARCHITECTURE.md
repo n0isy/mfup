@@ -30,6 +30,9 @@ sequenceDiagram
   API-->>SDK: Ticket and limits
   loop Incremental discovery and up to six baskets
     SDK->>API: Native multipart with manifest and File/Blob parts
+    API->>API: mapFile(metadata), validate destinations
+    API-->>UI: First overwrite question if needed
+    API->>DB: Save basket mappings
     API->>FS: Write aligned ranges into staging
     API->>DB: Persist ranges and basket receipt
     API-->>SDK: Receipt
@@ -42,18 +45,16 @@ sequenceDiagram
   SDK->>API: Commit file, directory and byte totals
   API->>API: onCommitted(event)
   SDK->>API: Publish when client policy allows it
-  API->>API: mapFile(request), validate complete plan
-  API->>DB: Save mapping plan
   API->>FS: Rename staged files into destination
   API->>DB: Save published result
   API-->>UI: Published snapshot
 ```
 
-Server `autoPublish` can initiate publication after processing. Approval is stored whenever it arrives; it does not publish incomplete data. Mapping can discover destination conflicts during publication planning.
+Server `autoPublish` can initiate publication after processing. Approval is stored whenever it arrives; it does not publish incomplete data. Mapping discovers destination conflicts during manifest reception.
 
 ## Scheduling and transport
 
-Defaults are six concurrent requests, 128 file parts plus directory entries per basket, 32 MiB payload per basket, 16 MiB aligned file ranges and an 8 ms collection window. The ready queue holds at most 768 entries by default. Available entries are assigned by basket load; a single ready file can start without waiting for six full baskets. Backpressure suspends directory enumeration while the queue is full.
+Defaults are six concurrent requests, 128 file parts plus directory entries per basket, 32 MiB payload per basket, 16 MiB aligned file ranges and an 8 ms collection window. Queued and active work together are capped at 10000 records, with enumeration resuming at 5000. Available entries are assigned by basket load; a single ready file can start without waiting for six full baskets. Backpressure suspends directory enumeration while the queue is full.
 
 `FileList` is already enumerated by the browser. Handles and directory entries are read incrementally; custom sources can be `AsyncIterable<Entry>`. FileList can carry relative file paths but cannot represent empty directories. Handles, entries or explicit directory entries can represent them.
 
@@ -69,7 +70,7 @@ Session metadata includes authorization results, `meta`, `context`, quotas, publ
 
 The engine serializes operations within each session and publication across the process. Resume drains admitted requests before advancing the epoch. Cancellation records the terminal state before stopping active requests; callbacks cannot publish after cancellation. Cleanup waits for callbacks using staging, and the sweeper retries deferred removal.
 
-A session can use an application-assigned absolute root. Its staging and published data are in that root, enabling same-filesystem rename. SQLite remains in the engine's metadata directory. Publication persists the complete plan before moving files. A single rename is atomic; merging a tree is not one filesystem transaction. Recovery uses the plan and the presence of staged/destination files. Files already replaced during a partial publication are not rolled back. Applications must not modify destinations used by unfinished publication.
+A session can use an application-assigned absolute root. Its staging and published data are in that root, enabling same-filesystem rename. SQLite remains in the engine's metadata directory. Manifest reception persists destinations before body receipt. Publication walks pages of at most 256 nodes. A single rename is atomic; merging a tree is not one filesystem transaction. Recovery uses the plan and the presence of staged/destination files. Files already replaced during a partial publication are not rolled back. Applications must not modify destinations used by unfinished publication.
 
 Receipts support recovery after a process restart. Payload fsync for power-loss durability is not performed. Published snapshots remain available until session retention expires; published files remain in the application destination.
 

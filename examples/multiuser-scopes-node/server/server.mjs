@@ -50,7 +50,7 @@ export function createExample({
       baseDir: rootFor(scope),
       targetDir: `${uid}/${scope}`,
       maxTotalBytes: 512 * 2 ** 20,
-      maxFiles: 20000,
+      maxFiles: 1000000,
       context: { uid, scope },
     };
   };
@@ -103,14 +103,32 @@ export function createExample({
           stream.pipe(res);
           return;
         }
-        const items = await fs
-          .readdir(target, { withFileTypes: true })
-          .catch((error) => {
-            if (error.code === "ENOENT") return [];
-            throw error;
-          });
+        const after = url.searchParams.get("after") ?? "";
+        const page = [];
+        let directory;
+        try {
+          directory = await fs.opendir(target);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        if (directory)
+          for await (const item of directory) {
+            const key = (item.isDirectory() ? "0:" : "1:") + item.name;
+            if (key <= after || (page.length === 257 && key >= page[256].key))
+              continue;
+            let lo = 0,
+              hi = page.length;
+            while (lo < hi) {
+              const mid = (lo + hi) >>> 1;
+              if (page[mid].key < key) lo = mid + 1;
+              else hi = mid;
+            }
+            page.splice(lo, 0, { item, key });
+            if (page.length > 257) page.pop();
+          }
+        const next = page.length > 256 ? page[255].key : null;
         const entries = await Promise.all(
-          items.map(async (item) => ({
+          page.slice(0, 256).map(async ({ item }) => ({
             name: item.name,
             dir: item.isDirectory(),
             size: item.isDirectory()
@@ -118,10 +136,7 @@ export function createExample({
               : (await fs.stat(path.join(target, item.name))).size,
           })),
         );
-        entries.sort((a, b) =>
-          a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1,
-        );
-        json(res, 200, { scope, path: rel, entries });
+        json(res, 200, { scope, path: rel, entries, next });
         return;
       }
       if (url.pathname.startsWith("/api/mfup/")) {

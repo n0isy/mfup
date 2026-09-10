@@ -389,3 +389,92 @@ test("pause resumes outstanding ranges and cancellation stops publication", asyn
     await (await request.get(`/test/result?target=${name}-cancel`)).json(),
   ).toEqual([]);
 });
+
+for (const manual of [false, true]) {
+  test(`bounded source continues without reselection after ${manual ? "exhaustion" : "more than three network failures"}`, async ({
+    page,
+    request,
+  }) => {
+    const name = target();
+    const result = await page.evaluate(
+      async ({ target, manual }) => {
+        let produced = 0,
+          accepted = 0,
+          maximum = 0,
+          posts = 0,
+          offline = true;
+        const s = new (window as any).mfup3.MfupSession({
+          targetDir: target,
+          concurrency: 1,
+          maxReady: 16,
+          batchDelayMs: 0,
+          ...(manual ? { retries: 0 } : {}),
+          retryDelayMs: 1,
+          retryMaxDelayMs: 2,
+          fetch: async (input: any, init: any) => {
+            if (String(input).includes("/batches/")) {
+              if (init?.method === "POST") {
+                posts++;
+                if (!manual && posts > 4) offline = false;
+              }
+              if (offline) throw new TypeError("temporary offline connection");
+            }
+            const response = await fetch(input, init);
+            if (
+              response.ok &&
+              String(input).includes("/batches/") &&
+              init?.method === "POST"
+            )
+              accepted += JSON.parse(init.body.get("manifest")).files.length;
+            return response;
+          },
+        });
+        async function* source() {
+          for (let i = 0; i < 40; i++) {
+            maximum = Math.max(maximum, ++produced - accepted);
+            yield {
+              kind: "file",
+              path: `f${i}`,
+              file: new File(["abc"], `f${i}`, { lastModified: 1 }),
+            };
+          }
+        }
+        try {
+          if (manual) {
+            await s.upload(source()).catch(() => {});
+            if (s.getSnapshot().state !== "failed")
+              throw Error("Expected exhausted retries");
+            const held = produced;
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            if (produced !== held) throw Error("Source advanced while held");
+            offline = false;
+            await s.retry();
+          } else await s.upload(source());
+          return {
+            maximum,
+            accepted,
+            produced,
+            posts,
+            state: s.getSnapshot().state,
+          };
+        } finally {
+          s.dispose();
+        }
+      },
+      { target: name, manual },
+    );
+    expect(result).toMatchObject({
+      accepted: 40,
+      produced: 40,
+      state: "published",
+    });
+    expect(result.maximum).toBeLessThanOrEqual(16);
+    expect(result.posts).toBeLessThan(40);
+    if (!manual) expect(result.posts).toBeGreaterThan(4);
+    const files = await (
+      await request.get(`/test/result?target=${name}`)
+    ).json();
+    expect(files).toHaveLength(40);
+    expect(files.every((f: any) => f.sha256 === hash("abc"))).toBe(true);
+  });
+}

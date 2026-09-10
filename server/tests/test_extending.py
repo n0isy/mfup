@@ -20,7 +20,7 @@ def call(client, ticket, action, data=None):
     )
 
 
-def upload(client, ticket, names=("a",)):
+def upload(client, ticket, names=("a",), expected=200):
     parts = [
         (
             "manifest",
@@ -33,7 +33,9 @@ def upload(client, ticket, names=("a",)):
         headers={"Authorization": "Bearer " + ticket["token"], "X-MFUP-Epoch": "1"},
         files=parts,
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == expected, r.text
+    if expected != 200:
+        return r
     return call(client, ticket, "commit", dict(files=len(names), dirs=0, bytes=3 * len(names)))
 
 
@@ -84,25 +86,30 @@ def test_embedding_lifecycle_prefix_and_websocket(tmp_path):
     assert mfup.engine.closed
 
 
-def test_staged_access_late_mapping_and_restart(tmp_path):
+def test_metadata_mapping_staged_processing_and_restart(tmp_path):
     seen = []
     home = tmp_path / "home"
 
     def mapping(r):
         seen.append(r)
-        with app.state.mfup.engine.open_staged(r["sessionId"], r["path"]) as file:
-            assert file.read() == b"abc"
+        with pytest.raises(ProtocolError):
+            app.state.mfup.engine.open_staged(r["sessionId"], r["path"])
         return "mapped/" + r["name"]
+
+    def committed(event):
+        with app.state.mfup.engine.open_staged(event["sessionId"], "a") as file:
+            assert file.read() == b"abc"
 
     app = app_for(
         tmp_path,
+        on_committed=committed,
         authorize=lambda r: dict(baseDir=str(home), targetDir="scope", context=dict(uid=7)),
         map_file=mapping,
     )
     with TestClient(app) as c:
         t = create(c).json()
         assert upload(c, t).status_code == 200
-        assert not seen
+        assert len(seen) == 1
         e = app.state.mfup.engine
         assert e.get_session(t["id"])["stagingDir"] == str(home / "staging" / t["id"])
         assert len(list(e.list_staged(t["id"]))) == 1
@@ -134,10 +141,10 @@ def test_complete_mapping_plan_validation(tmp_path, kind):
     app = app_for(tmp_path, map_file=mapping)
     with TestClient(app) as c:
         t = create(c).json()
-        assert upload(c, t, ("a", "b")).status_code == 200
-        assert call(c, t, "publish").json()["error"] == "mapping_error"
-        assert len(list(app.state.mfup.engine.list_staged(t["id"]))) == 2
+        assert upload(c, t, ("a", "b"), expected=409).json()["error"] == "mapping_error"
+        assert app.state.mfup.engine.snapshot(t["id"])["state"] == "uploading"
         app.state.mfup.engine.map_file = lambda r: None
+        assert upload(c, t, ("a", "b")).status_code == 200
         assert call(c, t, "publish").status_code == 200
     assert (tmp_path / "published/uploads/a").read_bytes() == b"abc"
 
@@ -261,3 +268,80 @@ def test_failed_processing_policy_and_root_survive_restart(tmp_path):
         assert call(c, t, "publish").status_code == 403
         assert c.portal.call(app.state.mfup.engine.retry_committed, t["id"])["state"] == "published"
     assert (home / "published/area/a").read_bytes() == b"abc"
+
+
+@pytest.mark.asyncio
+async def test_early_mapping_question_and_cancellation(tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def mapping(request):
+        if request["name"] == "b":
+            entered.set()
+            await release.wait()
+        return request["path"]
+
+    engine = Engine(tmp_path, lambda r: {}, map_file=mapping)
+    dest = tmp_path / "published/uploads"
+    dest.mkdir(parents=True)
+    (dest / "a").write_bytes(b"old")
+    try:
+        ticket = await engine.create(dict(protocol="MFUP/3"), {})
+        sid = ticket["id"]
+        batch = await engine.begin(sid, 1, "early", lambda: None)
+
+        async def receive():
+            try:
+                return await engine.prepare(
+                    batch, dict(files=[["a", 3, 1, 0, 3], ["b", 3, 1, 0, 3]], dirs=[])
+                )
+            finally:
+                engine.end(batch)
+
+        pending = asyncio.create_task(receive())
+        await asyncio.wait_for(entered.wait(), 2)
+        assert engine.snapshot(sid)["overwriteRequired"]
+        assert engine.snapshot(sid)["confirmedBytes"] == 0
+        await engine.set_properties(sid, dict(overwrite=True))
+        assert (await asyncio.wait_for(engine.cancel(sid), 2))["state"] == "cancelled"
+        with pytest.raises(ProtocolError):
+            await pending
+        assert await engine.sweep(9007199254740991) == 0
+    finally:
+        release.set()
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_large_inventory_and_published_pages_stay_bounded(tmp_path):
+    engine = Engine(tmp_path, lambda r: {})
+    try:
+        t = await engine.create(dict(protocol="MFUP/3"), {})
+
+        def records():
+            for i in range(100000):
+                name = f"f{i:06}"
+                yield t["id"], name, name, name, name
+
+        engine.db.execute("BEGIN IMMEDIATE")
+        engine.db.executemany(
+            "INSERT INTO nodes(sid,path,kind,size,mtime,destination,source_key,destination_key,mapped,done) VALUES(?,?,'file',0,1,?,?,?,1,1)",
+            records(),
+        )
+        engine.db.execute("COMMIT")
+        engine.db.execute("UPDATE sessions SET state='committed' WHERE id=?", (t["id"],))
+        unbounded = []
+        engine.db.set_trace_callback(
+            lambda sql: (
+                unbounded.append(sql)
+                if "SELECT * FROM nodes" in sql and "LIMIT" not in sql
+                else None
+            )
+        )
+        state = await engine.publish(t["id"])
+        assert not unbounded
+        assert state["files"] == state["publishedCount"] == 100000
+        assert len(state["published"]) == 256
+        assert state["publishedNext"] == "f000255"
+        assert len(engine.published_page(t["id"], "f099990")["files"]) == 9
+    finally:
+        await engine.close()

@@ -30,9 +30,7 @@ export function useMfupUpload(options: SessionOptions = {}) {
   const start = useCallback(async (source: Source | FileList | File[]) => {
     if (
       ref.current &&
-      !["published", "cancelled", "failed"].includes(
-        ref.current.getSnapshot().state,
-      )
+      !["published", "cancelled"].includes(ref.current.getSnapshot().state)
     )
       throw new Error("Upload already running");
     ref.current?.dispose();
@@ -48,6 +46,7 @@ export function useMfupUpload(options: SessionOptions = {}) {
     start,
     pause: () => ref.current?.pause(),
     resume: () => ref.current?.resume(),
+    retry: () => ref.current?.retry(),
     cancel: () => ref.current?.cancel(),
     setOverwrite: (value = true) => ref.current?.setOverwrite(value),
     answer: (id: string, choice: Choice) => ref.current?.answer(id, choice),

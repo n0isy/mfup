@@ -66,6 +66,8 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
   const [ticket, setTicket] = useState(() => readTicket(key));
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [folder, setFolder] = useState("");
+  const [after, setAfter] = useState("");
+  const [nextPage, setNextPage] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [drag, setDrag] = useState(false);
   const listingVersion = useRef(0);
@@ -73,15 +75,18 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
     const version = ++listingVersion.current;
     try {
       const response = await fetch(
-        `${API}/files/${scope}?path=${encodeURIComponent(folder)}`,
+        `${API}/files/${scope}?path=${encodeURIComponent(folder)}&after=${encodeURIComponent(after)}`,
       );
       if (!response.ok) throw new Error("Could not refresh the file list");
       const data = await response.json();
-      if (version === listingVersion.current) setEntries(data.entries);
+      if (version === listingVersion.current) {
+        setEntries(data.entries);
+        setNextPage(data.next ?? null);
+      }
     } catch (e) {
       if (version === listingVersion.current) setError((e as Error).message);
     }
-  }, [scope, folder]);
+  }, [scope, folder, after]);
   useEffect(() => {
     void refresh();
     return () => {
@@ -89,13 +94,21 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
     };
   }, [refresh]);
 
-  const { session, snapshot, start, setOverwrite, pause, resume, cancel } =
-    useMfupUpload({
-      serverUrl: API,
-      meta: { scope },
-      ticket,
-      trackUploadProgress: true,
-    });
+  const {
+    session,
+    snapshot,
+    start,
+    setOverwrite,
+    pause,
+    resume,
+    retry,
+    cancel,
+  } = useMfupUpload({
+    serverUrl: API,
+    meta: { scope },
+    ticket,
+    trackUploadProgress: true,
+  });
   const state = snapshot?.state ?? "idle";
   const busy = [
     "connecting",
@@ -104,6 +117,7 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
     "waiting",
     "committed",
     "cancelling",
+    "failed",
   ].includes(state);
   useEffect(() => {
     if (["published", "cancelled"].includes(state)) {
@@ -133,7 +147,6 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
   }
   function picked(input: HTMLInputElement) {
     const source = sourceFromInput(input);
-    input.value = "";
     void upload(source);
   }
   const total = snapshot?.totalBytes ?? 0;
@@ -303,7 +316,7 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
             </div>
           </div>
         )}
-      {ticket && !busy && (
+      {ticket && !session && !busy && (
         <div className="note warn">
           An unfinished upload is saved. Select the same files to resume.
           <button
@@ -319,6 +332,16 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
       {displayError && (
         <div className="note err" role="alert">
           {displayError}
+          {state === "failed" && snapshot?.errorInfo?.phase !== "cancel" && (
+            <button
+              onClick={() => {
+                setError("");
+                void retry()?.catch(reportError);
+              }}
+            >
+              Retry upload
+            </button>
+          )}
           {ticket && state === "failed" && (
             <button
               onClick={() => {
@@ -339,6 +362,7 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
           onClick={() => {
             setFolder(folder.split("/").slice(0, -1).join("/"));
             setEntries(null);
+            setAfter("");
           }}
         >
           ↑ Back
@@ -361,6 +385,7 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
                   onClick={() => {
                     setFolder(rel);
                     setEntries(null);
+                    setAfter("");
                   }}
                 >
                   ▸ {entry.name}
@@ -380,6 +405,28 @@ function ScopeZone({ scope, uid }: { scope: Scope; uid: string }) {
           );
         })}
       </ul>
+      {(after || nextPage) && (
+        <nav aria-label="File list pages">
+          <button
+            disabled={!after}
+            onClick={() => {
+              setAfter("");
+              setEntries(null);
+            }}
+          >
+            First page
+          </button>
+          <button
+            disabled={!nextPage}
+            onClick={() => {
+              setAfter(nextPage!);
+              setEntries(null);
+            }}
+          >
+            Next page
+          </button>
+        </nav>
+      )}
       <footer>
         The bar shows sent and confirmed bytes. Completion follows publication.
       </footer>

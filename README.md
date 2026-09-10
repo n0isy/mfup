@@ -55,6 +55,8 @@ The application supplies the input and rendering functions. Sources include File
 
 `trackUploadProgress: true` enables native XHR events during long POSTs. `sentBytes` estimates sent payload; `confirmedBytes` counts receipt-backed payload. Completion is `state === "published"`, not merely all bytes sent. A custom fetch takes precedence over XHR.
 
+The default 1000 retries with delays capped at 36 seconds keep recovery available for about ten hours. The SDK holds at most 10000 pending records including active baskets, resuming discovery at 5000. Do not collect or retain duplicate entries/File lists. After exhaustion, call session.retry() without a source; the bounded stream remains owned by the SDK.
+
 ## Resume and React
 
 Save `session.exportTicket()` after connect. Within the same page use pause/resume. After reload, restore the ticket and select the same source files again:
@@ -113,7 +115,7 @@ async def authorize(request):
 app = create_app('./data', authorize=authorize)
 ```
 
-The application implements resolveUser/resolve_user and its access policy. Authorization can set session roots, quotas and context. `mapFile` / `map_file` produces a saved destination plan after commit. `onCommitted` / `on_committed` reads accepted files and returns a boolean controlling server publication. Server autoPublish defaults to false; clientPublish=false reserves publication for the backend. See the [extension API](docs/EXTENDING.md).
+The application implements resolveUser/resolve_user and its access policy. Authorization can set session roots, quotas and context. `mapFile` / `map_file` maps metadata immediately during manifest reception. `onCommitted` / `on_committed` reads accepted files and returns a boolean controlling server publication. Server autoPublish defaults to false; clientPublish=false reserves publication for the backend. See the [extension API](docs/EXTENDING.md).
 
 One process owns SQLite and its assigned roots; Redis is not required. Receipts support process restart. File renames are atomic individually; publishing a tree is not one transaction and does not retain rollback copies. Payload fsync for power-loss durability is not performed. Empty directories are available through handles/entries, but not FileList. Exact behavior is specified by the [protocol](docs/PROTOCOL.md).
 

@@ -7,7 +7,6 @@ import {
   type Manifest,
   type Receipt,
   type RemoteState,
-  type ResumeFile,
   type Snapshot,
   type Source,
   type Ticket,
@@ -15,8 +14,15 @@ import {
 import { fromFiles } from "./ingestion.js";
 import { baskets, type Work } from "./scheduler.js";
 import { uploadMultipart } from "./upload.js";
+import {
+  DEFAULT_RETRIES,
+  isRetryable,
+  retryDelay,
+  validateRetryOptions,
+  type RetryOptions,
+} from "./retry.js";
 
-export interface SessionOptions {
+export interface SessionOptions extends RetryOptions {
   serverUrl?: string;
   targetDir?: string;
   meta?: unknown;
@@ -24,7 +30,6 @@ export interface SessionOptions {
   concurrency?: number;
   batchDelayMs?: number;
   maxReady?: number;
-  retries?: number;
   /** Additional consumer headers for HTTP requests. Browser WebSocket uses the issued ticket. */
   headers?: Record<string, string>;
   autoPublish?: boolean;
@@ -54,9 +59,11 @@ export class MfupSession {
   private listeners = new Set<() => void>();
   private notifyWaiters = new Set<() => void>();
   private controllers = new Set<AbortController>();
+  private controlControllers = new Set<AbortController>();
   private inFlight = new Map<AbortController, number>();
   private progressTimer?: ReturnType<typeof setTimeout>;
-  private remoteFiles = new Map<string, ResumeFile>();
+  private needsStatus = false;
+  private recovering = 0;
   private ws?: WebSocket;
   private wsTimer?: ReturnType<typeof setTimeout>;
   private disposed = false;
@@ -64,10 +71,47 @@ export class MfupSession {
   private cancelled = false;
   private stopping = false;
   private connection?: Promise<Ticket>;
+  private resumption?: Promise<void>;
   private fatal: unknown = null;
   private running = false;
+  private completions = new Set<{
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }>();
+  private completion() {
+    return new Promise<void>((resolve, reject) =>
+      this.completions.add({ resolve, reject }),
+    );
+  }
+  private settle(error?: unknown) {
+    for (const waiter of this.completions)
+      error ? waiter.reject(error) : waiter.resolve();
+    this.completions.clear();
+  }
+  private async recover<T>(operation: () => Promise<T>): Promise<T> {
+    while (true) {
+      await this.unpaused();
+      try {
+        return await operation();
+      } catch (error) {
+        if (this.cancelled || this.stopping || this.disposed) throw error;
+        this.fail(error);
+      }
+    }
+  }
   readonly options: SessionOptions;
   constructor(options: SessionOptions = {}) {
+    validateRetryOptions(options);
+    if (
+      options.maxReady !== undefined &&
+      (!Number.isSafeInteger(options.maxReady) ||
+        options.maxReady < 1 ||
+        options.maxReady > 10000)
+    )
+      throw new MfupError(
+        "bad_options",
+        "maxReady must be between 1 and 10000",
+      );
     this.options = options;
     this.ticket = options.ticket ?? null;
   }
@@ -119,6 +163,7 @@ export class MfupSession {
   }
   private async request<T>(url: string, init: RequestInit = {}): Promise<T> {
     const controller = init.signal ? undefined : new AbortController();
+    if (controller) this.controlControllers.add(controller);
     let expired = false;
     const timer = controller
       ? setTimeout(() => {
@@ -160,6 +205,7 @@ export class MfupSession {
       throw error;
     } finally {
       clearTimeout(timer);
+      if (controller) this.controlControllers.delete(controller);
     }
   }
   private fail(error: unknown) {
@@ -171,6 +217,7 @@ export class MfupSession {
             (error as Error)?.message ?? "Operation failed",
           );
     this.fatal ??= e;
+    this.settle(this.fatal);
     const first = this.fatal instanceof MfupError ? this.fatal : e;
     if (!this.snapshot.errorInfo)
       this.update({
@@ -200,6 +247,7 @@ export class MfupSession {
       remote.state !== this.snapshot.state
     )
       return;
+    if (this.ticket && remote.epoch < this.ticket.epoch) return;
     const terminal = ["published", "cancelled"].includes(remote.state);
     if (terminal) this.fatal = null;
     if (remote.state === "cancelled") {
@@ -213,6 +261,10 @@ export class MfupSession {
       Boolean(remote.overwrite) || Boolean(this.snapshot.overwrite);
     this.update({
       ...(terminal ? { error: null, errorInfo: null } : {}),
+      confirmedBytes: Math.max(
+        this.snapshot.confirmedBytes,
+        remote.confirmedBytes ?? 0,
+      ),
       overwrite,
       overwriteRequired:
         !overwrite &&
@@ -229,6 +281,7 @@ export class MfupSession {
     });
     if (
       remote.error &&
+      !this.resumption &&
       !this.stopping &&
       !["cancelled", "published"].includes(remote.state)
     )
@@ -247,33 +300,9 @@ export class MfupSession {
     this.apply(remote);
     return remote;
   }
-  private async loadFiles() {
-    this.remoteFiles.clear();
-    let after = "";
-    do {
-      const page = await this.request<{
-        files: ResumeFile[];
-        next: string | null;
-      }>(this.endpoint(`/files?after=${encodeURIComponent(after)}`));
-      for (const file of page.files) this.remoteFiles.set(file.path, file);
-      after = page.next ?? "";
-    } while (after);
-    this.update({
-      confirmedBytes: [...this.remoteFiles.values()].reduce(
-        (sum, file) =>
-          sum +
-          file.offsets.reduce(
-            (n, offset) =>
-              n + Math.min(this.ticket!.limits.partBytes, file.size - offset),
-            0,
-          ),
-        0,
-      ),
-    });
-  }
   async connect(): Promise<Ticket> {
     if (this.connection) return this.connection;
-    this.connection = this.connectImpl();
+    this.connection = this.retryRequest(() => this.connectImpl());
     try {
       return await this.connection;
     } finally {
@@ -293,7 +322,7 @@ export class MfupSession {
         limits: remote.limits,
       };
       this.apply(remote);
-      await this.loadFiles();
+      this.needsStatus = true;
       this.update({
         state:
           remote.state === "published"
@@ -375,7 +404,11 @@ export class MfupSession {
   }
   async setOverwrite(overwrite = true) {
     try {
-      this.apply(await this.post<RemoteState>("/properties", { overwrite }));
+      this.apply(
+        await this.retryRequest(() =>
+          this.post<RemoteState>("/properties", { overwrite }),
+        ),
+      );
     } catch (error) {
       if (
         overwrite &&
@@ -396,14 +429,31 @@ export class MfupSession {
     this.update({ state: "paused", activeRequests: 0 });
   }
   async resume() {
-    if (!this.ticket) throw new MfupError("not_connected", "Connect first");
+    if (this.resumption) return this.resumption;
+    this.resumption = Promise.resolve().then(() => this.resumeImpl());
+    try {
+      await this.resumption;
+    } finally {
+      this.resumption = undefined;
+    }
+  }
+  private async resumeImpl() {
+    if (!this.ticket) {
+      this.fatal = null;
+      this.paused = false;
+      this.update({ state: "connecting", error: null, errorInfo: null });
+      return;
+    }
+    this.paused = true;
     this.fatal = null;
     this.stopping = false;
     this.update({ error: null, errorInfo: null });
-    const remote = await this.post<RemoteState & { limits: Limits }>("/resume");
+    const remote = await this.retryRequest(() =>
+      this.post<RemoteState & { limits: Limits }>("/resume"),
+    );
     this.ticket.epoch = remote.epoch;
     this.ticket.limits = remote.limits;
-    await this.loadFiles();
+    this.needsStatus = true;
     this.apply(remote);
     this.paused = false;
     this.update({
@@ -453,6 +503,8 @@ export class MfupSession {
   }
   dispose() {
     this.disposed = true;
+    this.settle(new MfupError("cancelled", "Upload stopped"));
+    for (const controller of this.controlControllers) controller.abort();
     clearTimeout(this.progressTimer);
     this.inFlight.clear();
     for (const controller of this.controllers) controller.abort();
@@ -466,35 +518,73 @@ export class MfupSession {
     if (this.fatal) throw this.fatal;
   }
   private async unpaused() {
-    this.alive();
-    while (this.paused) {
+    if (this.cancelled || this.stopping || this.disposed) this.alive();
+    while (this.paused || this.fatal) {
       await this.wait();
-      this.alive();
+      if (this.cancelled || this.stopping || this.disposed) this.alive();
     }
   }
-  private confirm(group: Work[]) {
-    let bytes = 0;
-    for (const { part } of group)
-      if (part) {
-        let state = this.remoteFiles.get(part[0]);
-        if (!state) {
-          state = { path: part[0], size: part[1], mtime: part[2], offsets: [] };
-          this.remoteFiles.set(part[0], state);
-        }
-        if (!state.offsets.includes(part[3])) {
-          state.offsets.push(part[3]);
-          bytes += part[4];
-        }
-      }
+  private confirm(receipt: Receipt) {
     this.update({
-      confirmedBytes: this.snapshot.confirmedBytes + bytes,
+      confirmedBytes: Math.max(
+        this.snapshot.confirmedBytes,
+        receipt.confirmedBytes,
+      ),
       batches: this.snapshot.batches + 1,
     });
   }
+  private async backoff(attempt: number, respectPause = true) {
+    const until = Date.now() + retryDelay(attempt, this.options);
+    while (Date.now() < until) {
+      this.alive();
+      if (respectPause && this.paused) {
+        await this.unpaused();
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const wake = () => {
+          clearTimeout(timer);
+          this.notifyWaiters.delete(wake);
+          resolve();
+        };
+        const timer = setTimeout(
+          wake,
+          Math.min(until - Date.now(), 2147483647),
+        );
+        this.notifyWaiters.add(wake);
+      });
+    }
+    this.alive();
+  }
+  private async retryRequest<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      this.alive();
+      try {
+        return await operation();
+      } catch (error) {
+        this.alive();
+        if (
+          !isRetryable(error) ||
+          attempt >= (this.options.retries ?? DEFAULT_RETRIES)
+        )
+          throw error;
+        this.recovering++;
+        try {
+          await this.backoff(attempt, false);
+        } finally {
+          this.recovering--;
+          this.wake();
+        }
+      }
+    }
+  }
   private async send(group: Work[]) {
-    const id = crypto.randomUUID();
+    let id = crypto.randomUUID();
+    let statusEpoch = this.needsStatus ? 0 : this.ticket!.epoch;
+    let pending = group;
     for (let attempt = 0; ; attempt++) {
       await this.unpaused();
+      const attemptEpoch = this.ticket!.epoch;
       const controller = new AbortController();
       this.controllers.add(controller);
       const active = this.controllers.size;
@@ -502,15 +592,36 @@ export class MfupSession {
         activeRequests: active,
         maxActiveRequests: Math.max(active, this.snapshot.maxActiveRequests),
       });
+      let retry: unknown;
       try {
+        if (statusEpoch !== this.ticket!.epoch) {
+          const status = await this.post<{
+            received: boolean[];
+            confirmedBytes: number;
+          }>("/status", {
+            epoch: this.ticket!.epoch,
+            files: group.flatMap((w) => (w.part ? [w.part] : [])),
+          });
+          let n = 0;
+          pending = group.filter((w) => !w.part || !status.received[n++]);
+          id = crypto.randomUUID();
+          this.update({
+            confirmedBytes: Math.max(
+              this.snapshot.confirmedBytes,
+              status.confirmedBytes,
+            ),
+          });
+          statusEpoch = this.ticket!.epoch;
+          if (!pending.length) return;
+        }
         const form = new FormData(),
           manifest: Manifest = {
-            files: group.flatMap((w) => (w.part ? [w.part] : [])),
-            dirs: group.flatMap((w) => (w.dir ? [w.dir] : [])),
+            files: pending.flatMap((w) => (w.part ? [w.part] : [])),
+            dirs: pending.flatMap((w) => (w.dir ? [w.dir] : [])),
           };
         form.append("manifest", JSON.stringify(manifest));
         let n = 0;
-        for (const work of group)
+        for (const work of pending)
           if (work.part) {
             const p = work.part,
               f = work.file!;
@@ -522,20 +633,17 @@ export class MfupSession {
           }
         const url = this.endpoint(`/batches/${id}`);
         const headers = { "X-MFUP-Epoch": String(this.ticket!.epoch) };
+        let receipt: Receipt;
         if (
           this.options.trackUploadProgress &&
           !this.options.fetch &&
           typeof XMLHttpRequest !== "undefined"
         ) {
-          const pendingBytes = group.reduce(
-            (sum, { part }) =>
-              sum +
-              (part && !this.remoteFiles.get(part[0])?.offsets.includes(part[3])
-                ? part[4]
-                : 0),
+          const pendingBytes = pending.reduce(
+            (sum, w) => sum + (w.part?.[4] ?? 0),
             0,
           );
-          await uploadMultipart(
+          receipt = await uploadMultipart(
             url,
             form,
             { ...this.headers(), ...headers },
@@ -553,58 +661,88 @@ export class MfupSession {
                 }, 50);
             },
           );
-        } else {
-          await this.request<Receipt>(url, {
+        } else
+          receipt = await this.request<Receipt>(url, {
             method: "POST",
             headers,
             body: form,
             signal: controller.signal,
           });
-        }
         this.inFlight.delete(controller);
-        this.confirm(group);
+        this.confirm(receipt);
         return;
       } catch (error) {
         this.inFlight.delete(controller);
-        this.update();
         this.alive();
-        if (error instanceof MfupError && error.retryable === false)
-          throw error;
-        if (
-          error instanceof MfupError &&
-          ![0, 408, 409, 429, 500, 502, 503, 504].includes(error.status)
-        )
-          throw error;
-        if (
-          error instanceof MfupError &&
-          error.status === 409 &&
-          !["busy", "range_busy", "stale_epoch"].includes(error.code)
-        )
-          throw error;
-        await this.unpaused();
+        if (this.paused || attemptEpoch !== this.ticket!.epoch) {
+          attempt--;
+          continue;
+        }
+        if (!isRetryable(error)) throw error;
+        // A failed receipt probe is part of this attempt, not a separate retry budget.
         try {
-          await this.request<Receipt>(this.endpoint(`/batches/${id}`));
-          this.confirm(group);
+          const receipt = await this.request<Receipt>(
+            this.endpoint(`/batches/${id}`),
+          );
+          this.confirm(receipt);
           return;
         } catch (receiptError) {
-          if (receiptError instanceof MfupError && receiptError.status !== 404)
+          if (
+            !(
+              receiptError instanceof MfupError && receiptError.status === 404
+            ) &&
+            !isRetryable(receiptError)
+          )
             throw receiptError;
         }
-        if (attempt >= (this.options.retries ?? 3)) throw error;
-        await delay(Math.min(100 * 2 ** attempt, 2000));
+        if (attempt >= (this.options.retries ?? DEFAULT_RETRIES)) throw error;
+        retry = error;
       } finally {
         this.inFlight.delete(controller);
         this.controllers.delete(controller);
         this.update({ activeRequests: this.controllers.size });
       }
+      if (retry) {
+        this.recovering++;
+        try {
+          await this.backoff(attempt);
+        } finally {
+          this.recovering--;
+          this.wake();
+        }
+      }
     }
   }
-  async upload(source: Source | FileList | File[]) {
+  async retry() {
+    if (!this.running)
+      throw new MfupError("not_running", "There is no retained upload");
+    const completion = this.completion();
+    void this.resume().catch((error) => this.fail(error));
+    return completion;
+  }
+  upload(source: Source | FileList | File[]): Promise<void> {
     if (this.running)
-      throw new MfupError("busy", "An upload is already running");
+      return Promise.reject(
+        new MfupError("busy", "An upload is already running"),
+      );
+    this.running = true;
+    const result = this.completion();
+    void this.uploadImpl(source).then(
+      () => {
+        this.running = false;
+        this.settle();
+      },
+      (error) => {
+        this.running = false;
+        this.settle(error);
+      },
+    );
+    return result;
+  }
+  private async uploadImpl(source: Source | FileList | File[]) {
     if (!this.ticket || this.snapshot.state === "idle") {
       try {
-        await this.connect();
+        await this.recover(() => this.connect());
       } catch (error) {
         if (!this.stopping && !this.cancelled) this.fail(error);
         throw error;
@@ -614,7 +752,7 @@ export class MfupSession {
     if (this.snapshot.state === "published") return;
     if (this.snapshot.state === "committed") {
       if (this.options.autoPublish !== false && this.canClientPublish())
-        await this.publish();
+        await this.recover(() => this.publish());
       return;
     }
     this.running = true;
@@ -631,17 +769,17 @@ export class MfupSession {
         ),
       ),
     };
-    const maxReady = Math.max(
-      limits.maxParts,
-      this.options.maxReady ?? limits.maxParts * limits.concurrency,
-    );
+    const maxReady = this.options.maxReady ?? 10000;
+    const lowReady = Math.floor(maxReady / 2);
+    let pendingCount = 0;
+    let gated = false;
     const queue: Work[] = [],
       active = new Set<Promise<void>>();
     let ended = false,
       files = 0,
       dirs = 0,
       bytes = 0;
-    const seen = new Set<string>();
+    let scanUpdateAt = 0;
     const input =
       Symbol.asyncIterator in Object(source) ||
       (Array.isArray(source) && source.length > 0 && "kind" in source[0]) ||
@@ -650,57 +788,77 @@ export class MfupSession {
         !(typeof FileList !== "undefined" && source instanceof FileList))
         ? (source as Source)
         : fromFiles(source as ArrayLike<File>);
-    const push = async (work: Work) => {
+    const capacity = async () => {
       await this.unpaused();
-      while (queue.length >= maxReady) {
+      if (pendingCount >= maxReady) gated = true;
+      while (this.recovering || (gated && pendingCount > lowReady)) {
         await this.wait();
         await this.unpaused();
       }
+      gated = false;
+    };
+    const push = async (work: Work) => {
+      await capacity();
       queue.push(work);
+      pendingCount++;
       this.wake();
     };
     const producer = (async () => {
-      for await (const entry of input) {
-        await this.unpaused();
-        if (seen.has(entry.path))
-          throw new MfupError("duplicate_path", entry.path);
-        seen.add(entry.path);
-        if (entry.kind === "directory") {
-          dirs++;
-          await push({ dir: entry.path });
-          continue;
+      const iterator =
+        Symbol.asyncIterator in Object(input)
+          ? (input as AsyncIterable<Entry>)[Symbol.asyncIterator]()
+          : (input as Iterable<Entry>)[Symbol.iterator]();
+      let finished = false;
+      try {
+        while (true) {
+          await capacity();
+          const next = await iterator.next();
+          if (this.cancelled || this.stopping || this.disposed) {
+            this.alive();
+          }
+          if (next.done) {
+            finished = true;
+            break;
+          }
+          const entry = next.value;
+          if (entry.kind === "directory") {
+            dirs++;
+            await push({ dir: entry.path });
+            continue;
+          }
+          const file = entry.file;
+          if (!file) throw new MfupError("missing_file", entry.path);
+          files++;
+          bytes += file.size;
+          if (Date.now() >= scanUpdateAt) {
+            this.update({ discovered: files, totalBytes: bytes });
+            scanUpdateAt = Date.now() + 50;
+          }
+          for (
+            let offset = 0;
+            offset < file.size || offset === 0;
+            offset += limits.partBytes
+          ) {
+            const length = Math.min(limits.partBytes, file.size - offset);
+            await push({
+              file,
+              part: [entry.path, file.size, file.lastModified, offset, length],
+            });
+          }
         }
-        const file = entry.file;
-        if (!file) throw new MfupError("missing_file", entry.path);
-        const old = this.remoteFiles.get(entry.path);
-        if (old && (old.size !== file.size || old.mtime !== file.lastModified))
-          throw new MfupError("file_changed", entry.path);
-        files++;
-        bytes += file.size;
-        this.update({ discovered: files, totalBytes: bytes });
-        for (
-          let offset = 0;
-          offset < file.size || offset === 0;
-          offset += limits.partBytes
-        ) {
-          const length = Math.min(limits.partBytes, file.size - offset);
-          if (old?.offsets.includes(offset)) continue;
-          await push({
-            file,
-            part: [entry.path, file.size, file.lastModified, offset, length],
-          });
-        }
+      } finally {
+        if (!finished) await iterator.return?.();
       }
       ended = true;
-      this.update({ scanDone: true });
+      this.update({ scanDone: true, discovered: files, totalBytes: bytes });
     })().catch((error) => {
+      if (!this.cancelled && !this.stopping && !this.disposed) this.fail(error);
       this.fatal = error;
       ended = true;
       this.wake();
     });
     try {
       while (!ended || queue.length || active.size) {
-        this.alive();
         await this.unpaused();
         if (queue.length && active.size < limits.concurrency) {
           if (!ended && queue.length < maxReady)
@@ -713,12 +871,13 @@ export class MfupSession {
           this.wake();
           for (const group of groups) {
             let task: Promise<void>;
-            task = this.send(group)
+            task = this.recover(() => this.send(group))
               .catch((error) => {
                 this.fatal ??= error;
                 for (const c of this.controllers) c.abort();
               })
               .finally(() => {
+                pendingCount -= group.length;
                 active.delete(task);
                 this.wake();
               });
@@ -728,11 +887,11 @@ export class MfupSession {
       }
       await producer;
       this.alive();
-      const committed = await this.post<RemoteState>("/commit", {
-        files,
-        dirs,
-        bytes,
-      });
+      const committed = await this.recover(() =>
+        this.retryRequest(() =>
+          this.post<RemoteState>("/commit", { files, dirs, bytes }),
+        ),
+      );
       this.apply(committed);
       this.alive();
       if (this.getSnapshot().state === "published") return;
@@ -741,7 +900,7 @@ export class MfupSession {
       });
       if (committed.state === "published") return;
       if (this.options.autoPublish !== false && this.canClientPublish())
-        await this.publish();
+        await this.recover(() => this.publish());
     } catch (error) {
       if (!this.cancelled && !this.stopping) this.fail(error);
       this.fatal ??= error;
@@ -766,7 +925,7 @@ export class MfupSession {
       if (this.snapshot.overwriteRequired) {
         this.update({ state: "waiting" });
         await delay(250);
-        const remote = await this.refresh();
+        const remote = await this.retryRequest(() => this.refresh());
         if (remote.state === "published") {
           this.update({ state: "published" });
           return remote;
@@ -774,7 +933,9 @@ export class MfupSession {
         continue;
       }
       try {
-        const done = await this.post<RemoteState>("/publish");
+        const done = await this.retryRequest(() =>
+          this.post<RemoteState>("/publish"),
+        );
         this.apply(done);
         this.update({ state: "published" });
         return done;

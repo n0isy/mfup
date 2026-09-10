@@ -71,7 +71,7 @@ def validate(archive):
         )
     if npm:
         package = json.loads(files["package/package.json"])
-        assert package["name"] in EXPECTED_NPM and package["version"] == "3.0.0"
+        assert package["name"] in EXPECTED_NPM and package["version"] == json.loads(Path("package.json").read_text())["version"]
         assert package["repository"]["url"] == "git+https://github.com/n0isy/mfup.git"
         assert package["main"].removeprefix("./") in {
             str(PurePosixPath(*PurePosixPath(name).parts[1:])) for name in files

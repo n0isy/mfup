@@ -86,6 +86,12 @@ export class MfupServer {
       phase = action === "batches" ? "upload" : action || "status";
       if (req.method === "GET") {
         if (!action) json(res, 200, this.engine.snapshot(id));
+        else if (action === "published")
+          json(
+            res,
+            200,
+            this.engine.publishedPage(id, url.searchParams.get("after") ?? ""),
+          );
         else if (action === "files")
           json(
             res,
@@ -104,6 +110,8 @@ export class MfupServer {
       } else if (req.method === "POST") {
         if (action === "batches" && pieces[4])
           json(res, 200, await this.receive(req, id, pieces[4]));
+        else if (action === "status")
+          json(res, 200, this.engine.rangeStatus(id, await body(req)));
         else if (action === "resume") {
           await body(req);
           json(res, 200, await this.engine.resume(id));

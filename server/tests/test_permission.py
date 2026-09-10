@@ -181,6 +181,9 @@ def test_recover_real_sqlite_full_after_file_moves(client, app, tmp_path):
     assert send(client, t, files, "data").status_code == 200
     assert call(client, t, "/commit", dict(files=80, dirs=0, bytes=80)).status_code == 200
     db = app.state.mfup.engine.db
+    db.executescript(
+        "CREATE TABLE allocation_probe(value BLOB); CREATE TRIGGER publication_allocation BEFORE UPDATE OF state ON sessions WHEN NEW.state='published' BEGIN INSERT INTO allocation_probe VALUES(zeroblob(1048576)); END;"
+    )
     pages = db.execute("PRAGMA page_count").fetchone()[0]
     db.execute(f"PRAGMA max_page_count={pages}")
     failed = call(client, t, "/publish", {})
@@ -224,19 +227,19 @@ async def test_cancel_with_active_range_drains_and_cleans(tmp_path):
         await e.close()
 
 
-def test_mapping_plan_preserves_sqlite_full_on_rollback(client, app):
+def test_early_mapping_preserves_sqlite_full_on_rollback(client, app):
     engine = app.state.mfup.engine
     engine.map_file = lambda r: ("d" * 180) + "/" + ("e" * 180) + "/" + r["path"]
     t = ticket(client)
     files = [(f"f{i}", b"v") for i in range(80)]
-    send(client, t, files, "data")
-    call(client, t, "/commit", dict(files=80, dirs=0, bytes=80))
     db = engine.db
     pages = db.execute("PRAGMA page_count").fetchone()[0]
     db.execute(f"PRAGMA max_page_count={pages}")
-    failed = call(client, t, "/publish", {})
+    failed = send(client, t, files, "data")
     assert failed.status_code == 507, failed.text
-    assert len(list(engine.list_staged(t["id"]))) == 80
+    assert engine.snapshot(t["id"])["files"] == 0
     db.execute("PRAGMA max_page_count=100000")
-    engine.map_file = lambda r: None
+    t["epoch"] = call(client, t, "/resume", {}).json()["epoch"]
+    assert send(client, t, files, "data").status_code == 200
+    assert call(client, t, "/commit", dict(files=80, dirs=0, bytes=80)).status_code == 200
     assert call(client, t, "/publish", {}).status_code == 200

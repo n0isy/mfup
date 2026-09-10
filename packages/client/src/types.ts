@@ -28,6 +28,7 @@ export interface SessionFailure {
   retryable: boolean;
 }
 export interface RemoteState {
+  confirmedBytes: number;
   overwrite?: boolean;
   overwriteRequired?: boolean;
   error?: SessionFailure | null;
@@ -54,6 +55,7 @@ export interface Manifest {
   dirs: string[];
 }
 export interface Receipt {
+  confirmedBytes: number;
   id: string;
   parts: number;
   bytes: number;

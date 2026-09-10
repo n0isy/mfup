@@ -101,7 +101,7 @@ it("serves HTTP and WebSocket under the configured prefix", async () => {
     ws.close();
   }
 });
-it("reads staged files and maps once per file after upload, then persists the whole plan", async () => {
+it("maps metadata before body receipt and reads accepted content in onCommitted", async () => {
   const mapped: any[] = [];
   const home = path.join(base, "home");
   const { url, app } = await open({
@@ -113,18 +113,21 @@ it("reads staged files and maps once per file after upload, then persists the wh
     }),
     mapFile: async (r) => {
       mapped.push(r);
+      expect(() => app.engine.openStaged(r.sessionId, r.path)).toThrow();
+      return "mapped/" + r.name;
+    },
+    onCommitted: async (event) => {
       let content = "";
-      for await (const chunk of app.engine.openStaged(r.sessionId, r.path))
+      for await (const chunk of app.engine.openStaged(event.sessionId, "a.txt"))
         content += chunk;
       expect(content).toBe("abcdef");
-      return "mapped/" + r.name;
     },
   });
   const session = new MfupSession({ serverUrl: url, autoPublish: false });
   try {
     await session.upload([new File(["abcdef"], "a.txt", { lastModified: 1 })]);
     const t = session.exportTicket();
-    expect(mapped).toHaveLength(0);
+    expect(mapped).toHaveLength(1);
     expect([...app.engine.listStaged(t.id)]).toMatchObject([
       { path: "a.txt", size: 6 },
     ]);
@@ -172,12 +175,14 @@ it.each(["same", "parent", "case"])(
     });
     const session = new MfupSession({ serverUrl: url, autoPublish: false });
     try {
-      await session.upload([new File(["a"], "a"), new File(["b"], "b")]);
+      await expect(
+        session.upload([new File(["a"], "a"), new File(["b"], "b")]),
+      ).rejects.toMatchObject({ code: "mapping_error" });
       const t = session.exportTicket();
       expect((await call(url, t, "publish")).status).toBe(409);
-      expect([...app.engine.listStaged(t.id)]).toHaveLength(2);
-      expect(app.engine.snapshot(t.id).state).toBe("committed");
+      expect(app.engine.snapshot(t.id).state).toBe("uploading");
       app.engine.options.mapFile = () => null;
+      await session.retry();
       expect((await call(url, t, "publish")).status).toBe(200);
       expect(
         await fs.readFile(path.join(base, "published/uploads/a"), "utf8"),
@@ -322,3 +327,98 @@ it("recovers failed processing and per-session policy in a different root after 
     "restart",
   );
 });
+
+it("asks after the first mapped destination while the next map and all bodies are pending", async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const { app } = await open({
+    mapFile: async (r) => {
+      if (r.name === "b") await hold;
+      return r.name;
+    },
+  });
+  await fs.mkdir(path.join(base, "published/uploads"), { recursive: true });
+  await fs.writeFile(path.join(base, "published/uploads/a"), "old");
+  const t = await app.engine.create({ protocol: "MFUP/3" }, {});
+  const batch = await app.engine.begin(t.id, t.epoch, "early", () => {});
+  const prepare = app.engine
+    .prepare(batch, {
+      files: [
+        ["a", 3, 1, 0, 3],
+        ["b", 3, 1, 0, 3],
+      ],
+      dirs: [],
+    })
+    .finally(() => app.engine.end(batch));
+  try {
+    await expect
+      .poll(() => app.engine.snapshot(t.id).overwriteRequired)
+      .toBe(true);
+    expect(app.engine.snapshot(t.id).confirmedBytes).toBe(0);
+    await app.engine.setProperties(t.id, { overwrite: true });
+    release();
+    await prepare;
+    expect(app.engine.snapshot(t.id).asks).toEqual([]);
+  } finally {
+    release();
+    await prepare;
+  }
+});
+
+it("acknowledges cancellation during metadata mapping and waits for callback cleanup", async () => {
+  let release!: () => void,
+    entered = false;
+  const hold = new Promise<void>((r) => {
+    release = r;
+  });
+  const { app } = await open({
+    mapFile: async (r) => {
+      entered = true;
+      await hold;
+      return r.path;
+    },
+  });
+  const t = await app.engine.create({ protocol: "MFUP/3" }, {});
+  const batch = await app.engine.begin(t.id, t.epoch, "early", () => {});
+  const prepare = app.engine
+    .prepare(batch, { files: [["a", 3, 1, 0, 3]], dirs: [] })
+    .catch((e) => e)
+    .finally(() => app.engine.end(batch));
+  try {
+    await expect.poll(() => entered).toBe(true);
+    expect((await app.engine.cancel(t.id)).state).toBe("cancelled");
+    expect((await prepare).code).toBe("bad_state");
+    expect(await app.engine.sweep(Number.MAX_SAFE_INTEGER)).toBe(0);
+  } finally {
+    release();
+  }
+});
+
+it("handles a large persisted inventory without materializing all nodes or published paths", async () => {
+  const { app } = await open();
+  const t = await app.engine.create({ protocol: "MFUP/3" }, {});
+  const store = app.engine.store;
+  const insert = store.db.prepare(
+    "INSERT INTO nodes(sid,path,kind,size,mtime,destination,source_key,destination_key,mapped,done) VALUES(?,?,'file',0,1,?,?,?,1,1)",
+  );
+  store.transaction(() => {
+    for (let i = 0; i < 100000; i++) {
+      const name = `f${String(i).padStart(6, "0")}`;
+      insert.run(t.id, name, name, name, name);
+    }
+  });
+  const original = store.all.bind(store);
+  store.all = ((sql: string, ...args: any[]) => {
+    if (sql.includes("FROM nodes")) expect(sql).toMatch(/LIMIT (256|\?)/);
+    return original(sql, ...args);
+  }) as typeof store.all;
+  store.run("UPDATE sessions SET state='committed' WHERE id=?", t.id);
+  const state = await app.engine.publish(t.id);
+  expect(state.files).toBe(100000);
+  expect(state.publishedCount).toBe(100000);
+  expect(state.published).toHaveLength(256);
+  expect(state.publishedNext).toBe("f000255");
+  expect(app.engine.publishedPage(t.id, "f099990").files).toHaveLength(9);
+}, 30000);

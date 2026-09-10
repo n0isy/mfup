@@ -32,6 +32,11 @@ Protocol tests use local ports 20063–20065; example tests use 20067–20068. S
 
 ## Coverage
 
+- A stream of one million File objects without a consumer list, the 10000-record bound and retry of a retained stream.
+- Virtual ten-hour recovery with 1000 retries, including failed receipt probes.
+- Metadata-only early mapping, a question before the manifest finishes mapping and cancellation during a callback.
+- A 100000-node SQLite inventory and published pages capped at 256 paths.
+
 - Bounded incremental enumeration, empty directories, grouped files and six active requests.
 - Native File/Blob payloads without application arrayBuffer reads; exact published bytes.
 - Long POST upload events before receipts, pause/resume and confirmation counters.

@@ -35,6 +35,10 @@ export class Store {
         ).map((c) => c.name),
       );
       for (const [name, spec] of Object.entries({
+        declared_files: "INTEGER NOT NULL DEFAULT 0",
+        declared_dirs: "INTEGER NOT NULL DEFAULT 0",
+        declared_bytes: "INTEGER NOT NULL DEFAULT 0",
+        confirmed_bytes: "INTEGER NOT NULL DEFAULT 0",
         overwrite: "INTEGER NOT NULL DEFAULT 0",
         conflict: "INTEGER NOT NULL DEFAULT 0",
         failure: "TEXT NOT NULL DEFAULT ''",
@@ -48,6 +52,70 @@ export class Store {
         if (!columns.has(name))
           this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${spec}`);
       }
+      const nodeColumns = new Set(
+        this.db
+          .prepare("PRAGMA table_info(nodes)")
+          .all()
+          .map((c) => c.name),
+      );
+      for (const [name, spec] of Object.entries({
+        source_key: "TEXT",
+        destination_key: "TEXT",
+        mapped: "INTEGER NOT NULL DEFAULT 0",
+      }))
+        if (!nodeColumns.has(name))
+          this.db.exec(`ALTER TABLE nodes ADD COLUMN ${name} ${spec}`);
+      if (!nodeColumns.has("source_key")) {
+        let afterSid = "",
+          afterPath = "";
+        const page = this.db.prepare(
+          "SELECT sid,path,destination,kind FROM nodes WHERE (sid,path)>(?,?) ORDER BY sid,path LIMIT 256",
+        );
+        const update = this.db.prepare(
+          "UPDATE nodes SET source_key=?,destination_key=? WHERE sid=? AND path=?",
+        );
+        while (true) {
+          const rows = page.all(afterSid, afterPath) as {
+            sid: string;
+            path: string;
+            destination: string;
+            kind: string;
+          }[];
+          if (!rows.length) break;
+          this.transaction(() => {
+            for (const n of rows)
+              update.run(
+                n.path.toLowerCase(),
+                n.destination.toLowerCase(),
+                n.sid,
+                n.path,
+              );
+          });
+          afterSid = rows.at(-1)!.sid;
+          afterPath = rows.at(-1)!.path;
+        }
+        this.db.exec(
+          "UPDATE nodes SET mapped=1 WHERE sid IN (SELECT id FROM sessions WHERE mapped=1 OR map_files=0)",
+        );
+        this.db.exec(
+          "UPDATE nodes SET destination_key=NULL WHERE kind='directory' AND sid IN (SELECT id FROM sessions WHERE map_files=1)",
+        );
+      }
+      if (!columns.has("declared_files"))
+        this.db.exec(
+          "UPDATE sessions SET declared_files=(SELECT COUNT(*) FROM nodes WHERE sid=sessions.id AND kind='file'), declared_dirs=(SELECT COUNT(*) FROM nodes WHERE sid=sessions.id AND kind='directory'), declared_bytes=COALESCE((SELECT SUM(size) FROM nodes WHERE sid=sessions.id),0), confirmed_bytes=COALESCE((SELECT SUM(length) FROM parts WHERE sid=sessions.id),0)",
+        );
+      this.db.exec(`
+CREATE INDEX IF NOT EXISTS nodes_destination_key ON nodes(sid,destination_key);
+CREATE INDEX IF NOT EXISTS nodes_source_key ON nodes(sid,source_key);
+CREATE TRIGGER IF NOT EXISTS count_nodes_insert AFTER INSERT ON nodes BEGIN
+  UPDATE sessions SET declared_files=declared_files+(NEW.kind='file'),
+    declared_dirs=declared_dirs+(NEW.kind='directory'), declared_bytes=declared_bytes+NEW.size WHERE id=NEW.sid;
+END;
+CREATE TRIGGER IF NOT EXISTS count_parts_insert AFTER INSERT ON parts BEGIN
+  UPDATE sessions SET confirmed_bytes=confirmed_bytes+NEW.length WHERE id=NEW.sid;
+END;
+`);
       if (!columns.has("overwrite"))
         this.db.exec(
           "UPDATE sessions SET conflict=1 WHERE id IN (SELECT sid FROM asks)",

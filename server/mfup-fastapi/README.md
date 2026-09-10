@@ -23,7 +23,7 @@ For embedding, `MfupEngine(config).router` and `.lifespan` (or startup/shutdown)
 manage routing and cleanup. Use one lifecycle per Engine and one process per
 metadata directory. `create_app` applies config.prefix and owns the lifecycle.
 
-map_file runs at publication planning time and returns a relative path or None.
+map_file runs during manifest reception, before body reads and returns a relative path or None.
 on_committed receives CommitEvent and can return a boolean to override server
 auto_publish (default False). client_publish=False reserves publication for
 the backend. Engine exposes get_session, list_staged, open_staged,

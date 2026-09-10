@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import hashlib
+import heapq
 import os
 import re
 import secrets
@@ -45,7 +46,7 @@ def create_example(base_dir=None, *, scope_roots=None, **options):
             baseDir=str(roots[scope]),
             targetDir=f"{uid}/{scope}",
             maxTotalBytes=512 * 2**20,
-            maxFiles=20000,
+            maxFiles=1000000,
             context=dict(uid=uid, scope=scope),
         )
 
@@ -98,14 +99,27 @@ def create_example(base_dir=None, *, scope_roots=None, **options):
 
             def listing():
                 if not target.exists():
-                    return []
-                return [
-                    dict(name=p.name, dir=p.is_dir(), size=None if p.is_dir() else p.stat().st_size)
-                    for p in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name))
-                ]
+                    return dict(entries=[], next=None)
+                after = request.query_params.get("after", "")
+                with os.scandir(target) as iterator:
+                    candidates = ((("0:" if p.is_dir() else "1:") + p.name, p) for p in iterator)
+                    page = heapq.nsmallest(
+                        257, (p for p in candidates if p[0] > after), key=lambda p: p[0]
+                    )
+                return dict(
+                    entries=[
+                        dict(
+                            name=p.name,
+                            dir=p.is_dir(),
+                            size=None if p.is_dir() else p.stat().st_size,
+                        )
+                        for _, p in page[:256]
+                    ],
+                    next=page[255][0] if len(page) > 256 else None,
+                )
 
             return JSONResponse(
-                dict(scope=scope, path=rel, entries=await asyncio.to_thread(listing)),
+                dict(scope=scope, path=rel, **await asyncio.to_thread(listing)),
                 headers={"cache-control": "no-store"},
             )
         except ProtocolError as error:

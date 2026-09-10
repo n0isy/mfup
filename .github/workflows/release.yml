@@ -140,11 +140,11 @@ jobs:
           mkdir -p /tmp/mfup-registry-check
           cd /tmp/mfup-registry-check
           npm init -y
-          npm install --no-audit --no-fund @mfup/client@3.0.0 @mfup/react@3.0.0 @mfup/server@3.0.0 react@18
+          npm install --no-audit --no-fund @mfup/client@${{ needs.source.outputs.version }} @mfup/react@${{ needs.source.outputs.version }} @mfup/server@${{ needs.source.outputs.version }} react@18
           cp "$GITHUB_WORKSPACE/scripts/consumer-node-check.mjs" check.mjs
           cp "$GITHUB_WORKSPACE/examples/multiuser-scopes-node/server/server.mjs" example-server.mjs
           node check.mjs
       - name: Install public Python packages and run their consumer
         run: |
-          python -m pip install mfup-core==3.0.0 mfup-fastapi==3.0.0 httpx
+          python -m pip install mfup-core==${{ needs.source.outputs.version }} mfup-fastapi==${{ needs.source.outputs.version }} httpx
           python scripts/pack-python-check.py

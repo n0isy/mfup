@@ -18,7 +18,7 @@ app = create_app(
 
 Для встраивания MfupEngine(config).router и lifespan (либо startup/shutdown) управляют маршрутами и очисткой. Один lifecycle на Engine и один процесс на каталог метаданных. Create_app применяет config.prefix и управляет lifecycle.
 
-Map_file вызывается при подготовке публикации и возвращает относительный путь либо None. On_committed получает CommitEvent и возвращает boolean для server auto_publish (default False). Client_publish=False оставляет публикацию backend. Engine предоставляет get_session, list_staged, open_staged, prepare_publish, publish, retry_committed. Ошибка callback сохраняет принятые файлы и успешный commit с processing=failed.
+Map_file вызывается при получении манифеста до чтения тела и возвращает относительный путь либо None. On_committed получает CommitEvent и возвращает boolean для server auto_publish (default False). Client_publish=False оставляет публикацию backend. Engine предоставляет get_session, list_staged, open_staged, prepare_publish, publish, retry_committed. Ошибка callback сохраняет принятые файлы и успешный commit с processing=failed.
 
 Standalone: MFUP_AUTHORIZE=myapp.hooks:authorize python -m mfup_fastapi. MfupConfig.from_env использует те же MFUP_* настройки, что Node; Python hooks — callable или строки module:attribute.
 

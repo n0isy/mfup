@@ -28,7 +28,7 @@ server.listen(3000);
 
 ResolveUser предоставляет приложение. Браузер использует serverUrl:location.origin+'/api'. Scope и личность принадлежат приложению. PublishedDirectory(baseDir,targetDir) вычисляет каталог для listing/download.
 
-MapFile выполняется после commit, возвращает относительный путь либо null и сохраняет проверенный план до перемещений. OnCommitted получает корни, счётчики, meta/context; engine.listStaged/openStaged открывают принятые файлы. Boolean-результат callback переопределяет server autoPublish (default false). ClientPublish:false оставляет решение engine.publish(id) на backend. SDK autoPublish управляет только автоматическим клиентским запросом. Ошибка onCommitted оставляет успешный commit с processing=failed; engine.retryCommitted(id) повторяет обработку явно.
+MapFile выполняется при получении манифеста, до чтения тела, возвращает относительный путь либо null и сохраняет проверенный план до перемещений. OnCommitted получает корни, счётчики, meta/context; engine.listStaged/openStaged открывают принятые файлы. Boolean-результат callback переопределяет server autoPublish (default false). ClientPublish:false оставляет решение engine.publish(id) на backend. SDK autoPublish управляет только автоматическим клиентским запросом. Ошибка onCommitted оставляет успешный commit с processing=failed; engine.retryCommitted(id) повторяет обработку явно.
 
 Экспортируются AuthRequest, AuthResult, FileMapRequest, CommitEvent, StagedFile, Options, ProtocolError(code/status), createMfup, Engine, configFromEnv. Standalone: MFUP_AUTHORIZE='./hooks.mjs#authorize' mfup-server.
 

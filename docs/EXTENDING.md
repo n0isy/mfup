@@ -81,7 +81,7 @@ CommitEvent fields: sessionId, targetDir, baseDir, stagingDir, files, bytes, met
 | setProperties(id, properties)                  | set_properties(id, properties) | Update session overwrite permission                          |
 | snapshot, resume, answer, cancel, sweep, close | same names                     | Session state and lifecycle                                  |
 
-Staged access is available after commit, including from processing/mapping hooks. Close streams/files before publication. Staging does not mirror the source directory tree; use openStaged or localPath.
+Staged access is available after commit, including from onCommitted. mapFile receives metadata during reception and cannot read staging. Close streams/files before publication. Staging does not mirror the source tree; use openStaged or localPath.
 
 ## Processing and publication policy
 
@@ -109,7 +109,7 @@ Cancellation prevents late publication by callbacks. Staging cleanup waits for c
 
 ## File mapping
 
-`mapFile(FileMapRequest)` / `map_file` runs after commit, while file contents are accessible. Return a relative destination within targetDir, or null/None to keep the input path.
+`mapFile(FileMapRequest)` / `map_file` runs as soon as a new file appears in a received basket manifest, before reading its body. Return a relative destination within targetDir, or null/None to keep the input path. No consumer wrapper, duplicate entry list or content preload is required. Read content in onCommitted via listStaged/openStaged.
 
 ```ts
 mapFile: async ({ path, name, meta, context }) => {
@@ -118,19 +118,21 @@ mapFile: async ({ path, name, meta, context }) => {
 };
 ```
 
-The application supplies lookupCategory. The hook does not run during reception or range retries. Concurrent plan requests are coalesced. Each file is mapped once per planning attempt; all destination paths and collisions are validated before any moves. A failed hook or plan returns 409 mapping_error and retains staging. An explicit retry may compute the plan again.
+The application supplies lookupCategory. Metadata admission is serialized per session. Each new file is mapped once per manifest admission attempt. Paths and collisions are checked against indexed persistent metadata and the bounded current basket; the first conflict can prompt before the rest of the basket is mapped. A failed hook or mapping returns 409 mapping_error. If a manifest was not accepted, retry can repeat its callbacks, so mapping must be safe to repeat.
 
-A successful complete plan is stored in one SQLite transaction and reused after approval, retry and restart. Do not recursively call preparePublish/publish for the same session from mapFile. With a mapping hook, explicit empty directories are not published; without it, input paths and empty directories are retained.
+Successful manifest mappings are persisted together in one SQLite transaction per basket. Accepted mappings are reused for ranges, retries and restart. Do not recursively call preparePublish/publish from mapFile. With a mapper, explicit empty directories are not published; without it, input paths and empty directories are retained.
 
 Publication uses same-filesystem moves. Each file rename is atomic; an entire tree is not one transaction. Partial publication does not retain rollback copies of replaced files. Keep application writes away from destinations of unfinished publication.
 
 ## Client and React
 
-`MfupSession` exposes connect, upload, pause, resume, setOverwrite, answer, publish, cancel, exportTicket, getSnapshot, subscribe and dispose. Sources include File arrays, FileList, handles, entries and AsyncIterable. Call sourceFromDataTransfer synchronously in a drop handler.
+`MfupSession` exposes connect, upload, pause, resume, retry, setOverwrite, answer, publish, cancel, exportTicket, getSnapshot, subscribe and dispose. Sources include File arrays, FileList, handles, entries and AsyncIterable. Call sourceFromDataTransfer synchronously in a drop handler.
 
-React `useMfupUpload(options)` exposes start, session, snapshot, pendingAsks, answer, setOverwrite, pause, resume and cancel. It subscribes through useSyncExternalStore. `useMfupSession(session)` subscribes to an existing session.
+React `useMfupUpload(options)` exposes start, session, snapshot, pendingAsks, answer, setOverwrite, pause, resume, retry and cancel. It subscribes through useSyncExternalStore. `useMfupSession(session)` subscribes to an existing session.
 
 Render at most one overwrite prompt and one operational error per upload. `setOverwrite(true)` persists approval for the whole session. Cancellation remains cancelling until confirmed; a late cancellation may return published. `errorInfo` carries code/status/phase/retryable. `trackUploadProgress` enables XHR sentBytes estimates alongside confirmedBytes. See [PROTOCOL.md](PROTOCOL.md) for states, counters, deadlines and retry behavior.
+
+The SDK owns the source iterator and at most 10000 pending work records, including active baskets. Enumeration stops at that high-water mark and resumes at 5000, and also stops during retry backoff or a held error. `maxReady` can lower the bound (1–10000); its low-water mark is half that value. Confirmed File/entry references are released. Consumers must pass the source directly and must not collect or retain a duplicate entries/File list. After exhaustion or an operational error, `upload()` rejects but the SDK retains the bounded pending stream. Call `session.retry()` (React `retry()`) without a source to continue after the cause is resolved. Cancel/dispose release the retained transfer. A page reload destroys in-memory access; only that case requires source selection again.
 
 ## Standalone configuration
 

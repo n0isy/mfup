@@ -178,43 +178,47 @@ it.each(["during", "after"])(
     expect(fs.existsSync(app.engine.staging(t.id))).toBe(false);
   },
 );
-it("accepts approval during a long POST and suppresses later conflicts", async () => {
-  await seed();
-  const t = await ticket();
-  const manifest = JSON.stringify({
-    files: [["a", 4096, 1, 0, 4096]],
-    dirs: [],
-  });
-  const request = requestHTTP(`${url}/mfup/sessions/${t.id}/batches/long`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${t.token}`,
-      "X-MFUP-Epoch": "1",
-      "Content-Type": "multipart/form-data; boundary=part",
-    },
-  });
-  const response = new Promise<number>((resolve, reject) => {
-    request.on("error", reject);
-    request.on("response", (res) => {
-      res.resume();
-      res.on("end", () => resolve(res.statusCode!));
+it.each([false, true])(
+  "accepts approval during a long POST and suppresses later conflicts; mapping=%s",
+  async (mapped) => {
+    if (mapped) app.engine.options.mapFile = (request) => request.path;
+    await seed();
+    const t = await ticket();
+    const manifest = JSON.stringify({
+      files: [["a", 4096, 1, 0, 4096]],
+      dirs: [],
     });
-  });
-  request.write(
-    `--part\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n${manifest}\r\n--part\r\nContent-Disposition: form-data; name="0"; filename="a"\r\n\r\n` +
-      "x".repeat(512),
-  );
-  await expect
-    .poll(() => app.engine.snapshot(t.id).overwriteRequired)
-    .toBe(true);
-  await call(t, "/properties", { overwrite: true });
-  request.end("x".repeat(3584) + "\r\n--part--\r\n");
-  expect(await response).toBe(200);
-  await send(t, [["later", "new"]]);
-  expect(app.engine.snapshot(t.id).asks).toEqual([]);
-  await call(t, "/commit", { files: 2, dirs: 0, bytes: 4099 });
-  expect((await call(t, "/publish", {})).status).toBe(200);
-});
+    const request = requestHTTP(`${url}/mfup/sessions/${t.id}/batches/long`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${t.token}`,
+        "X-MFUP-Epoch": "1",
+        "Content-Type": "multipart/form-data; boundary=part",
+      },
+    });
+    const response = new Promise<number>((resolve, reject) => {
+      request.on("error", reject);
+      request.on("response", (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode!));
+      });
+    });
+    request.write(
+      `--part\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n${manifest}\r\n--part\r\nContent-Disposition: form-data; name="0"; filename="a"\r\n\r\n` +
+        "x".repeat(512),
+    );
+    await expect
+      .poll(() => app.engine.snapshot(t.id).overwriteRequired)
+      .toBe(true);
+    await call(t, "/properties", { overwrite: true });
+    request.end("x".repeat(3584) + "\r\n--part--\r\n");
+    expect(await response).toBe(200);
+    await send(t, [["later", "new"]]);
+    expect(app.engine.snapshot(t.id).asks).toEqual([]);
+    await call(t, "/commit", { files: 2, dirs: 0, bytes: 4099 });
+    expect((await call(t, "/publish", {})).status).toBe(200);
+  },
+);
 it("pre-approved upload never asks and a late cancel reports published", async () => {
   await seed();
   const t = await ticket(true);
@@ -325,6 +329,9 @@ it("recovers a real SQLite full error after file moves without repeating upload"
   expect((await send(t, files)).status).toBe(200);
   await call(t, "/commit", { files: 80, dirs: 0, bytes: 80 });
   const db = app.engine.store.db;
+  db.exec(
+    "CREATE TABLE allocation_probe(value BLOB); CREATE TRIGGER publication_allocation BEFORE UPDATE OF state ON sessions WHEN NEW.state='published' BEGIN INSERT INTO allocation_probe VALUES(zeroblob(1048576)); END",
+  );
   const pages = (db.prepare("PRAGMA page_count").get() as any).page_count;
   db.exec(`PRAGMA max_page_count=${pages}`);
   const failed = await call(t, "/publish", {});
@@ -457,25 +464,31 @@ it("checks the durable receipt after a network error instead of repeating the bo
     s.dispose();
   }
 });
-it("preserves SQLite FULL during mapping-plan rollback", async () => {
+it("preserves SQLite FULL while accepting early mapping metadata and retries the retained stream", async () => {
   app.engine.options.mapFile = ({ path: name }) =>
     "d".repeat(180) + "/" + "e".repeat(180) + "/" + name;
-  const t = await ticket();
-  const files: [string, string][] = Array.from({ length: 80 }, (_, i) => [
-    `f${i}`,
-    "v",
-  ]);
-  await send(t, files);
-  await call(t, "/commit", { files: 80, dirs: 0, bytes: 80 });
-  const db = app.engine.store.db;
-  const pages = (db.prepare("PRAGMA page_count").get() as any).page_count;
-  db.exec(`PRAGMA max_page_count=${pages}`);
-  expect((await call(t, "/publish", {})).status).toBe(507);
-  expect([...app.engine.listStaged(t.id)]).toHaveLength(80);
-  db.exec("PRAGMA max_page_count=100000");
-  app.engine.options.mapFile = () => null;
-  expect((await call(t, "/publish", {})).status).toBe(200);
+  const session = new MfupSession({ serverUrl: url, autoPublish: false });
+  try {
+    await session.connect();
+    const db = app.engine.store.db;
+    const pages = (db.prepare("PRAGMA page_count").get() as any).page_count;
+    db.exec(`PRAGMA max_page_count=${pages}`);
+    await expect(
+      session.upload(
+        Array.from({ length: 80 }, (_, i) => new File(["v"], `f${i}`)),
+      ),
+    ).rejects.toMatchObject({ code: "storage_full" });
+    db.exec("PRAGMA max_page_count=100000");
+    await session.retry();
+    expect([...app.engine.listStaged(session.exportTicket().id)]).toHaveLength(
+      80,
+    );
+    await session.publish();
+  } finally {
+    session.dispose();
+  }
 });
+
 it("does not demote server publication when an older commit response arrives", async () => {
   app.engine.options.clientPublish = false;
   const s = new MfupSession({

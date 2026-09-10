@@ -4,11 +4,12 @@ React 18+ integration for `@mfup/client`.
 
 ```tsx
 import { useMfupUpload } from "@mfup/react";
-const { start, snapshot, setOverwrite, pause, resume, cancel } = useMfupUpload({
-  serverUrl: location.origin,
-  meta: { scope: "workspace" },
-  trackUploadProgress: true,
-});
+const { start, snapshot, setOverwrite, pause, resume, retry, cancel } =
+  useMfupUpload({
+    serverUrl: location.origin,
+    meta: { scope: "workspace" },
+    trackUploadProgress: true,
+  });
 ```
 
 Use `useMfupSession(session)` for an externally owned session. Render a single
@@ -21,6 +22,8 @@ Render `snapshot.sentBytes` for in-flight progress and `snapshot.confirmedBytes`
 for server acknowledgements. A completed bar should depend on `state === 'published'`.
 Use the client package's `sourceFromInput` / `sourceFromDataTransfer` adapters
 in picker/drop handlers. Call the drop adapter synchronously inside the event.
+
+After automatic retries are exhausted, call retry() without a source. The hook retains the bounded stream inside the SDK; do not keep a duplicate entries/File list.
 
 [Extension API](https://github.com/n0isy/mfup/blob/main/docs/EXTENDING.md) · [HTTP protocol](https://github.com/n0isy/mfup/blob/main/docs/PROTOCOL.md)
 

@@ -1,6 +1,6 @@
 # Выпуск пакетов
 
-Пять дистрибутивов используют версию **3.0.0**:
+Пять дистрибутивов используют версию **3.1.0**:
 
 | npm          | Python       |
 | ------------ | ------------ |
@@ -25,7 +25,7 @@ npm pack -w @mfup/client -w @mfup/react -w @mfup/server --pack-destination dist-
 python scripts/build-python.py dist-py
 twine check dist-py/*
 python scripts/check-artifacts.py dist-npm dist-py
-python scripts/check-version.py 3.0.0
+python scripts/check-version.py 3.1.0
 ```
 
 Npm tarballs содержат скомпилированный JavaScript, объявления TypeScript, метаданные, лицензию и README на двух языках. Python wheels содержат модуль, py.typed, метаданные/лицензию; source tarballs также содержат pyproject.toml и оба README. Тесты, demo, бенчи, загруженные данные, логи, окружения разработки и локальные отчёты исключены.

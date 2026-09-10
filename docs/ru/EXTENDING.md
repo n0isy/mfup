@@ -81,7 +81,7 @@ Node экспортирует AuthRequest, AuthResult, FileMapRequest, CommitEve
 | setProperties(id,properties)                   | set_properties(id,properties) | Изменить разрешение перезаписи                   |
 | snapshot, resume, answer, cancel, sweep, close | те же имена                   | Состояние и жизненный цикл                       |
 
-Доступ к staging открыт после commit, включая hooks обработки и маппинга. Потоки/файлы нужно закрыть до публикации. Staging не повторяет дерево источника; используйте openStaged или localPath.
+Доступ к staging открыт после commit, включая onCommitted. MapFile получает метаданные во время приёма и не читает staging. Потоки нужно закрыть до публикации. Staging не повторяет дерево источника; используйте openStaged или localPath.
 
 ## Обработка и политика публикации
 
@@ -105,7 +105,7 @@ Processing сохраняется как none/pending/running/done/failed. Ош�
 
 ## Маппинг файлов
 
-MapFile(FileMapRequest) / map_file вызывается после commit при доступном содержимом. Результат — относительное назначение внутри targetDir либо null/None для сохранения исходного пути.
+MapFile(FileMapRequest) / map_file вызывается сразу при появлении нового файла в поступившем манифесте корзины, до чтения тела. Результат — относительное назначение внутри targetDir либо null/None для исходного пути. Консьюмеру не нужны обвязки, дубликат entries или предварительное чтение содержимого. Проверка тела выполняется в onCommitted через listStaged/openStaged.
 
 ```ts
 mapFile: async ({ path, name, meta, context }) => {
@@ -114,19 +114,21 @@ mapFile: async ({ path, name, meta, context }) => {
 };
 ```
 
-LookupCategory предоставляет приложение. Hook не вызывается при приёме и повторе диапазонов. Одновременные запросы плана объединяются. Каждый файл маппится один раз за попытку; все назначения и коллизии проверяются до перемещений. Ошибка hook/плана даёт 409 mapping_error и сохраняет staging. Явный повтор может вычислить план заново.
+LookupCategory предоставляет приложение. Приём метаданных сериализован внутри сессии. Каждый новый файл маппится один раз за попытку принятия манифеста. Пути и коллизии проверяются по индексам постоянных метаданных и ограниченной текущей корзине. Первый конфликт может вызвать вопрос до завершения маппинга остальных файлов корзины. Ошибка хука или назначения даёт 409 mapping_error. Непринятый манифест может повторить callbacks; маппинг должен допускать повтор.
 
-Успешный полный план сохраняется одной SQLite-транзакцией и используется после разрешения, повторов и restart. Нельзя рекурсивно вызывать preparePublish/publish той же сессии из mapFile. При map hook явные пустые каталоги не публикуются; без него исходные пути и пустые каталоги сохраняются.
+Успешный маппинг манифеста сохраняется одной SQLite-транзакцией на корзину. Принятые назначения используются для следующих диапазонов, повторов и restart. Нельзя рекурсивно вызывать preparePublish/publish из mapFile. При mapper явные пустые каталоги не публикуются; без него исходные пути и пустые каталоги сохраняются.
 
 Публикация использует перемещения в одной файловой системе. Rename каждого файла атомарен; всё дерево не является одной транзакцией. Копии для отката заменённых файлов не хранятся. Приложение не должно писать в назначения незавершённой публикации.
 
 ## Клиент и React
 
-MfupSession предоставляет connect, upload, pause, resume, setOverwrite, answer, publish, cancel, exportTicket, getSnapshot, subscribe, dispose. Источники: массивы File, FileList, handles, entries, AsyncIterable. SourceFromDataTransfer вызывается синхронно внутри drop handler.
+MfupSession предоставляет connect, upload, pause, resume, retry, setOverwrite, answer, publish, cancel, exportTicket, getSnapshot, subscribe, dispose. Источники: массивы File, FileList, handles, entries, AsyncIterable. SourceFromDataTransfer вызывается синхронно внутри drop handler.
 
-React useMfupUpload(options) предоставляет start, session, snapshot, pendingAsks, answer, setOverwrite, pause, resume, cancel. Подписка использует useSyncExternalStore. UseMfupSession(session) подписывается на существующую сессию.
+React useMfupUpload(options) предоставляет start, session, snapshot, pendingAsks, answer, setOverwrite, pause, resume, retry, cancel. Подписка использует useSyncExternalStore. UseMfupSession(session) подписывается на существующую сессию.
 
 Показывайте не более одного вопроса перезаписи и одной операционной ошибки на загрузку. SetOverwrite(true) сохраняет разрешение для всей сессии. Отмена остаётся cancelling до подтверждения; поздняя отмена может вернуть published. ErrorInfo содержит code/status/phase/retryable. TrackUploadProgress включает XHR-оценки sentBytes рядом с confirmedBytes. Состояния, счётчики, сроки ожидания и повторы: [PROTOCOL.md](PROTOCOL.md).
+
+SDK владеет итератором источника и не более чем 10000 ожидающих записей, включая активные корзины. Обход останавливается на этом пороге и продолжается после сокращения до 5000; ожидание повторов и удерживаемая ошибка также останавливают чтение. `maxReady` уменьшает предел (1–10000), нижний порог равен его половине. Ссылки на подтверждённые File/entries освобождаются. Консьюмер передаёт источник напрямую и не должен собирать или хранить дубликат списка entries/File. После исчерпания попыток или операционной ошибки `upload()` отклоняется, но SDK сохраняет ограниченный незавершённый поток. После устранения причины вызовите `session.retry()` (React `retry()`) без источника. Cancel/dispose освобождают передачу. Перезагрузка страницы уничтожает доступ в памяти; повторный выбор источника нужен только в этом случае.
 
 ## Standalone-конфигурация
 

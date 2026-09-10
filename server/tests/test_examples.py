@@ -84,7 +84,7 @@ def test_example_mapping_and_context_survive_restart(tmp_path):
         uid = client.get("/api/whoami").json()["user_id"]
         ticket = create(client, "uploads").json()
         prefix, headers = upload(client, ticket)
-        assert len(mapped) == 0
+        assert len(mapped) == 1
         client.portal.call(client.app.state.mfup.engine.prepare_publish, ticket["id"])
         assert len(mapped) == 1
         assert mapped[0]["context"] == dict(uid=uid, scope="uploads")

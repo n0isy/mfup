@@ -98,6 +98,8 @@ def published_directory(base_dir, target_dir) -> Path:
 class Runtime:
     def __init__(self):
         self.lock = asyncio.Lock()
+        self.metadata = asyncio.Lock()
+        self.mappings = set()
         self.active = {}
         self.batches = set()
         self.ranges = set()
@@ -177,6 +179,10 @@ class Engine:
             id TEXT NOT NULL, path TEXT NOT NULL, message TEXT NOT NULL, answer TEXT, PRIMARY KEY(sid,id));""")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")}
             for name, spec in dict(
+                declared_files="INTEGER NOT NULL DEFAULT 0",
+                declared_dirs="INTEGER NOT NULL DEFAULT 0",
+                declared_bytes="INTEGER NOT NULL DEFAULT 0",
+                confirmed_bytes="INTEGER NOT NULL DEFAULT 0",
                 overwrite="INTEGER NOT NULL DEFAULT 0",
                 conflict="INTEGER NOT NULL DEFAULT 0",
                 failure="TEXT NOT NULL DEFAULT ''",
@@ -189,6 +195,50 @@ class Engine:
             ).items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {spec}")
+            node_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(nodes)")}
+            for name, spec in dict(
+                source_key="TEXT", destination_key="TEXT", mapped="INTEGER NOT NULL DEFAULT 0"
+            ).items():
+                if name not in node_columns:
+                    self.db.execute(f"ALTER TABLE nodes ADD COLUMN {name} {spec}")
+            if "source_key" not in node_columns:
+                after_sid = after_path = ""
+                while True:
+                    rows = self.db.execute(
+                        "SELECT sid,path,destination FROM nodes WHERE (sid,path)>(?,?) ORDER BY sid,path LIMIT 256",
+                        (after_sid, after_path),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    self.db.executemany(
+                        "UPDATE nodes SET source_key=?,destination_key=? WHERE sid=? AND path=?",
+                        [
+                            (n["path"].lower(), n["destination"].lower(), n["sid"], n["path"])
+                            for n in rows
+                        ],
+                    )
+                    after_sid, after_path = rows[-1]["sid"], rows[-1]["path"]
+                self.db.execute(
+                    "UPDATE nodes SET mapped=1 WHERE sid IN (SELECT id FROM sessions WHERE mapped=1 OR map_files=0)"
+                )
+                self.db.execute(
+                    "UPDATE nodes SET destination_key=NULL WHERE kind='directory' AND sid IN (SELECT id FROM sessions WHERE map_files=1)"
+                )
+            if "declared_files" not in columns:
+                self.db.execute(
+                    "UPDATE sessions SET declared_files=(SELECT COUNT(*) FROM nodes WHERE sid=sessions.id AND kind='file'), declared_dirs=(SELECT COUNT(*) FROM nodes WHERE sid=sessions.id AND kind='directory'), declared_bytes=COALESCE((SELECT SUM(size) FROM nodes WHERE sid=sessions.id),0), confirmed_bytes=COALESCE((SELECT SUM(length) FROM parts WHERE sid=sessions.id),0)"
+                )
+            self.db.executescript("""
+CREATE INDEX IF NOT EXISTS nodes_destination_key ON nodes(sid,destination_key);
+CREATE INDEX IF NOT EXISTS nodes_source_key ON nodes(sid,source_key);
+CREATE TRIGGER IF NOT EXISTS count_nodes_insert AFTER INSERT ON nodes BEGIN
+  UPDATE sessions SET declared_files=declared_files+(NEW.kind='file'),
+    declared_dirs=declared_dirs+(NEW.kind='directory'), declared_bytes=declared_bytes+NEW.size WHERE id=NEW.sid;
+END;
+CREATE TRIGGER IF NOT EXISTS count_parts_insert AFTER INSERT ON parts BEGIN
+  UPDATE sessions SET confirmed_bytes=confirmed_bytes+NEW.length WHERE id=NEW.sid;
+END;
+""")
             if "overwrite" not in columns:
                 self.db.execute("UPDATE sessions SET conflict=1 WHERE id IN (SELECT sid FROM asks)")
             self.db.execute("UPDATE sessions SET hook_status='failed' WHERE hook_status='running'")
@@ -282,7 +332,7 @@ class Engine:
         )
         check(type(auto) is bool and type(client) is bool, "bad_config")
         max_files, max_bytes = (
-            integer(auth.get("maxFiles", 100000)),
+            integer(auth.get("maxFiles", 1000000)),
             integer(auth.get("maxTotalBytes", 9007199254740991)),
         )
         stage = base / "staging" / sid
@@ -426,18 +476,17 @@ class Engine:
 
     def snapshot(self, sid):
         row = self.row(sid)
-        totals = self.db.execute(
-            "SELECT COUNT(*) AS files,COALESCE(SUM(size),0) AS bytes FROM nodes WHERE sid=? AND kind='file'",
-            (sid,),
-        ).fetchone()
         return dict(
             id=sid,
             epoch=row["epoch"],
             state=row["state"],
-            files=totals["files"],
-            bytes=totals["bytes"],
+            files=row["declared_files"],
+            bytes=row["declared_bytes"],
+            confirmedBytes=row["confirmed_bytes"],
             asks=self.questions(sid),
-            published=json.loads(row["published"]),
+            published=self.published_page(sid)["files"] if row["state"] == "published" else [],
+            publishedCount=row["declared_files"] if row["state"] == "published" else 0,
+            publishedNext=self.published_page(sid)["next"] if row["state"] == "published" else None,
             clientPublish=bool(row["client_publish"]),
             processing=row["hook_status"],
             overwrite=bool(row["overwrite"]),
@@ -525,16 +574,176 @@ class Engine:
             check(row["epoch"] == epoch, "stale_epoch", 409)
             check(len(r.active) < self.limits["concurrency"] and bid not in r.batches, "busy", 429)
             done = asyncio.get_running_loop().create_future()
-            r.active[done] = abort
+            cancelled = asyncio.get_running_loop().create_future()
+
+            def stop():
+                if not cancelled.done():
+                    cancelled.set_result(None)
+                abort()
+
+            r.active[done] = stop
             r.batches.add(bid)
             self.touch(sid)
-            return dict(sid=sid, id=bid, epoch=epoch, done=done)
+            return dict(sid=sid, id=bid, epoch=epoch, done=done, cancelled=cancelled)
 
     def receipt(self, sid, bid):
         row = self.db.execute(
             "SELECT receipt FROM batches WHERE sid=? AND id=?", (sid, identifier(bid))
         ).fetchone()
-        return json.loads(row[0]) if row else None
+        return (
+            dict(json.loads(row[0]), confirmedBytes=self.row(sid)["confirmed_bytes"])
+            if row
+            else None
+        )
+
+    def nodes(self, sid):
+        after = ""
+        while True:
+            page = self.db.execute(
+                "SELECT * FROM nodes WHERE sid=? AND path>? ORDER BY path LIMIT 256", (sid, after)
+            ).fetchall()
+            if not page:
+                return
+            yield from page
+            after = page[-1]["path"]
+
+    def published_page(self, sid, after=""):
+        rows = self.db.execute(
+            "SELECT * FROM nodes WHERE sid=? AND kind='file' AND done=1 AND path>? ORDER BY path LIMIT 256",
+            (sid, after),
+        ).fetchall()
+        return dict(
+            files=[n["destination"] for n in rows],
+            next=rows[-1]["path"] if len(rows) == 256 else None,
+        )
+
+    def range_status(self, sid, data):
+        row = self.row(sid)
+        check(data.get("epoch") == row["epoch"], "stale_epoch", 409)
+        files = data.get("files")
+        check(isinstance(files, list) and len(files) <= self.limits["maxParts"], "bad_manifest")
+        received = []
+        for p in files:
+            check(isinstance(p, list) and len(p) == 5, "bad_manifest")
+            relative_path(p[0])
+            for value in p[1:]:
+                integer(value)
+            node = self.db.execute(
+                "SELECT * FROM nodes WHERE sid=? AND path=?", (sid, p[0])
+            ).fetchone()
+            if not node:
+                received.append(False)
+                continue
+            check(
+                node["kind"] == "file" and node["size"] == p[1] and node["mtime"] == p[2],
+                "file_changed",
+                409,
+            )
+            received.append(
+                bool(
+                    self.db.execute(
+                        "SELECT 1 FROM parts WHERE sid=? AND path=? AND offset=? AND length=?",
+                        (sid, p[0], p[3], p[4]),
+                    ).fetchone()
+                )
+            )
+        self.touch(sid)
+        return dict(received=received, confirmedBytes=row["confirmed_bytes"])
+
+    def check_name(self, sid, name, kind, field, owner, pending=()):
+        column = "path" if field == "source" else "destination"
+        code = (
+            "mapping_error"
+            if field == "destination" and self.row(sid)["map_files"]
+            else "path_conflict"
+        )
+        pieces = name.split("/")
+        for i in range(1, len(pieces) + 1):
+            prefix = "/".join(pieces[:i])
+            key = prefix.lower()
+            exact = self.db.execute(
+                f"SELECT * FROM nodes WHERE sid=? AND {field}_key=? LIMIT 1", (sid, key)
+            ).fetchone()
+            if exact and exact["path"] != owner:
+                check(
+                    exact[column] == prefix and i < len(pieces) and exact["kind"] == "directory",
+                    code,
+                    409,
+                )
+            for other in pending:
+                if other["path"] == owner or (
+                    field == "destination"
+                    and self.row(sid)["map_files"]
+                    and other["kind"] == "directory"
+                ):
+                    continue
+                value = other[column]
+                lower = value.lower()
+                if lower == key:
+                    check(
+                        value == prefix and i < len(pieces) and other["kind"] == "directory",
+                        code,
+                        409,
+                    )
+                if lower.startswith(key + "/"):
+                    check(
+                        value.startswith(prefix + "/") and (i < len(pieces) or kind == "directory"),
+                        code,
+                        409,
+                    )
+            child = self.db.execute(
+                f"SELECT * FROM nodes WHERE sid=? AND {field}_key>=? AND {field}_key<? ORDER BY {field}_key LIMIT 1",
+                (sid, key + "/", key + "0"),
+            ).fetchone()
+            if child and child["path"] != owner:
+                check(
+                    child[column].startswith(prefix + "/")
+                    and (i < len(pieces) or kind == "directory"),
+                    code,
+                    409,
+                )
+
+    async def mapped_destination(self, row, name, size, batch=None):
+        if not row["map_files"]:
+            return name
+        check(self.map_file is not None, "hook_unavailable", 503)
+        r = self.runtime(row["id"])
+
+        async def invoke():
+            return await maybe(
+                self.map_file(
+                    dict(
+                        sessionId=row["id"],
+                        path=name,
+                        name=name.rsplit("/", 1)[-1],
+                        size=size,
+                        targetDir=row["target"],
+                        context=json.loads(row["context"]),
+                        meta=json.loads(row["meta"]),
+                    )
+                )
+            )
+
+        task = asyncio.create_task(invoke())
+        r.mappings.add(task)
+
+        def finished(task):
+            r.mappings.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        task.add_done_callback(finished)
+        try:
+            if batch:
+                await asyncio.wait((task, batch["cancelled"]), return_when=asyncio.FIRST_COMPLETED)
+                check(not batch["cancelled"].done(), "bad_state", 409)
+            result = await asyncio.shield(task)
+            return relative_path(name if result is None else result)
+        except Exception as exc:
+            if self.row(row["id"])["state"] == "cancelled":
+                raise ProtocolError(409, "bad_state") from exc
+            self.report("mapFile", row["id"], exc)
+            raise ProtocolError(409, "mapping_error") from exc
 
     async def prepare(self, batch, data):
         check(
@@ -565,7 +774,7 @@ class Engine:
         sid, bid = batch["sid"], batch["id"]
         row = self.row(sid)
         r = self.runtime(sid)
-        async with r.lock:
+        async with r.metadata:
             current = self.row(sid)
             check(current["epoch"] == batch["epoch"], "stale_epoch", 409)
             check(current["state"] == "uploading" and not r.transition, "bad_state", 409)
@@ -574,83 +783,101 @@ class Engine:
             ).fetchone()
             if old:
                 check(old["signature"] == signature, "batch_conflict", 409)
-                return json.loads(old["receipt"])
+                return dict(
+                    json.loads(old["receipt"]), confirmedBytes=self.row(sid)["confirmed_bytes"]
+                )
             keys = [(p[0], p[3]) for p in files]
             check(
                 len(set(keys)) == len(keys) and not any(k in r.ranges for k in keys),
                 "range_busy",
                 409,
             )
-            existing = [dict(n) for n in self.db.execute("SELECT * FROM nodes WHERE sid=?", (sid,))]
-            nodes = {n["path"]: n for n in existing}
-            destinations = {n["destination"].lower(): n for n in existing}
-            spelling = {}
-
-            def check_spelling(name):
-                pieces = name.split("/")
-                for i in range(1, len(pieces) + 1):
-                    prefix = "/".join(pieces[:i])
-                    lower = prefix.lower()
-                    check(lower not in spelling or spelling[lower] == prefix, "path_conflict", 409)
-                    spelling[lower] = prefix
-
-            for n in existing:
-                check_spelling(n["destination"])
             additions = []
+            added_files = added_bytes = 0
 
-            def add(name, kind, size, mtime, destination):
-                previous = nodes.get(name)
+            async def add(name, kind, size, mtime):
+                nonlocal added_files, added_bytes
+                previous = (
+                    next((n for n in additions if n["path"] == name), None)
+                    or self.db.execute(
+                        "SELECT * FROM nodes WHERE sid=? AND path=?", (sid, name)
+                    ).fetchone()
+                )
                 if previous:
                     check(
                         previous["kind"] == kind
                         and previous["size"] == size
-                        and previous["mtime"] == mtime
-                        and previous["destination"] == destination,
+                        and previous["mtime"] == mtime,
                         "file_changed",
                         409,
                     )
                     return
-                check_spelling(destination)
-                lower = destination.lower()
-                check(lower not in destinations, "path_conflict", 409)
-                parent = lower
-                while "/" in parent:
-                    parent = parent.rsplit("/", 1)[0]
-                    check(destinations.get(parent, {}).get("kind") != "file", "path_conflict", 409)
-                if kind == "file":
-                    check(
-                        not any(p.startswith(lower + "/") for p in destinations),
-                        "path_conflict",
-                        409,
-                    )
-                n = dict(
-                    path=name, kind=kind, size=size, mtime=mtime, destination=destination, done=0
+                self.check_name(sid, name, kind, "source", name, additions)
+                destination = (
+                    await self.mapped_destination(row, name, size, batch)
+                    if kind == "file"
+                    else name
                 )
-                nodes[name] = n
-                destinations[lower] = n
-                additions.append(n)
+                current = self.row(sid)
+                check(
+                    current["epoch"] == batch["epoch"]
+                    and current["state"] == "uploading"
+                    and not r.transition,
+                    "bad_state",
+                    409,
+                )
+                if not row["map_files"] or kind == "file":
+                    self.check_name(sid, destination, kind, "destination", name, additions)
+                check(
+                    current["declared_files"] + added_files + (kind == "file") <= row["max_files"]
+                    and current["declared_files"] + current["declared_dirs"] + len(additions) + 1
+                    <= row["max_files"] * 4 + 1024
+                    and current["declared_bytes"] + added_bytes + size <= row["max_bytes"],
+                    "quota_exceeded",
+                    413,
+                )
+                additions.append(
+                    dict(path=name, kind=kind, size=size, mtime=mtime, destination=destination)
+                )
+                added_files += kind == "file"
+                added_bytes += size
+                asked = self.needs_overwrite(self.row(sid))
+                if not row["map_files"] or kind == "file":
+                    self.conflicts(sid, current, destination, kind)
+                if not asked and self.needs_overwrite(self.row(sid)):
+                    self.emit(sid)
 
             for d in dirs:
-                add(d, "directory", 0, 0, d)
+                await add(d, "directory", 0, 0)
             for p in files:
-                add(p[0], "file", p[1], p[2], p[0])
-            file_nodes = [n for n in nodes.values() if n["kind"] == "file"]
+                await add(p[0], "file", p[1], p[2])
             check(
-                len(nodes) <= row["max_files"] * 4 + 1024
-                and len(file_nodes) <= row["max_files"]
-                and sum(n["size"] for n in file_nodes) <= row["max_bytes"],
-                "quota_exceeded",
-                413,
+                self.row(sid)["epoch"] == batch["epoch"]
+                and self.row(sid)["state"] == "uploading"
+                and not r.transition,
+                "bad_state",
+                409,
             )
             self.db.execute("BEGIN IMMEDIATE")
             try:
-                for n in additions:
-                    self.db.execute(
-                        "INSERT INTO nodes(sid,path,kind,size,mtime,destination) VALUES(?,?,?,?,?,?)",
-                        (sid, n["path"], n["kind"], n["size"], n["mtime"], n["destination"]),
-                    )
-                    if not row["map_files"]:
-                        self.conflicts(sid, row, n["destination"], n["kind"])
+                self.db.executemany(
+                    "INSERT INTO nodes(sid,path,kind,size,mtime,destination,source_key,destination_key,mapped) VALUES(?,?,?,?,?,?,?,?,1)",
+                    [
+                        (
+                            sid,
+                            n["path"],
+                            n["kind"],
+                            n["size"],
+                            n["mtime"],
+                            n["destination"],
+                            n["path"].lower(),
+                            None
+                            if row["map_files"] and n["kind"] == "directory"
+                            else n["destination"].lower(),
+                        )
+                        for n in additions
+                    ],
+                )
                 self.db.execute("COMMIT")
             except BaseException:
                 with contextlib.suppress(sqlite3.Error):
@@ -692,6 +919,7 @@ class Engine:
                     "INSERT OR IGNORE INTO parts(sid,path,offset,length) VALUES(?,?,?,?)",
                     [(sid, p[0], p[3], p[4]) for p in batch["manifest"]["files"]],
                 )
+                receipt["confirmedBytes"] = self.row(sid)["confirmed_bytes"]
                 self.db.execute(
                     "INSERT INTO batches(sid,id,signature,receipt) VALUES(?,?,?,?)",
                     (sid, bid, batch["signature"], json.dumps(receipt)),
@@ -768,18 +996,16 @@ class Engine:
             if row["state"] in ("committed", "published"):
                 return self.snapshot(sid)
             check(row["state"] == "uploading" and not r.transition and not r.active, "busy", 409)
-            files = list(self.db.execute("SELECT * FROM nodes WHERE sid=? AND kind='file'", (sid,)))
-            dirs = self.db.execute(
-                "SELECT COUNT(*) FROM nodes WHERE sid=? AND kind='directory'", (sid,)
-            ).fetchone()[0]
             check(
-                integer(totals.get("files")) == len(files)
-                and integer(totals.get("dirs")) == dirs
-                and integer(totals.get("bytes")) == sum(f["size"] for f in files),
+                integer(totals.get("files")) == row["declared_files"]
+                and integer(totals.get("dirs")) == row["declared_dirs"]
+                and integer(totals.get("bytes")) == row["declared_bytes"],
                 "scan_mismatch",
                 409,
             )
-            for f in files:
+            for f in self.nodes(sid):
+                if f["kind"] != "file":
+                    continue
                 count, size = self.db.execute(
                     "SELECT COUNT(*),COALESCE(SUM(length),0) FROM parts WHERE sid=? AND path=?",
                     (sid, f["path"]),
@@ -867,66 +1093,19 @@ class Engine:
                 )
             if row["state"] == "published":
                 return
-            if row["map_files"] and not row["mapped"]:
-                check(self.map_file is not None, "hook_unavailable", 503)
-                files = list(
-                    self.db.execute(
-                        "SELECT * FROM nodes WHERE sid=? AND kind='file' ORDER BY path", (sid,)
-                    )
-                )
-                plan = []
-                try:
-                    for f in files:
-                        dest = await maybe(
-                            self.map_file(
-                                dict(
-                                    sessionId=sid,
-                                    path=f["path"],
-                                    name=f["path"].rsplit("/", 1)[-1],
-                                    size=f["size"],
-                                    targetDir=row["target"],
-                                    context=json.loads(row["context"]),
-                                    meta=json.loads(row["meta"]),
-                                )
-                            )
-                        )
-                        plan.append((f["path"], relative_path(f["path"] if dest is None else dest)))
-                    names, spelling = set(), {}
-                    for _, dest in plan:
-                        lower = dest.lower()
-                        check(lower not in names, "mapping_error", 409)
-                        names.add(lower)
-                        parts = dest.split("/")
-                        for i in range(1, len(parts) + 1):
-                            prefix = "/".join(parts[:i])
-                            key = prefix.lower()
-                            check(
-                                key not in spelling or spelling[key] == prefix, "mapping_error", 409
-                            )
-                            spelling[key] = prefix
-                    for _, dest in plan:
-                        parts = dest.lower().split("/")
-                        for i in range(1, len(parts)):
-                            check("/".join(parts[:i]) not in names, "mapping_error", 409)
-                except Exception as exc:
-                    self.report("mapFile", sid, exc)
-                    raise ProtocolError(409, "mapping_error") from None
-                async with r.lock:
+            if row["map_files"]:
+                for f in self.nodes(sid):
+                    if f["kind"] != "file" or f["mapped"]:
+                        continue
+                    destination = await self.mapped_destination(row, f["path"], f["size"])
                     check(
                         self.row(sid)["state"] == "committed" and not r.transition, "bad_state", 409
                     )
-                    self.db.execute("BEGIN IMMEDIATE")
-                    try:
-                        self.db.executemany(
-                            "UPDATE nodes SET destination=? WHERE sid=? AND path=?",
-                            ((dest, sid, name) for name, dest in plan),
-                        )
-                        self.db.execute("UPDATE sessions SET mapped=1 WHERE id=?", (sid,))
-                        self.db.execute("COMMIT")
-                    except BaseException:
-                        with contextlib.suppress(sqlite3.Error):
-                            self.db.execute("ROLLBACK")
-                        raise
+                    self.check_name(sid, destination, "file", "destination", f["path"])
+                    self.db.execute(
+                        "UPDATE nodes SET destination=?,destination_key=?,mapped=1 WHERE sid=? AND path=?",
+                        (destination, destination.lower(), sid, f["path"]),
+                    )
 
         task = asyncio.create_task(prepare())
         r.planning = task
@@ -944,7 +1123,7 @@ class Engine:
         r = self.runtime(sid)
         async with r.lock:
             current = self.row(sid)
-            for n in self.db.execute("SELECT * FROM nodes WHERE sid=?", (sid,)):
+            for n in self.nodes(sid):
                 if current["map_files"] and n["kind"] == "directory":
                     continue
                 if not n["done"] and (
@@ -985,12 +1164,9 @@ class Engine:
                 "bad_state",
                 409,
             )
-            nodes = [
-                n
-                for n in self.db.execute("SELECT * FROM nodes WHERE sid=? ORDER BY path", (sid,))
-                if not row["map_files"] or n["kind"] == "file"
-            ]
-            for n in nodes:
+            for n in self.nodes(sid):
+                if row["map_files"] and n["kind"] == "directory":
+                    continue
                 present = n["kind"] == "directory" or self.payload(sid, n["path"]).exists()
                 if not n["done"] and not present and row["state"] == "committed":
                     raise ProtocolError(
@@ -1013,8 +1189,8 @@ class Engine:
                     dest.mkdir(parents=True, exist_ok=True)
 
             self.db.execute("UPDATE sessions SET state='publishing' WHERE id=?", (sid,))
-            for n in nodes:
-                if n["done"]:
+            for n in self.nodes(sid):
+                if n["done"] or (row["map_files"] and n["kind"] == "directory"):
                     continue
                 dest = self.destination(row, n["destination"])
                 if n["kind"] == "directory":
@@ -1037,7 +1213,6 @@ class Engine:
                         source.replace(dest)
                     else:
                         check(dest.exists(), "missing_payload", 409)
-            published = [n["destination"] for n in nodes if n["kind"] == "file"]
             # The persisted plan and source/destination presence recover partial moves.
             # A single metadata transaction avoids a WAL commit for every file.
             self.db.execute("BEGIN IMMEDIATE")
@@ -1045,7 +1220,7 @@ class Engine:
                 self.db.execute("UPDATE nodes SET done=1 WHERE sid=?", (sid,))
                 self.db.execute(
                     "UPDATE sessions SET state='published',published=? WHERE id=?",
-                    (json.dumps(published), sid),
+                    ("[]", sid),
                 )
                 self.touch(sid)
                 self.db.execute("COMMIT")
@@ -1096,7 +1271,7 @@ class Engine:
             except Exception as exc:
                 self.report("cancel_cleanup", sid, exc)
 
-        callbacks = [t for t in (r.processing, r.planning) if t]
+        callbacks = [t for t in (r.processing, r.planning, *r.mappings) if t]
         if callbacks:
 
             async def later():
@@ -1126,6 +1301,7 @@ class Engine:
                     or r.listeners
                     or r.processing
                     or r.planning
+                    or r.mappings
                 ):
                     continue
                 r.transition = True
@@ -1149,7 +1325,12 @@ class Engine:
                 abort()
         await asyncio.gather(*active)
         await asyncio.gather(
-            *(t for r in self.runtimes.values() for t in (r.processing, r.planning) if t),
+            *(
+                t
+                for r in self.runtimes.values()
+                for t in (r.processing, r.planning, *r.mappings)
+                if t
+            ),
             return_exceptions=True,
         )
         await asyncio.gather(

@@ -117,7 +117,7 @@ it("persists scope context and per-file mapping across a backend restart", async
   await s.upload([new File(["mapped"], "a.txt", { lastModified: 1 })]);
   const ticket = s.exportTicket();
   s.dispose();
-  expect(mapped).toHaveLength(0);
+  expect(mapped).toHaveLength(1);
   await app.mfup.engine.preparePublish(ticket.id);
   expect(mapped).toHaveLength(1);
   expect(mapped[0].context).toEqual({ uid: a.user_id, scope: "uploads" });
