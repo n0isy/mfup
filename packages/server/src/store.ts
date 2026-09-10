@@ -1,134 +1,237 @@
-/**
- * Session store — the expiry index + path metadata behind the sweeper,
- * recovery and lazy resume. Pluggable; two built-ins:
- *
- *   - MemoryStore (default): a Map. Right for the typical single-process
- *     Node deployment. It is EPHEMERAL — after a restart the engine
- *     re-populates it by scanning the base dir for staging directories
- *     (state.sqlite carries expiry/target), so single-process deployments
- *     get restart recovery without any external service.
- *
- *   - RedisStore (./store-redis.js): full parity with the Python server —
- *     survives restarts on its own, supports lazy resume/failover across
- *     workers, and keeps cleanup O(expired) with no directory scans.
- *     `redis` is an optional peer dependency, imported only when used.
- *
- * Key semantics (mirroring mfup_core/redis_index.py): a session is scored
- * by its expiry timestamp; meta holds the target dir and the ABSOLUTE
- * staging dir (what makes sweeper + recovery work with per-user base dirs).
- */
+import { DatabaseSync, type StatementSync } from "node:sqlite";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
-export interface SessionMeta {
-  targetDir: string;
-  stagingDir: string;
-}
-
-export interface SessionStore {
-  /** True when the store's contents do not survive a process restart.
-   * The engine runs a filesystem recovery scan at startup for ephemeral
-   * stores (and skips it for durable ones, which drive recovery themselves). */
-  readonly ephemeral: boolean;
-
-  register(sessionId: string, expiresAt: Date, targetDir: string, stagingDir: string): Promise<void>;
-  updateExpiry(sessionId: string, expiresAt: Date): Promise<void>;
-  /** Session ids whose expiry is <= now. */
-  getExpired(now?: Date): Promise<string[]>;
-  /** Session ids whose expiry is > now (still alive). */
-  getNotExpired(now?: Date): Promise<string[]>;
-  isRegistered(sessionId: string): Promise<boolean>;
-  getMeta(sessionId: string): Promise<SessionMeta | null>;
-  /** Every id regardless of expiry. */
-  allSessions(): Promise<string[]>;
-  remove(sessionId: string): Promise<void>;
-  close(): Promise<void>;
-}
-
-interface MemoryEntry {
-  expiresAtMs: number;
-  targetDir: string;
-  stagingDir: string;
-}
-
-/** In-process store. See module docs for the restart story. */
-export class MemoryStore implements SessionStore {
-  readonly ephemeral = true;
-  private entries = new Map<string, MemoryEntry>();
-
-  async register(
-    sessionId: string,
-    expiresAt: Date,
-    targetDir: string,
-    stagingDir: string,
-  ): Promise<void> {
-    this.entries.set(sessionId, { expiresAtMs: expiresAt.getTime(), targetDir, stagingDir });
-  }
-
-  async updateExpiry(sessionId: string, expiresAt: Date): Promise<void> {
-    const e = this.entries.get(sessionId);
-    if (e) {
-      e.expiresAtMs = expiresAt.getTime();
+export class Store {
+  readonly db: DatabaseSync;
+  private statements = new Map<string, StatementSync>();
+  private closed = false;
+  constructor(base: string) {
+    fs.mkdirSync(base, { recursive: true });
+    this.db = new DatabaseSync(path.join(base, "metadata.sqlite"));
+    try {
+      this.db
+        .exec(`PRAGMA busy_timeout=1000; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, token TEXT NOT NULL, epoch INTEGER NOT NULL,
+        state TEXT NOT NULL, target TEXT NOT NULL, context TEXT NOT NULL, meta TEXT NOT NULL,
+        max_files INTEGER NOT NULL, max_bytes INTEGER NOT NULL, expires INTEGER NOT NULL,
+        published TEXT NOT NULL DEFAULT '[]');
+      CREATE TABLE IF NOT EXISTS nodes(sid TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        path TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+        destination TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sid,path));
+      CREATE TABLE IF NOT EXISTS parts(sid TEXT NOT NULL, path TEXT NOT NULL, offset INTEGER NOT NULL,
+        length INTEGER NOT NULL, PRIMARY KEY(sid,path,offset),
+        FOREIGN KEY(sid,path) REFERENCES nodes(sid,path) ON DELETE CASCADE);
+      CREATE TABLE IF NOT EXISTS batches(sid TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        id TEXT NOT NULL, signature TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(sid,id));
+      CREATE TABLE IF NOT EXISTS asks(sid TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        id TEXT NOT NULL, path TEXT NOT NULL, message TEXT NOT NULL, answer TEXT, PRIMARY KEY(sid,id));`);
+      const columns = new Set(
+        (
+          this.db.prepare("PRAGMA table_info(sessions)").all() as {
+            name: string;
+          }[]
+        ).map((c) => c.name),
+      );
+      for (const [name, spec] of Object.entries({
+        overwrite: "INTEGER NOT NULL DEFAULT 0",
+        conflict: "INTEGER NOT NULL DEFAULT 0",
+        failure: "TEXT NOT NULL DEFAULT ''",
+        base_dir: "TEXT NOT NULL DEFAULT ''",
+        map_files: "INTEGER NOT NULL DEFAULT 0",
+        mapped: "INTEGER NOT NULL DEFAULT 0",
+        auto_publish: "INTEGER NOT NULL DEFAULT 0",
+        client_publish: "INTEGER NOT NULL DEFAULT 1",
+        hook_status: "TEXT NOT NULL DEFAULT 'none'",
+      })) {
+        if (!columns.has(name))
+          this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${spec}`);
+      }
+      if (!columns.has("overwrite"))
+        this.db.exec(
+          "UPDATE sessions SET conflict=1 WHERE id IN (SELECT sid FROM asks)",
+        );
+      this.db.exec(
+        "UPDATE sessions SET hook_status='failed' WHERE hook_status='running'",
+      );
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
   }
-
-  async getExpired(now: Date = new Date()): Promise<string[]> {
-    const t = now.getTime();
-    const out: string[] = [];
-    for (const [sid, e] of this.entries) {
-      if (e.expiresAtMs <= t) out.push(sid);
+  run(sql: string, ...args: (string | number | null)[]) {
+    return this.statement(sql).run(...args);
+  }
+  private statement(sql: string) {
+    let stmt = this.statements.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.statements.set(sql, stmt);
     }
-    return out;
+    return stmt;
   }
-
-  async getNotExpired(now: Date = new Date()): Promise<string[]> {
-    const t = now.getTime();
-    const out: string[] = [];
-    for (const [sid, e] of this.entries) {
-      if (e.expiresAtMs > t) out.push(sid);
+  get<T = Record<string, unknown>>(
+    sql: string,
+    ...args: (string | number)[]
+  ): T | undefined {
+    return this.statement(sql).get(...args) as T | undefined;
+  }
+  all<T = Record<string, unknown>>(
+    sql: string,
+    ...args: (string | number)[]
+  ): T[] {
+    return this.statement(sql).all(...args) as T[];
+  }
+  transaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = fn();
+      this.db.exec("COMMIT");
+      return value;
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* SQLite may already have rolled back. */
+      }
+      throw e;
     }
-    return out;
   }
-
-  async isRegistered(sessionId: string): Promise<boolean> {
-    return this.entries.has(sessionId);
-  }
-
-  async getMeta(sessionId: string): Promise<SessionMeta | null> {
-    const e = this.entries.get(sessionId);
-    return e ? { targetDir: e.targetDir, stagingDir: e.stagingDir } : null;
-  }
-
-  async allSessions(): Promise<string[]> {
-    return [...this.entries.keys()];
-  }
-
-  async remove(sessionId: string): Promise<void> {
-    this.entries.delete(sessionId);
-  }
-
-  async close(): Promise<void> {
-    this.entries.clear();
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.statements.clear();
+    this.db.close();
   }
 }
 
-/**
- * Resolve the `store` option: a SessionStore instance passes through,
- * "memory"/undefined builds a MemoryStore, and a "redis://…" URL lazily
- * imports the Redis adapter (so `redis` stays an optional dependency).
- */
-export async function resolveStore(
-  store: SessionStore | string | undefined,
-): Promise<SessionStore> {
-  if (store === undefined || store === "memory") {
-    return new MemoryStore();
+export class Mutex {
+  private tail: Promise<unknown> = Promise.resolve();
+  run<T>(fn: () => T | Promise<T>): Promise<T> {
+    const next = this.tail.then(fn);
+    this.tail = next.catch(() => {});
+    return next;
   }
-  if (typeof store === "string") {
-    if (store.startsWith("redis://") || store.startsWith("rediss://")) {
-      const { RedisStore } = await import("./store-redis.js");
-      return RedisStore.connect(store);
-    }
-    throw new Error(
-      `unrecognized store ${JSON.stringify(store)}: expected "memory", a redis:// URL, or a SessionStore instance`,
+}
+
+export class ProtocolError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message = code,
+    public retryable?: boolean,
+    public phase?: string,
+  ) {
+    super(message);
+  }
+}
+export function check(
+  condition: unknown,
+  code: string,
+  status = 400,
+): asserts condition {
+  if (!condition) throw new ProtocolError(status, code);
+}
+export function relativePath(value: unknown): string {
+  check(
+    typeof value === "string" &&
+      value.length > 0 &&
+      Buffer.byteLength(value) <= 1024 &&
+      value === value.normalize("NFC"),
+    "bad_path",
+  );
+  for (const segment of value.split("/")) {
+    check(
+      segment.length > 0 &&
+        Buffer.byteLength(segment) <= 240 &&
+        !/[\\<>:"|?*\x00-\x1f\x7f]/.test(segment) &&
+        !/[. ]$/.test(segment) &&
+        segment !== "." &&
+        segment !== ".." &&
+        !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(segment),
+      "bad_path",
     );
   }
-  return store;
+  return value;
+}
+export function identifier(value: unknown): string {
+  check(
+    typeof value === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value),
+    "bad_id",
+  );
+  return value;
+}
+/** Resolve the application-visible directory using the same layout as Engine.publish. */
+export function publishedDirectory(baseDir: string, targetDir: string): string {
+  return path.join(path.resolve(baseDir), "published", relativePath(targetDir));
+}
+export function integer(value: unknown): number {
+  check(
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0,
+    "bad_number",
+  );
+  return value;
+}
+
+export interface Failure {
+  code: string;
+  status: number;
+  phase: string;
+  retryable: boolean;
+}
+/** Preserve OS/SQLite failures instead of reporting malformed request data. */
+export function normalizeError(error: unknown, phase?: string): ProtocolError {
+  if (error instanceof ProtocolError) {
+    error.phase ??= phase;
+    return error;
+  }
+  const e = error as { code?: string; errcode?: number; message?: string };
+  const sqlite = e?.code?.startsWith("ERR_SQLITE") ? (e.errcode ?? 0) & 255 : 0;
+  if (
+    ["ENOSPC", "EDQUOT", "SQLITE_FULL"].includes(e?.code ?? "") ||
+    sqlite === 13
+  )
+    return new ProtocolError(
+      507,
+      "storage_full",
+      "Server storage is full",
+      false,
+      phase,
+    );
+  if (
+    [
+      "EIO",
+      "EROFS",
+      "EACCES",
+      "EPERM",
+      "ENODEV",
+      "ENOENT",
+      "ENOTDIR",
+      "EMFILE",
+      "ENFILE",
+      "EBUSY",
+      "EFBIG",
+      "EXDEV",
+      "SQLITE_IOERR",
+      "SQLITE_READONLY",
+      "SQLITE_CANTOPEN",
+    ].includes(e?.code ?? "") ||
+    [5, 6, 8, 10, 11, 14, 26].includes(sqlite)
+  )
+    return new ProtocolError(
+      503,
+      "storage_unavailable",
+      "Server storage is unavailable",
+      false,
+      phase,
+    );
+  return new ProtocolError(
+    500,
+    "server_error",
+    "Server could not complete the operation",
+    false,
+    phase,
+  );
 }

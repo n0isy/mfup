@@ -1,124 +1,176 @@
-/**
- * The multiuser-scopes example on the NODE server — same policy as the
- * FastAPI version (examples/multiuser-scopes/server/app.py), written the
- * way an express consumer would:
- *
- *   - users auto-created via a `demo_uid` cookie (GET /api/whoami mints it);
- *   - three upload zones, the SCOPE travels as session meta;
- *   - ONE authorize hook turns (cookie, meta.scope) into a server-owned
- *     destination: files always land at <DATA_DIR>/<uid>/<scope>/…;
- *   - MFUP integration is two lines: app.use(prefix, mfup.middleware) for
- *     HTTP + mfup.attach(server) for the control WebSocket.
- *
- * No Redis: the default in-memory session store. On a restart the engine
- * re-discovers live sessions by scanning DATA_DIR for staging directories.
- */
-
-import crypto from "node:crypto";
+import { createServer } from "node:http";
+import { createHash, randomBytes } from "node:crypto";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createMfup,
+  relativePath,
+  ProtocolError,
+  publishedDirectory,
+} from "@mfup/server";
 
-import express from "express";
-import { createMfup } from "@mfup/server";
-
-const DATA_DIR = path.resolve(process.env.DEMO_DATA_DIR ?? "./data");
-const SCOPES = ["workspace", "scratch", "uploads"];
-const COOKIE_NAME = "demo_uid";
-const PORT = Number.parseInt(process.env.PORT ?? "8091", 10);
-
-/** Parse the demo_uid cookie off a raw Cookie header (same rules as the
- * Python example: alnum, 8–64 chars). Works for HTTP requests and for the
- * WebSocket handshake headers alike. */
-function uidFromCookieHeader(header) {
-  if (!header) return null;
-  for (const part of header.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq === -1) continue;
-    if (part.slice(0, eq).trim() !== COOKIE_NAME) continue;
-    const v = part.slice(eq + 1).trim();
-    if (/^[a-zA-Z0-9]{8,64}$/.test(v)) return v;
-  }
-  return null;
+export const SCOPES = ["workspace", "scratch", "uploads"];
+const COOKIE = "mfup3_node_user";
+function identity(headers) {
+  const token = String(headers.cookie ?? "")
+    .split(";")
+    .map((p) => p.trim())
+    .find((p) => p.startsWith(COOKIE + "="))
+    ?.slice(COOKIE.length + 1);
+  return /^[a-f0-9]{64}$/.test(token ?? "")
+    ? createHash("sha256").update(token).digest("hex").slice(0, 32)
+    : null;
+}
+function json(res, status, value) {
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+  });
+  res.end(JSON.stringify(value));
 }
 
-// ---------------------------------------------------------------------------
-// MFUP: the whole multiuser/scope policy is this one authorize hook.
-// ---------------------------------------------------------------------------
-const mfup = createMfup({
-  baseDir: DATA_DIR,
-  store: process.env.REDIS_URL ?? "memory",
-  authorize: async (req) => {
-    const uid = uidFromCookieHeader(req.headers["cookie"]);
-    if (!uid) return null; // the SPA calls /api/whoami first
-    const scope =
-      req.meta && typeof req.meta === "object" ? /** @type {any} */ (req.meta).scope : undefined;
-    if (!SCOPES.includes(scope)) return null;
+/** @param {Omit<Partial<import('@mfup/server').Options>, 'authorize'> & {scopeRoots?: Record<string, string>}} [config] */
+export function createExample({
+  baseDir = process.env.DEMO_DATA_DIR ?? "./data/example-node",
+  scopeRoots = {},
+  ...options
+} = {}) {
+  const base = path.resolve(baseDir);
+  // Application policy: both uploads and listings resolve the same scope roots.
+  const rootFor = (scope) => path.resolve(scopeRoots[scope] ?? base);
+  /** @type {import('@mfup/server').Options['authorize']} */
+  const authorize = ({ headers, meta }) => {
+    const uid = identity(headers),
+      scope =
+        meta && typeof meta === "object" && "scope" in meta ? meta.scope : null;
+    if (!uid || !SCOPES.includes(scope)) return null;
     return {
-      baseDir: path.join(DATA_DIR, uid), // per-user home (staging lives inside)
-      targetDir: scope, // SERVER owns the layout: <uid>/<scope>/
-      maxTotalBytes: 512 * 2 ** 20, // 512 MiB per session
-      maxFiles: 20_000,
+      baseDir: rootFor(scope),
+      targetDir: `${uid}/${scope}`,
+      maxTotalBytes: 512 * 2 ** 20,
+      maxFiles: 20000,
       context: { uid, scope },
     };
-  },
-});
-
-// ---------------------------------------------------------------------------
-// The consumer app around it.
-// ---------------------------------------------------------------------------
-const app = express();
-
-app.get("/api/whoami", async (req, res) => {
-  let uid = uidFromCookieHeader(req.headers.cookie);
-  if (!uid) {
-    uid = crypto.randomBytes(8).toString("hex"); // 16 hex chars — passes the check
-    res.cookie(COOKIE_NAME, uid, {
-      maxAge: 30 * 24 * 3600 * 1000,
-      httpOnly: true,
-      sameSite: "lax",
-    });
-  }
-  await fs.mkdir(path.join(DATA_DIR, uid), { recursive: true });
-  res.json({ user_id: uid, scopes: SCOPES, server: "@mfup/server (node)" });
-});
-
-app.get("/api/files/:scope", async (req, res) => {
-  const uid = uidFromCookieHeader(req.headers.cookie);
-  const scope = req.params.scope;
-  if (!uid || !SCOPES.includes(scope)) {
-    res.status(403).json({ error: "unknown user or scope" });
-    return;
-  }
-  const dir = path.join(DATA_DIR, uid, scope);
-  let entries = [];
-  try {
-    const dirents = await fs.readdir(dir, { withFileTypes: true });
-    entries = await Promise.all(
-      dirents.map(async (d) => ({
-        name: d.name,
-        dir: d.isDirectory(),
-        size: d.isDirectory() ? null : (await fs.stat(path.join(dir, d.name))).size,
-      })),
-    );
-    entries.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
-  } catch {
-    /* scope dir not created yet — empty listing */
-  }
-  res.json({ scope, entries });
-});
-
-// MFUP/2 under a prefix: HTTP endpoints via middleware…
-app.use("/api/mfup", mfup.middleware);
-
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`multiuser-scopes (node) listening on :${PORT} — data at ${DATA_DIR}`);
-});
-// …and the control-channel WebSocket via the upgrade hook.
-mfup.attach(server);
-
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => {
-    server.close();
-    mfup.close().finally(() => process.exit(0));
+  };
+  const mfup = createMfup({
+    ...options,
+    baseDir: base,
+    authorize,
+    prefix: "/api",
   });
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, "http://localhost");
+      if (req.method === "GET" && url.pathname === "/api/whoami") {
+        let uid = identity(req.headers);
+        if (!uid) {
+          const token = randomBytes(32).toString("hex");
+          uid = identity({ cookie: COOKIE + "=" + token });
+          res.setHeader(
+            "set-cookie",
+            `${COOKIE}=${token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax${process.env.COOKIE_SECURE === "1" ? "; Secure" : ""}`,
+          );
+        }
+        json(res, 200, { user_id: uid, scopes: SCOPES, backend: "node" });
+        return;
+      }
+      const route = /^\/api\/(files|file)\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && route) {
+        const uid = identity(req.headers),
+          scope = route[2];
+        if (!uid || !SCOPES.includes(scope)) {
+          json(res, 403, { error: "unknown_user_or_scope" });
+          return;
+        }
+        const rel = url.searchParams.get("path") ?? "";
+        if (rel) relativePath(rel);
+        const root = publishedDirectory(rootFor(scope), `${uid}/${scope}`),
+          target = path.join(root, rel);
+        if (route[1] === "file") {
+          if (!rel || !(await fs.stat(target)).isFile()) {
+            json(res, 404, { error: "not_found" });
+            return;
+          }
+          res.writeHead(200, {
+            "content-type": "application/octet-stream",
+            "cache-control": "no-store",
+            "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(rel))}`,
+          });
+          const stream = createReadStream(target);
+          stream.on("error", () => res.destroy());
+          stream.pipe(res);
+          return;
+        }
+        const items = await fs
+          .readdir(target, { withFileTypes: true })
+          .catch((error) => {
+            if (error.code === "ENOENT") return [];
+            throw error;
+          });
+        const entries = await Promise.all(
+          items.map(async (item) => ({
+            name: item.name,
+            dir: item.isDirectory(),
+            size: item.isDirectory()
+              ? null
+              : (await fs.stat(path.join(target, item.name))).size,
+          })),
+        );
+        entries.sort((a, b) =>
+          a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1,
+        );
+        json(res, 200, { scope, path: rel, entries });
+        return;
+      }
+      if (url.pathname.startsWith("/api/mfup/")) {
+        await mfup.handle(req, res);
+        return;
+      }
+      json(res, 404, { error: "not_found" });
+    } catch (error) {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      json(
+        res,
+        error instanceof ProtocolError
+          ? error.status
+          : error.code === "ENOENT"
+            ? 404
+            : 500,
+        {
+          error: error instanceof ProtocolError ? error.code : "request_failed",
+        },
+      );
+    }
+  });
+  mfup.attach(server);
+  const close = async () => {
+    await mfup.close();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  };
+  return { server, mfup, close };
+}
+
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  const app = createExample();
+  const port = Number(process.env.PORT ?? 3001);
+  app.server.listen(port, process.env.HOST ?? "0.0.0.0", () =>
+    console.log(`MFUP/3 scopes (Node) on :${port}`),
+  );
+  let closing = false;
+  for (const signal of ["SIGINT", "SIGTERM"])
+    process.on(signal, async () => {
+      if (closing) return;
+      closing = true;
+      await app.close();
+      process.exit(0);
+    });
 }

@@ -1,602 +1,1307 @@
-/**
- * MfupEngine — owns the session registry, the session store, the sweeper and
- * the consumer hooks. The HTTP/WS surface lives in handler.ts; consumer
- * backends can also drive the engine directly (engine.publish(), sweep()).
- *
- * Port of server/mfup-fastapi/mfup_fastapi/engine.py (lifecycle half).
- */
-
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-
-import { createLogger } from "./logger.js";
-import type {
-  AuthorizeHook,
-  CommitEvent,
-  FileMapRequest,
-  MapFileHook,
-  OnCommittedHook,
-} from "./hooks.js";
-import { SessionState } from "./protocol.js";
-import { LiveSession, SessionRegistry } from "./session.js";
-import { DEFAULT_STAGING_PREFIX, stagingDir } from "./storage.js";
 import {
-  ConflictError,
-  MappingError,
-  listPayloadFiles,
-  publishSession,
-  publishSessionMapped,
-} from "./publish.js";
-import { MemoryStore, resolveStore, type SessionStore } from "./store.js";
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
+import {
+  Store,
+  normalizeError,
+  type Failure,
+  Mutex,
+  ProtocolError,
+  check,
+  identifier,
+  integer,
+  relativePath,
+  publishedDirectory,
+} from "./store.js";
 
-const logger = createLogger("mfup.engine");
+import type {
+  Options,
+  Limits,
+  AuthResult,
+  CommitEvent,
+  RequestContext,
+  StagedFile,
+} from "./contracts.js";
+export type { Options, Limits, AuthResult } from "./contracts.js";
 
-// ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
-
-export interface MfupOptions {
-  /** Global base directory for staging + publish (a per-session baseDir from
-   * the authorize hook overrides it per session). */
-  baseDir: string;
-  /** Session store: "memory" (default), a "redis://…" URL, or a custom
-   * SessionStore. Memory is right for single-process deployments — after a
-   * restart the engine re-discovers live sessions by scanning baseDir for
-   * staging directories. Redis adds cross-worker lazy resume/failover and
-   * scan-free cleanup, wire-compatible with the Python server's index. */
-  store?: SessionStore | string;
-  /** Seconds a session stays resumable; sets expires_at at HELLO. */
-  sessionResumeTtl?: number;
-  /** Seconds of leg inactivity before the leg is detached. */
-  legIdleTimeout?: number;
-  /** Largest accepted chunk; advertised in HELLO_OK.limits. */
-  maxChunkBytes?: number;
-  /** Concurrently open files per session; advertised in HELLO_OK.limits. */
-  maxOpenFiles?: number;
-  /** Pending-file window; advertised in HELLO_OK.limits. */
-  maxPendingFiles?: number;
-  /** Seconds between sweeper passes. */
-  sweepInterval?: number;
-  /** Prefix of per-session staging dir names ({prefix}.{session_id}). */
-  stagingPrefix?: string;
-  /** Run the filesystem-orphan reconciliation every Nth sweep. */
-  reconcileEvery?: number;
-  /** Minimum staging-dir age (seconds) before it may be reconciled away. */
-  orphanGraceSeconds?: number;
-  /** How many directory levels below baseDir to scan for staging dirs
-   * (memory-store restart recovery + orphan reconciliation). Depth 2 covers
-   * both `<base>/.incoming.*` and per-user `<base>/<uid>/.incoming.*`. */
-  scanDepth?: number;
-  /** Buffered-body threshold for atomic batch POSTs; also the hard cap that
-   * produces 413 body_too_large. */
-  maxBufferedBody?: number;
-  /** Cap on the JSON size of HELLO.meta. */
-  maxMetaBytes?: number;
-  /** Bearer for the x-mfup-admin-token header; empty/unset disables the
-   * admin routes entirely. */
-  adminToken?: string;
-  /** Mount prefix when the handler cannot infer it from req.url (raw
-   * http.createServer with a path prefix). With express/vite middleware
-   * mounting this is unnecessary. */
-  basePath?: string;
-  /** Consumer hooks (see hooks.ts). No authorize hook = allow-all (warned). */
-  authorize?: AuthorizeHook;
-  mapFile?: MapFileHook;
-  onCommitted?: OnCommittedHook;
+interface SessionRow {
+  id: string;
+  token: string;
+  epoch: number;
+  state: string;
+  target: string;
+  context: string;
+  meta: string;
+  max_files: number;
+  max_bytes: number;
+  expires: number;
+  published: string;
+  base_dir: string;
+  map_files: number;
+  mapped: number;
+  auto_publish: number;
+  client_publish: number;
+  hook_status: string;
+  overwrite: number;
+  conflict: number;
+  failure: string;
+}
+interface NodeRow {
+  path: string;
+  kind: "file" | "directory";
+  size: number;
+  mtime: number;
+  destination: string;
+  done: number;
+}
+interface Active {
+  done: Promise<void>;
+  finish: () => void;
+  abort: () => void;
+}
+interface Runtime {
+  mutex: Mutex;
+  active: Set<Active>;
+  batches: Set<string>;
+  ranges: Set<string>;
+  listeners: Set<(state: unknown) => void>;
+  transition: boolean;
+  overwrite?: boolean;
+  conflict?: boolean;
+  failure?: Failure | null;
+  baseDir?: string;
+  publishedDir?: string;
+  processing?: Promise<unknown>;
+  planning?: Promise<unknown>;
+  cancelling?: Promise<unknown>;
+}
+export type Part = [string, number, number, number, number];
+export interface Manifest {
+  files: Part[];
+  dirs: string[];
+}
+export interface Batch {
+  id: string;
+  sid: string;
+  epoch: number;
+  active: Active;
+  manifest?: Manifest;
+  signature?: string;
+  entries?: { item: Part; filePath: string; skip: boolean }[];
 }
 
-export interface ResolvedMfupOptions {
-  baseDir: string;
-  store: SessionStore | string;
-  sessionResumeTtl: number;
-  legIdleTimeout: number;
-  maxChunkBytes: number;
-  maxOpenFiles: number;
-  maxPendingFiles: number;
-  sweepInterval: number;
-  stagingPrefix: string;
-  reconcileEvery: number;
-  orphanGraceSeconds: number;
-  scanDepth: number;
-  maxBufferedBody: number;
-  maxMetaBytes: number;
-  adminToken: string;
-  basePath: string;
-  authorize: AuthorizeHook | null;
-  mapFile: MapFileHook | null;
-  onCommitted: OnCommittedHook | null;
-}
-
-export function resolveOptions(opts: MfupOptions): ResolvedMfupOptions {
-  return {
-    baseDir: path.resolve(opts.baseDir),
-    store: opts.store ?? "memory",
-    sessionResumeTtl: opts.sessionResumeTtl ?? 3600,
-    legIdleTimeout: opts.legIdleTimeout ?? 60,
-    maxChunkBytes: opts.maxChunkBytes ?? 262144,
-    maxOpenFiles: opts.maxOpenFiles ?? 1,
-    maxPendingFiles: opts.maxPendingFiles ?? 64,
-    sweepInterval: opts.sweepInterval ?? 300,
-    stagingPrefix: opts.stagingPrefix ?? DEFAULT_STAGING_PREFIX,
-    reconcileEvery: opts.reconcileEvery ?? 4,
-    orphanGraceSeconds: opts.orphanGraceSeconds ?? 600,
-    scanDepth: opts.scanDepth ?? 2,
-    maxBufferedBody: opts.maxBufferedBody ?? 16 * 1024 * 1024,
-    maxMetaBytes: opts.maxMetaBytes ?? 16384,
-    adminToken: opts.adminToken ?? "",
-    basePath: opts.basePath ?? "",
-    authorize: opts.authorize ?? null,
-    mapFile: opts.mapFile ?? null,
-    onCommitted: opts.onCommitted ?? null,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Typed publish errors
-// ---------------------------------------------------------------------------
-
-export class PublishError extends Error {}
-
-export class SessionNotFound extends PublishError {}
-
-export class NotCommitted extends PublishError {
-  constructor(readonly state: string) {
-    super(`cannot publish session in state ${state}`);
-  }
-}
-
-export class TargetEscapes extends PublishError {}
-
-export class MapFileHookError extends PublishError {
-  constructor(readonly path: string) {
-    super(`mapFile hook raised for ${path}`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Check that targetDir resolves within baseDir (no path traversal). */
-export function isSafeTarget(baseDir: string, targetDir: string): boolean {
-  const resolved = path.isAbsolute(targetDir)
-    ? path.resolve(targetDir)
-    : path.resolve(baseDir, targetDir);
-  const rel = path.relative(path.resolve(baseDir), resolved);
-  return !rel.startsWith("..") && !path.isAbsolute(rel);
-}
-
-/**
- * Depth-limited scan of `base` for staging directories `{prefix}.{sid}`.
- * Depth 1 = only direct children of base; depth 2 also checks each child
- * directory's children (per-user homes) — never descends INTO a staging dir.
- */
-export async function scanStagingDirs(
-  base: string,
-  prefix: string,
-  depth: number,
-): Promise<{ sessionId: string; stagingPath: string }[]> {
-  const found: { sessionId: string; stagingPath: string }[] = [];
-  const marker = `${prefix}.`;
-
-  const walk = async (dir: string, remaining: number): Promise<void> => {
-    let entries: fs.Dirent[];
+export class Engine {
+  readonly store: Store;
+  readonly limits: Limits;
+  readonly options: Options;
+  private runtimes = new Map<string, Runtime>();
+  private timer?: ReturnType<typeof setInterval>;
+  private closed = false;
+  private publishLock = new Mutex();
+  private cleanups = new Set<Promise<void>>();
+  constructor(options: Options) {
+    this.options = { ...options, baseDir: path.resolve(options.baseDir) };
+    this.limits = {
+      concurrency: 6,
+      maxParts: 128,
+      batchBytes: 32 * 1024 ** 2,
+      partBytes: 16 * 1024 ** 2,
+      ...options.limits,
+    };
+    check(
+      this.limits.concurrency >= 1 &&
+        this.limits.concurrency <= 6 &&
+        Object.values(this.limits).every(
+          (n) => Number.isSafeInteger(n) && n > 0,
+        ) &&
+        this.limits.partBytes <= this.limits.batchBytes &&
+        this.limits.maxParts <= 1024,
+      "bad_limits",
+    );
+    check(typeof options.authorize === "function", "missing_authorize");
+    for (const value of [options.autoPublish, options.clientPublish])
+      check(value === undefined || typeof value === "boolean", "bad_config");
+    for (const value of [
+      options.maxMetaBytes ?? 16384,
+      options.maxContextBytes ?? 65536,
+    ])
+      integer(value);
+    this.store = new Store(this.options.baseDir);
     try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      const p = path.join(dir, e.name);
-      if (e.name.startsWith(marker)) {
-        found.push({ sessionId: e.name.slice(marker.length), stagingPath: p });
-      } else if (remaining > 1) {
-        await walk(p, remaining - 1);
-      }
-    }
-  };
-
-  await walk(base, Math.max(1, depth));
-  return found;
-}
-
-/**
- * Remove staging dirs that no live session and no store entry reference.
- *
- * The store-driven sweeper can only clean sessions the store still knows
- * about. A staging dir becomes an unreachable orphan when cleanup was
- * interrupted between rm and store-remove, when rm silently failed, or when
- * the store lost the entry. Such a dir can never be resumed nor swept — so
- * it would accumulate forever. This scan is the retention safety net.
- *
- * An orphan is removed only when ALL hold, to avoid racing a live upload:
- *   - not in the in-memory registry,
- *   - not registered in the store,
- *   - last modified at least graceSeconds ago.
- */
-export async function reconcileOrphans(
-  base: string,
-  registry: SessionRegistry,
-  store: SessionStore,
-  prefix: string,
-  graceSeconds = 600,
-  scanDepth = 2,
-): Promise<string[]> {
-  const removed: string[] = [];
-  if (!fs.existsSync(base)) return removed;
-
-  const now = Date.now();
-  for (const { sessionId: sid, stagingPath } of await scanStagingDirs(base, prefix, scanDepth)) {
-    if (registry.get(sid) !== null) continue; // live in this process
-    try {
-      if (await store.isRegistered(sid)) continue; // store still tracks it
-    } catch {
-      // Store unreachable — do not delete anything we cannot verify.
-      logger.warn(`Reconcile: cannot verify session ${sid} in store, skipping`);
-      continue;
-    }
-    let ageMs: number;
-    try {
-      ageMs = now - (await fsp.stat(stagingPath)).mtimeMs;
-    } catch {
-      continue;
-    }
-    if (ageMs < graceSeconds * 1000) continue; // might be mid-registration
-
-    await fsp.rm(stagingPath, { recursive: true, force: true });
-    // Belt and suspenders: drop any half-written store entry too.
-    try {
-      await store.remove(sid);
-    } catch {
-      /* best effort */
-    }
-    removed.push(sid);
-  }
-
-  return removed;
-}
-
-// ---------------------------------------------------------------------------
-// Engine
-// ---------------------------------------------------------------------------
-
-export class MfupEngine {
-  readonly cfg: ResolvedMfupOptions;
-  registry: SessionRegistry | null = null;
-  store: SessionStore | null = null;
-
-  private sweepTimer: NodeJS.Timeout | null = null;
-  private sweeping = false;
-  private sweeps = 0;
-  private startedUp = false;
-
-  constructor(cfg: ResolvedMfupOptions) {
-    this.cfg = cfg;
-    if (cfg.authorize === null) {
-      logger.warn(
-        "no authorize hook configured — running WITHOUT authorization (allow-all). " +
-          "Do not do this in production.",
+      this.store.run(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES('partBytes',?)",
+        this.limits.partBytes,
       );
+      check(
+        this.store.get<{ value: number }>(
+          "SELECT value FROM settings WHERE key='partBytes'",
+        )?.value === this.limits.partBytes,
+        "part_size_in_use",
+      );
+    } catch (error) {
+      this.store.close();
+      throw error;
     }
-  }
-
-  // -- lifecycle -------------------------------------------------------------
-
-  async startup(): Promise<void> {
-    if (this.startedUp) return;
-    this.startedUp = true;
-    const cfg = this.cfg;
-    await fsp.mkdir(cfg.baseDir, { recursive: true });
-
-    this.store = await resolveStore(cfg.store);
-    this.registry = new SessionRegistry(cfg.baseDir, cfg.stagingPrefix, {
-      sessionResumeTtl: cfg.sessionResumeTtl,
-      legIdleTimeout: cfg.legIdleTimeout,
-      maxChunkBytes: cfg.maxChunkBytes,
-      // With a mapFile hook the client's layout no longer predicts final
-      // paths — the ingest-time conflict ASK would be noise; publish-time
-      // conflict handling (409 → action) takes over.
-      conflictCheck: cfg.mapFile === null,
+    fs.mkdirSync(path.join(this.options.baseDir, "staging"), {
+      recursive: true,
     });
-
-    try {
-      if (this.store.ephemeral) {
-        await this.recoverFromFilesystem();
-      } else {
-        await this.recoverFromStore();
-      }
-    } catch (exc) {
-      logger.error(`Startup: session recovery failed: ${exc}`);
+    fs.mkdirSync(path.join(this.options.baseDir, "published"), {
+      recursive: true,
+    });
+    if (options.sweepIntervalMs !== 0) {
+      this.timer = setInterval(() => {
+        void this.sweep().catch(() => {});
+      }, options.sweepIntervalMs ?? 60000);
+      this.timer.unref();
     }
-
-    // One filesystem reconciliation at startup: catches staging dirs
-    // orphaned by a crash between rm and store-remove, a silently-failed
-    // rm, or a lost store — none of which the store-driven sweeper can find.
+  }
+  private runtime(id: string): Runtime {
+    let r = this.runtimes.get(id);
+    if (!r) {
+      r = {
+        mutex: new Mutex(),
+        active: new Set(),
+        batches: new Set(),
+        ranges: new Set(),
+        listeners: new Set(),
+        transition: false,
+      };
+      this.runtimes.set(id, r);
+    }
+    return r;
+  }
+  row(id: string): SessionRow {
+    identifier(id);
+    const row = this.store.get<SessionRow>(
+      "SELECT * FROM sessions WHERE id=?",
+      id,
+    );
+    if (!row) throw new ProtocolError(404, "not_found");
+    this.runtime(id).baseDir = row.base_dir || this.options.baseDir;
+    this.runtime(id).overwrite = Boolean(row.overwrite);
+    this.runtime(id).conflict = Boolean(row.conflict);
+    return row;
+  }
+  authenticate(id: string, token: string) {
+    const row = this.row(id),
+      a = Buffer.from(row.token),
+      b = Buffer.from(token);
+    check(a.length === b.length && timingSafeEqual(a, b), "denied", 403);
+    return row;
+  }
+  private touch(id: string) {
+    this.store.run(
+      "UPDATE sessions SET expires=? WHERE id=?",
+      Date.now() + (this.options.ttlMs ?? 86400000),
+      id,
+    );
+  }
+  private report(hook: string, sessionId: string, error: unknown) {
     try {
-      const removed = await reconcileOrphans(
-        cfg.baseDir,
-        this.registry,
-        this.store,
-        cfg.stagingPrefix,
-        cfg.orphanGraceSeconds,
-        cfg.scanDepth,
+      if (this.options.onError)
+        this.options.onError({ hook, sessionId, error });
+      else console.error(`MFUP ${hook} failed (${sessionId})`, error);
+    } catch {
+      /* Diagnostics must not change session state. */
+    }
+  }
+  async create(
+    input: {
+      protocol?: unknown;
+      targetDir?: unknown;
+      meta?: unknown;
+      overwrite?: unknown;
+    },
+    headers: Record<string, string>,
+    request: RequestContext = {},
+  ) {
+    check(!this.closed, "closed", 503);
+    check(input.protocol === "MFUP/3", "bad_protocol");
+    check(
+      input.overwrite === undefined || typeof input.overwrite === "boolean",
+      "bad_property",
+    );
+    const target =
+      input.targetDir === undefined || input.targetDir === ""
+        ? "uploads"
+        : relativePath(input.targetDir);
+    const meta = JSON.stringify(input.meta ?? null);
+    check(
+      Buffer.byteLength(meta) <= (this.options.maxMetaBytes ?? 16384),
+      "meta_too_large",
+      413,
+    );
+    const id = randomUUID(),
+      token = randomBytes(32).toString("hex");
+    let auth: AuthResult | null;
+    try {
+      auth = await this.options.authorize({
+        ...request,
+        sessionId: id,
+        headers,
+        targetDir: target,
+        meta: JSON.parse(meta),
+      });
+    } catch (error) {
+      this.report("authorize", id, error);
+      throw new ProtocolError(403, "denied");
+    }
+    check(auth && typeof auth === "object", "denied", 403);
+    check(
+      auth.baseDir === undefined ||
+        (typeof auth.baseDir === "string" && path.isAbsolute(auth.baseDir)),
+      "bad_base_dir",
+    );
+    const base = path.resolve(auth.baseDir ?? this.options.baseDir);
+    const targetDir = relativePath(auth.targetDir ?? target);
+    const context = JSON.stringify(auth.context ?? {});
+    check(
+      auth.context === undefined ||
+        (auth.context !== null &&
+          typeof auth.context === "object" &&
+          !Array.isArray(auth.context)),
+      "bad_context",
+    );
+    check(
+      Buffer.byteLength(context) <= (this.options.maxContextBytes ?? 65536),
+      "context_too_large",
+    );
+    const auto = auth.autoPublish ?? this.options.autoPublish ?? false;
+    const client = auth.clientPublish ?? this.options.clientPublish ?? true;
+    check(
+      typeof auto === "boolean" && typeof client === "boolean",
+      "bad_config",
+    );
+    const maxFiles = integer(auth.maxFiles ?? 100000),
+      maxBytes = integer(auth.maxTotalBytes ?? Number.MAX_SAFE_INTEGER);
+    const stage = path.join(base, "staging", id);
+    fs.mkdirSync(stage, { recursive: true });
+    try {
+      this.store.run(
+        "INSERT INTO sessions(id,token,epoch,state,target,context,meta,max_files,max_bytes,expires,base_dir,map_files,auto_publish,client_publish,hook_status,overwrite) VALUES(?,?,1,'uploading',?,?,?,?,?,?,?,?,?,?,?,?)",
+        id,
+        token,
+        targetDir,
+        context,
+        meta,
+        maxFiles,
+        maxBytes,
+        Date.now() + (this.options.ttlMs ?? 86400000),
+        base,
+        Number(Boolean(this.options.mapFile)),
+        Number(auto),
+        Number(client),
+        this.options.onCommitted ? "pending" : "none",
+        Number(input.overwrite ?? false),
       );
-      if (removed.length > 0) {
-        logger.warn(
-          `Startup: reconciled ${removed.length} orphaned staging dir(s): ${removed.join(", ")}`,
-        );
+    } catch (error) {
+      try {
+        fs.rmSync(stage, { recursive: true, force: true });
+      } catch (cleanupError) {
+        this.report("create_cleanup", id, cleanupError);
       }
-    } catch (exc) {
-      logger.error(`Startup: orphan reconciliation failed: ${exc}`);
+      throw error;
     }
-
-    this.sweepTimer = setInterval(() => {
-      void this.sweepTick();
-    }, cfg.sweepInterval * 1000);
-    this.sweepTimer.unref();
+    this.runtime(id).baseDir = base;
+    return { id, token, epoch: 1, limits: this.limits };
   }
-
-  async shutdown(): Promise<void> {
-    if (this.sweepTimer !== null) {
-      clearInterval(this.sweepTimer);
-      this.sweepTimer = null;
+  staging(id: string) {
+    const base =
+      this.runtime(id).baseDir ??
+      (this.row(id).base_dir || this.options.baseDir);
+    return path.join(base, "staging", identifier(id));
+  }
+  payload(id: string, file: string) {
+    return path.join(
+      this.staging(id),
+      createHash("sha256").update(file).digest("hex"),
+    );
+  }
+  destination(row: SessionRow, file: string) {
+    const r = this.runtime(row.id);
+    r.publishedDir ??= publishedDirectory(
+      row.base_dir || this.options.baseDir,
+      row.target,
+    );
+    return path.join(r.publishedDir, file);
+  }
+  getSession(id: string): CommitEvent & { state: string; processing: string } {
+    const row = this.row(id),
+      snapshot = this.snapshot(id);
+    return {
+      sessionId: id,
+      targetDir: row.target,
+      baseDir: row.base_dir || this.options.baseDir,
+      stagingDir: this.staging(id),
+      files: snapshot.files,
+      bytes: snapshot.bytes,
+      context: JSON.parse(row.context),
+      meta: JSON.parse(row.meta),
+      state: row.state,
+      processing: row.hook_status,
+    };
+  }
+  *listStaged(id: string): Generator<StagedFile> {
+    check(this.row(id).state === "committed", "bad_state", 409);
+    let after = "";
+    for (;;) {
+      const page = this.store.all<NodeRow>(
+        "SELECT * FROM nodes WHERE sid=? AND kind='file' AND path>? ORDER BY path LIMIT 256",
+        id,
+        after,
+      );
+      for (const file of page)
+        yield {
+          path: file.path,
+          size: file.size,
+          mtime: file.mtime,
+          localPath: this.payload(id, file.path),
+        };
+      if (page.length < 256) return;
+      after = page.at(-1)!.path;
     }
-    if (this.registry !== null) {
-      for (const [, session] of this.registry.allSessions()) {
-        session.cancelIdleTimer();
-        session.closeAllWriters();
-        session.db.close();
-      }
-    }
-    if (this.store !== null) {
-      await this.store.close();
-    }
-    this.startedUp = false;
   }
-
-  requireRegistry(): SessionRegistry {
-    if (this.registry === null) throw new Error("MfupEngine.startup() has not run");
-    return this.registry;
+  openStaged(id: string, file: string) {
+    check(this.row(id).state === "committed", "bad_state", 409);
+    const node = this.store.get<NodeRow>(
+      "SELECT * FROM nodes WHERE sid=? AND path=? AND kind='file'",
+      id,
+      relativePath(file),
+    );
+    check(node, "not_found", 404);
+    return fs.createReadStream(this.payload(id, file));
   }
-
-  requireStore(): SessionStore {
-    if (this.store === null) throw new Error("MfupEngine.startup() has not run");
-    return this.store;
+  snapshot(id: string) {
+    const row = this.row(id);
+    const totals = this.store.get<{ files: number; bytes: number }>(
+      "SELECT COUNT(*) AS files, COALESCE(SUM(size),0) AS bytes FROM nodes WHERE sid=? AND kind='file'",
+      id,
+    )!;
+    return {
+      id,
+      epoch: row.epoch,
+      state: row.state,
+      ...totals,
+      asks: this.questions(id),
+      published: JSON.parse(row.published) as string[],
+      clientPublish: Boolean(row.client_publish),
+      processing: row.hook_status,
+      overwrite: Boolean(row.overwrite),
+      overwriteRequired: this.needsOverwrite(row),
+      error:
+        this.runtime(id).failure ??
+        (row.failure ? (JSON.parse(row.failure) as Failure) : null),
+    };
   }
-
-  // -- recovery ----------------------------------------------------------------
-
-  /** Durable store (Redis): recover live sessions the store knows about. */
-  private async recoverFromStore(): Promise<void> {
-    const store = this.requireStore();
-    const registry = this.requireRegistry();
-    const aliveIds = await store.getNotExpired();
-    const expiredIds = await store.getExpired();
-    logger.info(`Startup: store has ${aliveIds.length} alive + ${expiredIds.length} expired session(s)`);
-    let recovered = 0;
-    for (const sid of aliveIds) {
-      const meta = await store.getMeta(sid);
-      if (!meta || !meta.stagingDir) {
-        logger.warn(`Startup: no meta for session ${sid}, skipping`);
-        continue;
-      }
-      const session = registry.recoverSession(sid, meta.stagingDir);
-      if (session) {
-        session.onExpiryChange = (s, e) => store.updateExpiry(s, e);
-        recovered += 1;
-      }
-    }
-    logger.info(`Startup: recovered ${recovered} session(s) from disk`);
+  private needsOverwrite(row: SessionRow) {
+    return (
+      !row.overwrite &&
+      Boolean(row.conflict) &&
+      !["cancelled", "published"].includes(row.state)
+    );
   }
-
-  /**
-   * Ephemeral store (memory): the store is empty after a restart, so
-   * re-discover sessions by scanning the base dir for staging directories —
-   * each carries its own state.sqlite with expiry, target and auth state.
-   * Live ones are recovered AND re-registered in the store; expired ones
-   * are reclaimed immediately.
-   */
-  private async recoverFromFilesystem(): Promise<void> {
-    const store = this.requireStore();
-    const registry = this.requireRegistry();
-    const cfg = this.cfg;
-    const dirs = await scanStagingDirs(cfg.baseDir, cfg.stagingPrefix, cfg.scanDepth);
-    if (dirs.length === 0) return;
-    logger.info(`Startup: found ${dirs.length} staging dir(s) on disk`);
-    let recovered = 0;
-    let reclaimed = 0;
-    for (const { sessionId: sid, stagingPath } of dirs) {
-      const session = registry.recoverSession(sid, stagingPath);
-      if (session === null) continue; // terminal/unreadable — reconcile handles it
-      const expired = new Date(session.expiresAt).getTime() <= Date.now();
-      if (expired) {
-        registry.remove(sid);
-        await fsp.rm(stagingPath, { recursive: true, force: true });
-        reclaimed += 1;
-        continue;
-      }
-      await store.register(sid, new Date(session.expiresAt), session.targetDir, stagingPath);
-      session.onExpiryChange = (s, e) => store.updateExpiry(s, e);
-      recovered += 1;
-    }
-    logger.info(`Startup: recovered ${recovered} session(s), reclaimed ${reclaimed} expired`);
+  questions(id: string) {
+    return this.needsOverwrite(this.row(id))
+      ? [
+          {
+            id: "overwrite",
+            message: "overwrite_required",
+            choices: ["overwrite", "cancel"],
+            answer: null,
+          },
+        ]
+      : [];
   }
-
-  // -- sweeper -----------------------------------------------------------------
-
-  private async sweepTick(): Promise<void> {
-    if (this.sweeping) return; // a slow pass must not overlap the next tick
-    this.sweeping = true;
+  recordFailure(id: string, error: unknown, phase: string) {
+    const e = normalizeError(error, phase);
+    if (e.status < 500) return e;
+    this.report(phase, id, error);
     try {
-      await this.sweep();
-      this.sweeps += 1;
-      if (this.sweeps % this.cfg.reconcileEvery === 0) {
-        const orphans = await reconcileOrphans(
-          this.cfg.baseDir,
-          this.requireRegistry(),
-          this.requireStore(),
-          this.cfg.stagingPrefix,
-          this.cfg.orphanGraceSeconds,
-          this.cfg.scanDepth,
+      const row = this.row(id),
+        r = this.runtime(id);
+      if (row.state === "cancelled") return e;
+      const failure: Failure = {
+        code: e.code,
+        status: e.status,
+        phase,
+        retryable: false,
+      };
+      r.failure ??= row.failure ? JSON.parse(row.failure) : failure;
+      try {
+        this.store.run(
+          "UPDATE sessions SET failure=? WHERE id=? AND failure=''",
+          JSON.stringify(r.failure),
+          id,
         );
-        if (orphans.length > 0) {
-          logger.warn(`Sweeper reconciled ${orphans.length} orphaned staging dir(s): ${orphans.join(", ")}`);
+      } catch {}
+      try {
+        this.emit(id);
+      } catch {}
+    } catch {}
+    return e;
+  }
+  private clearFailure(id: string) {
+    const row = this.row(id);
+    if (row.failure)
+      this.store.run("UPDATE sessions SET failure='' WHERE id=?", id);
+    this.runtime(id).failure = null;
+  }
+  subscribe(id: string, listener: (state: unknown) => void) {
+    this.row(id);
+    const runtime = this.runtime(id);
+    runtime.listeners.add(listener);
+    listener(this.snapshot(id));
+    return () => runtime.listeners.delete(listener);
+  }
+  private emit(id: string) {
+    const runtime = this.runtime(id);
+    if (!runtime.listeners.size) return;
+    const value = this.snapshot(id);
+    for (const fn of runtime.listeners) {
+      try {
+        fn(value);
+      } catch {}
+    }
+  }
+  private conflicts(id: string, row: SessionRow, name: string, kind: string) {
+    const r = this.runtime(id);
+    if (r.overwrite || r.conflict || row.overwrite || row.conflict) return;
+    const pieces = name.split("/");
+    for (let i = 1; i <= pieces.length; i++) {
+      const relative = pieces.slice(0, i).join("/"),
+        dest = this.destination(row, relative);
+      if (
+        fs.existsSync(dest) &&
+        ((i === pieces.length && kind === "file") ||
+          !fs.statSync(dest).isDirectory())
+      ) {
+        this.store.run(
+          "UPDATE sessions SET conflict=1 WHERE id=? AND overwrite=0",
+          id,
+        );
+        r.conflict = true;
+        return;
+      }
+    }
+  }
+  async setProperties(id: string, properties: { overwrite?: unknown }) {
+    check(
+      properties && typeof properties.overwrite === "boolean",
+      "bad_property",
+    );
+    const r = this.runtime(id);
+    await r.mutex.run(() => {
+      const row = this.row(id);
+      check(row.state !== "cancelled" && !r.transition, "bad_state", 409);
+      check(
+        !row.overwrite || properties.overwrite,
+        "overwrite_already_approved",
+        409,
+      );
+      if (Boolean(row.overwrite) !== properties.overwrite) {
+        this.store.run(
+          "UPDATE sessions SET overwrite=? WHERE id=?",
+          Number(properties.overwrite),
+          id,
+        );
+        r.overwrite = properties.overwrite as boolean;
+        this.touch(id);
+        this.emit(id);
+      }
+    });
+    const row = this.row(id);
+    if (
+      row.auto_publish &&
+      ["committed", "publishing"].includes(row.state) &&
+      ["none", "done"].includes(row.hook_status) &&
+      row.overwrite
+    ) {
+      try {
+        await this.publish(id);
+      } catch (e) {
+        if (!(e instanceof ProtocolError && e.code === "answers_required"))
+          throw e;
+      }
+    }
+    return this.snapshot(id);
+  }
+  async answer(id: string, question: string, choice: string) {
+    check(question === "overwrite", "unknown_question", 404);
+    check(["overwrite", "cancel"].includes(choice), "bad_choice");
+    return choice === "cancel"
+      ? this.cancel(id)
+      : this.setProperties(id, { overwrite: true });
+  }
+  async begin(
+    id: string,
+    epoch: number,
+    batchId: string,
+    abort: () => void,
+  ): Promise<Batch> {
+    identifier(batchId);
+    const r = this.runtime(id);
+    return r.mutex.run(() => {
+      const row = this.row(id);
+      check(!r.transition && row.state === "uploading", "bad_state", 409);
+      check(row.epoch === epoch, "stale_epoch", 409);
+      check(
+        r.active.size < this.limits.concurrency && !r.batches.has(batchId),
+        "busy",
+        429,
+      );
+      let finish!: () => void;
+      const done = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const active = { done, finish, abort };
+      r.active.add(active);
+      r.batches.add(batchId);
+      this.touch(id);
+      return { sid: id, epoch, id: batchId, active };
+    });
+  }
+  receipt(id: string, batchId: string) {
+    const row = this.store.get<{ receipt: string }>(
+      "SELECT receipt FROM batches WHERE sid=? AND id=?",
+      id,
+      identifier(batchId),
+    );
+    return row ? JSON.parse(row.receipt) : null;
+  }
+  async prepare(batch: Batch, raw: unknown) {
+    check(raw && typeof raw === "object", "bad_manifest");
+    const data = raw as Manifest;
+    check(
+      Array.isArray(data.files) &&
+        Array.isArray(data.dirs) &&
+        data.files.length + data.dirs.length > 0 &&
+        data.files.length + data.dirs.length <= this.limits.maxParts,
+      "bad_manifest",
+    );
+    const files: Part[] = data.files.map((item) => {
+      check(Array.isArray(item) && item.length === 5, "bad_manifest");
+      const p: Part = [
+        relativePath(item[0]),
+        integer(item[1]),
+        integer(item[2]),
+        integer(item[3]),
+        integer(item[4]),
+      ];
+      check(
+        p[3] % this.limits.partBytes === 0 &&
+          p[3] <= p[1] &&
+          p[4] === Math.min(this.limits.partBytes, p[1] - p[3]) &&
+          (p[4] > 0 || p[1] === 0),
+        "bad_range",
+      );
+      return p;
+    });
+    const dirs = data.dirs.map(relativePath);
+    check(
+      files.reduce((n, p) => n + p[4], 0) <= this.limits.batchBytes,
+      "batch_too_large",
+      413,
+    );
+    const signature = createHash("sha256")
+      .update(JSON.stringify({ files, dirs }))
+      .digest("hex");
+    const row = this.row(batch.sid);
+    return this.runtime(batch.sid).mutex.run(() => {
+      const r = this.runtime(batch.sid),
+        current = this.row(batch.sid);
+      check(current.epoch === batch.epoch, "stale_epoch", 409);
+      check(current.state === "uploading" && !r.transition, "bad_state", 409);
+      const old = this.store.get<{ signature: string; receipt: string }>(
+        "SELECT signature,receipt FROM batches WHERE sid=? AND id=?",
+        batch.sid,
+        batch.id,
+      );
+      if (old) {
+        check(old.signature === signature, "batch_conflict", 409);
+        return JSON.parse(old.receipt);
+      }
+      const keys = files.map((p) => `${p[0]}\0${p[3]}`);
+      check(
+        new Set(keys).size === keys.length &&
+          keys.every((k) => !r.ranges.has(k)),
+        "range_busy",
+        409,
+      );
+      const existing = this.store.all<NodeRow>(
+        "SELECT * FROM nodes WHERE sid=?",
+        batch.sid,
+      );
+      const nodes = new Map(existing.map((n) => [n.path, n]));
+      const destinations = new Map(
+        existing.map((n) => [n.destination.toLowerCase(), n]),
+      );
+      const spelling = new Map<string, string>();
+      const checkSpelling = (name: string) => {
+        const pieces = name.split("/");
+        for (let i = 1; i <= pieces.length; i++) {
+          const prefix = pieces.slice(0, i).join("/"),
+            key = prefix.toLowerCase();
+          check(
+            !spelling.has(key) || spelling.get(key) === prefix,
+            "path_conflict",
+            409,
+          );
+          spelling.set(key, prefix);
+        }
+      };
+      for (const n of existing) checkSpelling(n.destination);
+      const additions: NodeRow[] = [];
+      const add = (
+        name: string,
+        kind: NodeRow["kind"],
+        size: number,
+        mtime: number,
+        destination: string,
+      ) => {
+        const previous = nodes.get(name);
+        if (previous) {
+          check(
+            previous.kind === kind &&
+              previous.size === size &&
+              previous.mtime === mtime &&
+              previous.destination === destination,
+            "file_changed",
+            409,
+          );
+          return;
+        }
+        checkSpelling(destination);
+        const lower = destination.toLowerCase();
+        const conflict = destinations.get(lower);
+        check(!conflict, "path_conflict", 409);
+        for (let parent = lower; parent.includes("/");) {
+          parent = parent.slice(0, parent.lastIndexOf("/"));
+          check(
+            destinations.get(parent)?.kind !== "file",
+            "path_conflict",
+            409,
+          );
+        }
+        if (kind === "file")
+          check(
+            ![...destinations.keys()].some((p) => p.startsWith(lower + "/")),
+            "path_conflict",
+            409,
+          );
+        const n: NodeRow = {
+          path: name,
+          kind,
+          size,
+          mtime,
+          destination,
+          done: 0,
+        };
+        nodes.set(name, n);
+        destinations.set(lower, n);
+        additions.push(n);
+      };
+      for (const dir of dirs) add(dir, "directory", 0, 0, dir);
+      for (const p of files) add(p[0], "file", p[1], p[2], p[0]);
+      const fileNodes = [...nodes.values()].filter((n) => n.kind === "file");
+      check(
+        nodes.size <= row.max_files * 4 + 1024 &&
+          fileNodes.length <= row.max_files &&
+          fileNodes.reduce((n, f) => n + f.size, 0) <= row.max_bytes,
+        "quota_exceeded",
+        413,
+      );
+      this.store.transaction(() => {
+        for (const n of additions) {
+          this.store.run(
+            "INSERT INTO nodes(sid,path,kind,size,mtime,destination) VALUES(?,?,?,?,?,?)",
+            batch.sid,
+            n.path,
+            n.kind,
+            n.size,
+            n.mtime,
+            n.destination,
+          );
+          if (!row.map_files)
+            this.conflicts(batch.sid, row, n.destination, n.kind);
+        }
+      });
+      batch.manifest = { files, dirs };
+      batch.signature = signature;
+      batch.entries = files.map((item) => {
+        const filePath = this.payload(batch.sid, item[0]);
+        if (!fs.existsSync(filePath)) {
+          const fd = fs.openSync(filePath, "wx");
+          fs.closeSync(fd);
+        }
+        return {
+          item,
+          filePath,
+          skip: !!this.store.get(
+            "SELECT 1 FROM parts WHERE sid=? AND path=? AND offset=?",
+            batch.sid,
+            item[0],
+            item[3],
+          ),
+        };
+      });
+      for (const key of keys) r.ranges.add(key);
+      this.emit(batch.sid);
+      return null;
+    });
+  }
+  async complete(batch: Batch) {
+    return this.runtime(batch.sid).mutex.run(() => {
+      check(batch.manifest && batch.signature, "bad_manifest");
+      const row = this.row(batch.sid),
+        r = this.runtime(batch.sid);
+      check(
+        row.state === "uploading" && !r.transition && row.epoch === batch.epoch,
+        "bad_state",
+        409,
+      );
+      const receipt = {
+        id: batch.id,
+        parts: batch.manifest.files.length,
+        bytes: batch.manifest.files.reduce((sum, p) => sum + p[4], 0),
+      };
+      this.store.transaction(() => {
+        for (const p of batch.manifest!.files)
+          this.store.run(
+            "INSERT OR IGNORE INTO parts(sid,path,offset,length) VALUES(?,?,?,?)",
+            batch.sid,
+            p[0],
+            p[3],
+            p[4],
+          );
+        this.store.run(
+          "INSERT INTO batches(sid,id,signature,receipt) VALUES(?,?,?,?)",
+          batch.sid,
+          batch.id,
+          batch.signature!,
+          JSON.stringify(receipt),
+        );
+        this.touch(batch.sid);
+      });
+      return receipt;
+    });
+  }
+  end(batch: Batch) {
+    const r = this.runtime(batch.sid);
+    for (const p of batch.manifest?.files ?? [])
+      r.ranges.delete(`${p[0]}\0${p[3]}`);
+    r.batches.delete(batch.id);
+    r.active.delete(batch.active);
+    batch.active.finish();
+  }
+  async resume(id: string) {
+    const r = this.runtime(id);
+    const active = await r.mutex.run(() => {
+      const row = this.row(id);
+      check(
+        !r.transition &&
+          ["uploading", "committed", "publishing", "published"].includes(
+            row.state,
+          ),
+        "bad_state",
+        409,
+      );
+      r.transition = true;
+      return [...r.active];
+    });
+    await Promise.all(active.map((a) => a.done));
+    return r.mutex.run(() => {
+      try {
+        this.clearFailure(id);
+        this.store.run("UPDATE sessions SET epoch=epoch+1 WHERE id=?", id);
+        this.touch(id);
+        return { ...this.snapshot(id), limits: this.limits };
+      } finally {
+        r.transition = false;
+      }
+    });
+  }
+  resumePage(id: string, after = "", limit = 256) {
+    this.row(id);
+    limit = Math.max(1, Math.min(integer(limit), 256));
+    const files = this.store.all<NodeRow>(
+      "SELECT * FROM nodes WHERE sid=? AND kind='file' AND path>? ORDER BY path LIMIT ?",
+      id,
+      after,
+      limit,
+    );
+    return {
+      files: files.map((f) => ({
+        path: f.path,
+        size: f.size,
+        mtime: f.mtime,
+        offsets: this.store
+          .all<{ offset: number }>(
+            "SELECT offset FROM parts WHERE sid=? AND path=? ORDER BY offset",
+            id,
+            f.path,
+          )
+          .map((p) => p.offset),
+      })),
+      next: files.length === limit ? files.at(-1)!.path : null,
+    };
+  }
+  async commit(
+    id: string,
+    totals: { files: number; dirs: number; bytes: number },
+  ) {
+    let newlyCommitted = false;
+    await this.runtime(id).mutex.run(() => {
+      const row = this.row(id),
+        r = this.runtime(id);
+      if (["committed", "published"].includes(row.state))
+        return this.snapshot(id);
+      check(
+        row.state === "uploading" && !r.transition && r.active.size === 0,
+        "busy",
+        409,
+      );
+      const files = this.store.all<NodeRow>(
+        "SELECT * FROM nodes WHERE sid=? AND kind='file'",
+        id,
+      );
+      const dirs = this.store.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM nodes WHERE sid=? AND kind='directory'",
+        id,
+      )!.n;
+      check(
+        integer(totals.files) === files.length &&
+          integer(totals.dirs) === dirs &&
+          integer(totals.bytes) === files.reduce((n, f) => n + f.size, 0),
+        "scan_mismatch",
+        409,
+      );
+      for (const f of files) {
+        const p = this.store.get<{ n: number; bytes: number }>(
+          "SELECT COUNT(*) AS n,COALESCE(SUM(length),0) AS bytes FROM parts WHERE sid=? AND path=?",
+          id,
+          f.path,
+        )!;
+        check(
+          p.n === Math.max(1, Math.ceil(f.size / this.limits.partBytes)) &&
+            p.bytes === f.size,
+          "incomplete",
+          409,
+        );
+      }
+      this.store.run("UPDATE sessions SET state='committed' WHERE id=?", id);
+      this.touch(id);
+      newlyCommitted = true;
+      this.emit(id);
+      return this.snapshot(id);
+    });
+    if (newlyCommitted) return this.retryCommitted(id);
+    if (this.runtime(id).processing) await this.runtime(id).processing;
+    return this.snapshot(id);
+  }
+  async retryCommitted(id: string) {
+    const r = this.runtime(id);
+    if (r.processing) {
+      await r.processing;
+      return this.snapshot(id);
+    }
+    const task = (async () => {
+      const row = await r.mutex.run(() => {
+        const row = this.row(id);
+        check(row.state === "committed" && !r.transition, "bad_state", 409);
+        if (!["none", "done"].includes(row.hook_status)) {
+          this.store.run(
+            "UPDATE sessions SET hook_status='running' WHERE id=?",
+            id,
+          );
+          this.emit(id);
+        }
+        return row;
+      });
+      let auto = Boolean(row.auto_publish);
+      if (!["none", "done"].includes(row.hook_status)) {
+        try {
+          check(this.options.onCommitted, "hook_unavailable", 503);
+          const decision = await this.options.onCommitted(this.getSession(id));
+          if (this.row(id).state === "cancelled") return;
+          check(
+            decision === undefined || typeof decision === "boolean",
+            "bad_hook_result",
+          );
+          if (decision !== undefined) auto = decision;
+          this.store.run(
+            "UPDATE sessions SET hook_status='done',auto_publish=? WHERE id=?",
+            Number(auto),
+            id,
+          );
+        } catch (error) {
+          if (this.row(id).state === "cancelled") return;
+          this.store.run(
+            "UPDATE sessions SET hook_status='failed' WHERE id=?",
+            id,
+          );
+          this.report("onCommitted", id, error);
+          this.emit(id);
+          return;
         }
       }
-    } catch (exc) {
-      logger.error(`Sweeper error: ${exc}`);
+      if (auto && this.row(id).state !== "published") {
+        try {
+          await this.publish(id);
+        } catch (error) {
+          if (!(
+            error instanceof ProtocolError && error.code === "answers_required"
+          ))
+            this.report("publish", id, error);
+        }
+      }
+      this.emit(id);
+    })();
+    r.processing = task;
+    try {
+      await task;
+      return this.snapshot(id);
     } finally {
-      this.sweeping = false;
+      r.processing = undefined;
     }
   }
-
-  /** Remove expired sessions (staging dir + store entry). Returns their ids. */
-  async sweep(): Promise<string[]> {
-    const registry = this.requireRegistry();
-    const store = this.requireStore();
-    const expiredIds = await store.getExpired();
-    const removed: string[] = [];
-    for (const sid of expiredIds) {
-      const meta = await store.getMeta(sid);
-      registry.remove(sid);
-      const sd =
-        meta && meta.stagingDir
-          ? meta.stagingDir
-          : stagingDir(this.cfg.baseDir, sid, this.cfg.stagingPrefix);
-      if (fs.existsSync(sd)) {
-        await fsp.rm(sd, { recursive: true, force: true });
-      }
-      await store.remove(sid);
-      removed.push(sid);
-      logger.info(`Sweeper cleaned session ${sid} (staging=${sd})`);
+  private async preparePlan(id: string) {
+    const r = this.runtime(id);
+    if (r.planning) {
+      await r.planning;
+      return this.snapshot(id);
     }
-    if (removed.length > 0) {
-      logger.info(`Sweeper removed ${removed.length} sessions`);
+    const task = (async () => {
+      const row = await r.mutex.run(() => {
+        const row = this.row(id);
+        check(
+          ["committed", "publishing", "published"].includes(row.state) &&
+            !r.transition,
+          "bad_state",
+          409,
+        );
+        return row;
+      });
+      if (row.state === "published") return;
+      if (row.map_files && !row.mapped) {
+        check(this.options.mapFile, "hook_unavailable", 503);
+        const files = this.store.all<NodeRow>(
+          "SELECT * FROM nodes WHERE sid=? AND kind='file' ORDER BY path",
+          id,
+        );
+        const plan: { path: string; destination: string }[] = [];
+        try {
+          for (const f of files) {
+            const dest = await this.options.mapFile({
+              sessionId: id,
+              path: f.path,
+              name: f.path.split("/").at(-1)!,
+              size: f.size,
+              targetDir: row.target,
+              context: JSON.parse(row.context),
+              meta: JSON.parse(row.meta),
+            });
+            plan.push({
+              path: f.path,
+              destination: relativePath(dest === null ? f.path : dest),
+            });
+          }
+          const names = new Set<string>(),
+            spelling = new Map<string, string>();
+          for (const f of plan) {
+            const lower = f.destination.toLowerCase();
+            check(!names.has(lower), "mapping_error", 409);
+            names.add(lower);
+            const parts = f.destination.split("/");
+            for (let i = 1; i <= parts.length; i++) {
+              const prefix = parts.slice(0, i).join("/"),
+                key = prefix.toLowerCase();
+              check(
+                !spelling.has(key) || spelling.get(key) === prefix,
+                "mapping_error",
+                409,
+              );
+              spelling.set(key, prefix);
+            }
+          }
+          for (const f of plan) {
+            const parts = f.destination.toLowerCase().split("/");
+            for (let i = 1; i < parts.length; i++)
+              check(
+                !names.has(parts.slice(0, i).join("/")),
+                "mapping_error",
+                409,
+              );
+          }
+        } catch (error) {
+          this.report("mapFile", id, error);
+          throw new ProtocolError(409, "mapping_error");
+        }
+        await r.mutex.run(() => {
+          check(
+            this.row(id).state === "committed" && !r.transition,
+            "bad_state",
+            409,
+          );
+          this.store.transaction(() => {
+            for (const f of plan)
+              this.store.run(
+                "UPDATE nodes SET destination=? WHERE sid=? AND path=?",
+                f.destination,
+                id,
+                f.path,
+              );
+            this.store.run("UPDATE sessions SET mapped=1 WHERE id=?", id);
+          });
+        });
+      }
+    })();
+    r.planning = task;
+    try {
+      await task;
+      return this.snapshot(id);
+    } finally {
+      r.planning = undefined;
+    }
+  }
+  async preparePublish(id: string) {
+    await this.preparePlan(id);
+    const r = this.runtime(id);
+    await r.mutex.run(() => {
+      const current = this.row(id);
+      const nodes = this.store.all<NodeRow>(
+        "SELECT * FROM nodes WHERE sid=?",
+        id,
+      );
+      for (const n of nodes) {
+        if (current.map_files && n.kind === "directory") continue;
+        if (
+          !n.done &&
+          (n.kind === "directory" || fs.existsSync(this.payload(id, n.path)))
+        )
+          this.conflicts(id, current, n.destination, n.kind);
+      }
+      this.touch(id);
+      this.emit(id);
+    });
+    return this.snapshot(id);
+  }
+  async publishFromClient(id: string) {
+    const allowed = () => {
+      const row = this.row(id);
+      check(Boolean(row.client_publish), "server_publish_only", 403);
+      check(
+        ["none", "done"].includes(row.hook_status),
+        "processing_required",
+        409,
+      );
+    };
+    allowed();
+    return this.publish(id, allowed);
+  }
+  async publish(id: string, beforeMove?: () => void) {
+    try {
+      this.clearFailure(id);
+      return await this.publishImpl(id, beforeMove);
+    } catch (error) {
+      throw this.recordFailure(id, error, "publish");
+    }
+  }
+  private async publishImpl(id: string, beforeMove?: () => void) {
+    await this.preparePlan(id);
+
+    return this.publishLock.run(() =>
+      this.runtime(id).mutex.run(async () => {
+        beforeMove?.();
+        const row = this.row(id),
+          r = this.runtime(id);
+        if (row.state === "published") return this.snapshot(id);
+        check(
+          ["committed", "publishing"].includes(row.state) &&
+            !r.transition &&
+            r.active.size === 0,
+          "bad_state",
+          409,
+        );
+        const nodes = this.store
+          .all<NodeRow>("SELECT * FROM nodes WHERE sid=? ORDER BY path", id)
+          .filter((n) => !row.map_files || n.kind === "file");
+        for (const n of nodes.filter((n) => !n.done)) {
+          const present =
+            n.kind === "directory" || fs.existsSync(this.payload(id, n.path));
+          if (!present && row.state === "committed")
+            throw new ProtocolError(
+              503,
+              "storage_unavailable",
+              "Accepted file is unavailable",
+              false,
+              "publish",
+            );
+          if (present) this.conflicts(id, row, n.destination, n.kind);
+        }
+        if (this.questions(id).some((q) => q.answer === null)) {
+          this.emit(id);
+          throw new ProtocolError(409, "answers_required");
+        }
+        const ensureDirectory = async (name: string) => {
+          const pieces = name.split("/").filter(Boolean);
+          for (let i = 1; i <= pieces.length; i++) {
+            const relative = pieces.slice(0, i).join("/"),
+              dest = this.destination(row, relative);
+            if (fs.existsSync(dest) && !fs.statSync(dest).isDirectory()) {
+              check(Boolean(row.overwrite), "answers_required", 409);
+              await fsp.rm(dest, { force: true });
+            }
+            await fsp.mkdir(dest, { recursive: true });
+          }
+        };
+        this.store.run("UPDATE sessions SET state='publishing' WHERE id=?", id);
+        for (const n of nodes) {
+          if (n.done) continue;
+          const dest = this.destination(row, n.destination);
+          if (n.kind === "directory") {
+            await ensureDirectory(n.destination);
+          } else {
+            const parent = n.destination.includes("/")
+              ? n.destination.slice(0, n.destination.lastIndexOf("/"))
+              : "";
+            await fsp.mkdir(this.destination(row, ""), { recursive: true });
+            await ensureDirectory(parent);
+            const source = this.payload(id, n.path);
+            if (fs.existsSync(source)) {
+              if (fs.existsSync(dest)) {
+                check(Boolean(row.overwrite), "answers_required", 409);
+                if (fs.statSync(dest).isDirectory())
+                  await fsp.rm(dest, { recursive: true, force: true });
+              }
+              await fsp.rename(source, dest);
+            } else check(fs.existsSync(dest), "missing_payload", 409);
+          }
+        }
+        const published = nodes
+          .filter((n) => n.kind === "file")
+          .map((n) => n.destination);
+        // The saved plan plus source/destination presence recover interrupted renames.
+        // Finish metadata in one transaction, avoiding a WAL commit per file.
+        this.store.transaction(() => {
+          this.store.run("UPDATE nodes SET done=1 WHERE sid=?", id);
+          this.store.run(
+            "UPDATE sessions SET state='published',published=? WHERE id=?",
+            JSON.stringify(published),
+            id,
+          );
+          this.touch(id);
+        });
+        await fsp.rm(this.staging(id), { recursive: true, force: true });
+        this.emit(id);
+        return this.snapshot(id);
+      }),
+    );
+  }
+  async cancel(id: string) {
+    const r = this.runtime(id);
+    if (r.cancelling) {
+      await r.cancelling;
+      return this.snapshot(id);
+    }
+    const task = this.cancelImpl(id);
+    r.cancelling = task;
+    try {
+      return await task;
+    } finally {
+      r.cancelling = undefined;
+    }
+  }
+  private async cancelImpl(id: string) {
+    const r = this.runtime(id);
+    const active = await r.mutex.run(() => {
+      const row = this.row(id);
+      if (row.state === "published" || row.state === "cancelled") return [];
+      check(!r.transition, "busy", 409);
+      this.store.run("UPDATE sessions SET state='cancelled' WHERE id=?", id);
+      r.transition = true;
+      for (const a of r.active) a.abort();
+      this.touch(id);
+      this.emit(id);
+      return [...r.active];
+    });
+    await Promise.allSettled(active.map((a) => a.done));
+    if (this.row(id).state === "published") return this.snapshot(id);
+    r.transition = false;
+    const cleanup = async () => {
+      try {
+        await fsp.rm(this.staging(id), { recursive: true, force: true });
+      } catch (error) {
+        this.report("cancel_cleanup", id, error);
+      }
+    };
+    const callbacks = [r.processing, r.planning].filter(Boolean);
+    if (callbacks.length) {
+      const task = Promise.allSettled(callbacks).then(cleanup);
+      this.cleanups.add(task);
+      void task.finally(() => this.cleanups.delete(task));
+    } else await cleanup();
+    return this.snapshot(id);
+  }
+  async sweep(now = Date.now()) {
+    const candidates = this.store.all<{ id: string }>(
+      "SELECT id FROM sessions WHERE expires<=?",
+      now,
+    );
+    let removed = 0;
+    for (const { id } of candidates) {
+      const r = this.runtime(id);
+      await r.mutex.run(async () => {
+        const row = this.store.get<SessionRow>(
+          "SELECT * FROM sessions WHERE id=?",
+          id,
+        );
+        if (
+          !row ||
+          row.expires > now ||
+          r.active.size ||
+          r.transition ||
+          r.planning ||
+          r.processing ||
+          r.listeners.size
+        )
+          return;
+        r.transition = true;
+        try {
+          await fsp.rm(this.staging(id), { recursive: true, force: true });
+          this.store.run("DELETE FROM sessions WHERE id=?", id);
+          this.runtimes.delete(id);
+          removed++;
+        } finally {
+          r.transition = false;
+        }
+      });
     }
     return removed;
   }
-
-  // -- programmatic publish ----------------------------------------------------
-
-  /**
-   * Publish a committed session server-side (consumer backends and the
-   * onCommitted auto-publish path). Throws typed PublishError subclasses;
-   * ConflictError/MappingError pass through.
-   */
-  async publish(sessionId: string): Promise<string[]> {
-    const registry = this.requireRegistry();
-    const session = registry.get(sessionId);
-    if (session === null) {
-      throw new SessionNotFound(sessionId);
-    }
-    if (session.state !== SessionState.COMMITTED) {
-      throw new NotCommitted(session.state);
-    }
-
-    const target = path.isAbsolute(session.targetDir)
-      ? session.targetDir
-      : path.join(session.baseDir, session.targetDir);
-
-    // Defense in depth: verify the target stays within the session's base dir
-    if (!isSafeTarget(session.baseDir, session.targetDir)) {
-      throw new TargetEscapes(session.targetDir);
-    }
-
-    let published: string[];
-    if (this.cfg.mapFile !== null) {
-      // Per-file layout is the consumer's: run the (async) hook per file
-      // first, then hand the precomputed plan to the mover.
-      const files = await listPayloadFiles(session.baseDir, sessionId, this.cfg.stagingPrefix);
-      const mapping: Record<string, string> = {};
-      for (const [rel, size] of files) {
-        let mapped: string | null | undefined;
-        try {
-          mapped = await this.cfg.mapFile({
-            sessionId,
-            path: rel,
-            name: rel.split("/").pop() ?? rel,
-            size,
-            targetDir: session.targetDir,
-            meta: session.clientMeta,
-            context: session.authContext,
-          } satisfies FileMapRequest);
-        } catch (exc) {
-          logger.error(`mapFile hook raised for ${sessionId} (${rel}): ${exc}`);
-          throw new MapFileHookError(rel);
-        }
-        if (mapped !== null && mapped !== undefined) {
-          mapping[rel] = mapped;
-        }
-      }
-      published = await publishSessionMapped(
-        session.baseDir,
-        sessionId,
-        target,
-        mapping,
-        this.cfg.stagingPrefix,
-        session.publishAction,
-      );
-    } else {
-      published = await publishSession(
-        session.baseDir,
-        sessionId,
-        target,
-        this.cfg.stagingPrefix,
-        session.publishAction,
-      );
-    }
-
-    registry.remove(sessionId);
-    await this.requireStore().remove(sessionId);
-    return published;
-  }
-
-  // -- onCommitted -------------------------------------------------------------
-
-  /**
-   * Fire the consumer's onCommitted hook once per commit. A hook error must
-   * never damage the session; a "publish" return triggers server-side
-   * publish immediately.
-   */
-  private async afterCommit(session: LiveSession, result: { files: number; bytes: number }): Promise<void> {
-    if (this.cfg.onCommitted === null) return;
-    const sd = stagingDir(session.baseDir, session.sessionId, this.cfg.stagingPrefix);
-    let verdict: string | null | undefined;
-    try {
-      verdict = await this.cfg.onCommitted({
-        sessionId: session.sessionId,
-        targetDir: session.targetDir,
-        baseDir: session.baseDir,
-        stagingDir: sd,
-        files: result.files,
-        bytes: result.bytes,
-        meta: session.clientMeta,
-        context: session.authContext,
-      } satisfies CommitEvent);
-    } catch (exc) {
-      logger.error(`onCommitted hook raised for session ${session.sessionId}: ${exc}`);
-      return;
-    }
-    if (verdict === "publish") {
-      try {
-        const published = await this.publish(session.sessionId);
-        logger.info(`onCommitted auto-published session ${session.sessionId}: ${published.join(", ")}`);
-      } catch (exc) {
-        logger.error(`onCommitted auto-publish failed for session ${session.sessionId}: ${exc}`);
-      }
-    }
-  }
-
-  /** tryCommit + onCommitted, so no call site can forget the hook. */
-  async tryCommit(session: LiveSession): Promise<{ files: number; bytes: number } | null> {
-    const result = await session.tryCommit();
-    if (result !== null && session.state === SessionState.COMMITTED) {
-      await this.afterCommit(session, result);
-    }
-    return result;
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    clearInterval(this.timer);
+    const all = [...this.runtimes.values()].flatMap((r) => [...r.active]);
+    for (const a of all) a.abort();
+    await Promise.all(all.map((a) => a.done));
+    await Promise.allSettled(
+      [...this.runtimes.values()].flatMap((r) =>
+        [r.processing, r.planning].filter(Boolean),
+      ),
+    );
+    await Promise.allSettled(
+      [...this.runtimes.values()].flatMap((r) =>
+        r.cancelling ? [r.cancelling] : [],
+      ),
+    );
+    await Promise.allSettled(this.cleanups);
+    this.store.close();
   }
 }
-
-export { ConflictError, MappingError };

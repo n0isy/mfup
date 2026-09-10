@@ -1,0 +1,16 @@
+:80 {
+    redir /python /python/
+    handle /python/api/* {
+        uri strip_prefix /python
+        reverse_proxy python:8090
+    }
+    handle /python/* {
+        reverse_proxy client-python:3000
+    }
+    handle /api/* {
+        reverse_proxy node:3001
+    }
+    handle {
+        reverse_proxy client:3000
+    }
+}

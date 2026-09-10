@@ -1,122 +1,117 @@
-# Release: build + publish all five packages on a version tag (v0.2.0, …).
-#
-# NO long-lived tokens anywhere — both registries use OIDC trusted publishing.
-#
-# One-time setup before the first release:
-#   - PyPI (works for FIRST publish): pypi.org → Account → Publishing →
-#     "Add a new pending publisher" TWICE (mfup-core, mfup-fastapi) with:
-#     owner=n0isy, repository=mfup, workflow=release.yml, environment=release.
-#     The first tag then CREATES the projects via OIDC.
-#   - npm has no "pending publisher": the FIRST publish of each npm package
-#     (@mfup/client, @mfup/react, @mfup/server) must be done manually once
-#     (npm login with 2FA; from repo root:
-#     npm publish -w @mfup/<name> --access public).
-#     Then on npmjs.com for EACH package: Settings → Publishing access →
-#     add Trusted Publisher (GitHub Actions: n0isy/mfup, release.yml,
-#     environment release) and select "Require two-factor authentication
-#     and disallow tokens". Subsequent tags publish via OIDC below.
-#     The publish loop below skips packages that do not exist on the
-#     registry yet, so an unpublished package never fails a release.
-#
-# Also create the "release" GitHub environment (Settings → Environments).
-# Versions: keep package.json / pyproject.toml versions == the tag.
-
 name: release
-
 on:
   push:
-    tags: ["v*"]
+    tags: ["v3.*"]
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
   build:
+    needs: checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - name: Build npm packages
-        run: |
-          npm ci
-          npm run build
-          mkdir -p dist-npm    # npm pack does not create the destination
-          npm pack -w @mfup/client -w @mfup/react -w @mfup/server --pack-destination dist-npm
-
-      - uses: actions/setup-python@v5
+          node-version: "24"
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
-      - name: Build Python packages
-        run: |
-          pip install build twine
-          python -m build server/mfup-core -o dist-py
-          python -m build server/mfup-fastapi -o dist-py
-          twine check dist-py/*
-
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - run: npm run check
+      - run: npm test
+      - run: npm run pack:check
+      - run: python -m pip install build twine ./server/mfup-core "./server/mfup-fastapi[dev]"
+      - run: python -m pytest server/tests -q
+      - name: Check tag versions
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python scripts/check-version.py "${GITHUB_REF_NAME#v}"
+      - run: mkdir -p dist-npm dist-py
+      - run: npm pack -w @mfup/client -w @mfup/react -w @mfup/server --pack-destination dist-npm
+      - run: python scripts/build-python.py dist-py
+      - run: twine check dist-py/*
+      - run: python scripts/check-artifacts.py dist-npm dist-py
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-npm
+          name: npm
           path: dist-npm/
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-py
+          name: python
           path: dist-py/
-
-  publish-npm:
+  npm:
     needs: build
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
     environment: release
     permissions:
-      id-token: write   # npm trusted publishing (OIDC) — no NPM_TOKEN
       contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: 24        # trusted publishing needs Node >= 22.14
+          node-version: "24"
           registry-url: https://registry.npmjs.org
-      - name: Ensure npm >= 11.5.1 (OIDC support)
-        run: npm install -g npm@latest && npm --version
-      - name: Publish npm packages (OIDC, provenance auto)
-        # Skip versions already on the registry — reruns and partial releases
-        # must be idempotent, and 0.2.0 was first-published manually anyway.
-        # A package with NO releases at all is skipped too: npm cannot create
-        # a package via OIDC, so its first publish is manual (see header).
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm
+          path: dist-npm
+      - run: npm install -g npm@11 --no-audit --no-fund
+      - name: Publish built artifacts
         run: |
-          npm ci
-          npm run build
-          for dir in client react server; do
-            pkg="@mfup/$dir"
-            v=$(node -p "require('./packages/$dir/package.json').version")
-            if npm view "$pkg@$v" version >/dev/null 2>&1; then
-              echo "$pkg@$v already published — skipping"
-            elif ! npm view "$pkg" name >/dev/null 2>&1; then
-              echo "::warning::$pkg has never been published — first publish is manual, skipping"
+          for artifact in dist-npm/*.tgz; do
+            name=$(tar -xOf "$artifact" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).name')
+            version=$(tar -xOf "$artifact" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).version')
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version already exists"
             else
-              npm publish -w "$pkg" --access public
+              npm publish "$artifact" --access public --tag latest --provenance
             fi
           done
-
-  publish-pypi:
+  pypi:
     needs: build
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
     environment: release
     permissions:
-      id-token: write   # PyPI trusted publishing (OIDC)
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist-py
-          path: dist-py/
+          name: python
+          path: dist-py
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-py/
-          # Idempotent reruns: files already on PyPI are skipped, not fatal
-          # (e.g. re-running after adding the second pending publisher).
           skip-existing: true
+
+  verify:
+    needs: [npm, pypi]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python scripts/verify-registry.py "${GITHUB_REF_NAME#v}"
+      - name: Install public npm packages and run their consumer
+        run: |
+          mkdir -p /tmp/mfup-registry-check
+          cd /tmp/mfup-registry-check
+          npm init -y
+          npm install --no-audit --no-fund @mfup/client@3.0.0 @mfup/react@3.0.0 @mfup/server@3.0.0 react@18
+          cp "$GITHUB_WORKSPACE/scripts/consumer-node-check.mjs" check.mjs
+          cp "$GITHUB_WORKSPACE/examples/multiuser-scopes-node/server/server.mjs" example-server.mjs
+          node check.mjs
+      - name: Install public Python packages and run their consumer
+        run: |
+          python -m pip install mfup-core==3.0.0 mfup-fastapi==3.0.0 httpx
+          python scripts/pack-python-check.py

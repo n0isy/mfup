@@ -1,44 +1,13 @@
-# multiuser-scopes — Node edition
+# Anonymous users and application zones — Node
 
-The same consumer example as [`../multiuser-scopes`](../multiuser-scopes),
-with the Python/FastAPI server swapped for **express + `@mfup/server`**
-(installed from npm, the way an outside integrator would). The React client
-is literally the same directory — it only talks HTTP/WS, and both servers
-speak the same protocol.
+This example uses public MFUP/3 packages, an anonymous cookie and a shared React client. Identity, zone selection and destination roots are application rules implemented in authorize. Scope is an ordinary meta field.
 
-Differences from the Python edition:
-
-| | Python (`:20061`) | Node (`:20062`) |
-|---|---|---|
-| Server | FastAPI + `mfup-fastapi` (PyPI) | express + `@mfup/server` (npm) |
-| Session store | Redis (required) | **memory** — no Redis at all; restart recovery via a staging-dir scan |
-| MFUP wiring | `app.include_router(engine.router, prefix="/api/mfup")` | `app.use("/api/mfup", mfup.middleware)` + `mfup.attach(server)` |
-| Data on host | `./uploads/<uid>/<scope>/` | `./uploads-node/<uid>/<scope>/` |
-
-Run (from the repo root):
+From the repository root after installing dependencies and building:
 
 ```bash
-docker compose up -d server-node client-node
-# → http://localhost:20062
+node examples/multiuser-scopes-node/server/server.mjs
 ```
 
-Or natively (server needs **Node ≥ 22.13** — `node:sqlite`):
+The backend exposes the MFUP adapter under /api and application routes /api/whoami, /api/files/{scope} and /api/file/{scope}. It validates identity for uploads, listings and downloads. Lifecycle manages session cleanup. See the [example guide](../README.md) for the client, Docker, data layout and configuration.
 
-```bash
-# Terminal 1 — server (:8091; data lands in ./data/<uid>/<scope>/,
-# override with DEMO_DATA_DIR; set REDIS_URL to switch to the Redis store)
-cd examples/multiuser-scopes-node/server
-npm install
-node server.mjs
-
-# Terminal 2 — the shared client from the Python edition
-cd examples/multiuser-scopes/client
-npm install
-EXAMPLE_BACKEND_URL=http://localhost:8091 npm run dev -- --port 20062
-```
-
-Then poke the interactive parts: cancel mid-upload (single click, instant),
-drop the same folder twice (the server ASKs — Overwrite / Cancel — while the
-transfer keeps running), and restart the server mid-upload (the client
-reconnects and resumes; with the memory store the session is re-discovered
-from its staging directory on disk).
+[Russian](README_ru.md)

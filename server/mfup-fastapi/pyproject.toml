@@ -1,45 +1,32 @@
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
 [project]
 name = "mfup-fastapi"
-version = "0.2.0"
-description = "FastAPI integration for the MFUP/2 upload engine: MfupEngine + APIRouter you mount into your own app, or a ready-to-run standalone server."
+version = "3.0.0"
+description = "MFUP/3 FastAPI adapter with streaming multipart and WebSocket questions"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
 authors = [{ name = "n0isy" }]
-keywords = ["upload", "resumable", "multi-file", "fastapi", "mfup"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Framework :: FastAPI",
-    "Topic :: Internet :: WWW/HTTP",
-    "Typing :: Typed",
-]
-dependencies = [
-    "mfup-core==0.2.0",
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.30.0",
-    "websockets>=13.0",
-]
+requires-python = ">=3.10"
+dependencies = ["mfup-core==3.0.0", "fastapi>=0.115", "uvicorn[standard]>=0.30", "python-multipart>=0.0.20"]
+[project.scripts]
+mfup-server = "mfup_fastapi.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "httpx"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.28"]
+[tool.hatch.build.targets.wheel]
+packages = ["mfup_fastapi"]
 
 [project.urls]
 Homepage = "https://github.com/n0isy/mfup"
 Repository = "https://github.com/n0isy/mfup"
 Issues = "https://github.com/n0isy/mfup/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["mfup_fastapi"]
+[tool.hatch.build.targets.sdist]
+include = ["/mfup_fastapi", "/pyproject.toml", "/README.md", "/README_ru.md", "/LICENSE"]
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
+[tool.hatch.build]
+ignore-vcs = true
+exclude = ["**/__pycache__/**", "**/*.py[cod]"]

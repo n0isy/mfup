@@ -1,444 +1,73 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>MFUP/2 Upload Demo</title>
-<style>
-  :root {
-    --bg: #0b0e14;
-    --surface: #131820;
-    --border: #1e2530;
-    --text: #c5cdd9;
-    --text-dim: #6b7a8d;
-    --accent: #3b82f6;
-    --accent-glow: #3b82f640;
-    --green: #22c55e;
-    --red: #ef4444;
-    --orange: #f59e0b;
-    --radius: 12px;
-  }
-
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  body {
-    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 40px 20px;
-  }
-
-  h1 {
-    font-size: 1.4rem;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    margin-bottom: 6px;
-  }
-  h1 span { color: var(--accent); }
-
-  .subtitle {
-    font-size: 0.75rem;
-    color: var(--text-dim);
-    margin-bottom: 32px;
-  }
-
-  /* ---- drop zone ---- */
-  #dropzone {
-    width: 100%;
-    max-width: 640px;
-    min-height: 220px;
-    border: 2px dashed var(--border);
-    border-radius: var(--radius);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    cursor: pointer;
-    transition: all 0.2s;
-    position: relative;
-    background: var(--surface);
-  }
-  #dropzone.dragover {
-    border-color: var(--accent);
-    box-shadow: 0 0 40px var(--accent-glow);
-    background: #131820ee;
-  }
-  #dropzone.uploading {
-    pointer-events: none;
-    border-style: solid;
-    border-color: var(--accent);
-  }
-  #dropzone .icon { font-size: 2.4rem; opacity: 0.5; }
-  #dropzone .label { font-size: 0.85rem; color: var(--text-dim); }
-  #dropzone .label b { color: var(--accent); cursor: pointer; }
-  #dropzone input[type="file"] { display: none; }
-
-  /* ---- progress panel ---- */
-  #progress {
-    width: 100%;
-    max-width: 640px;
-    margin-top: 24px;
-    display: none;
-  }
-  #progress.visible { display: block; }
-
-  .progress-bar-track {
-    width: 100%;
-    height: 6px;
-    background: var(--border);
-    border-radius: 3px;
-    overflow: hidden;
-    margin-bottom: 16px;
-  }
-  .progress-bar-fill {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, var(--accent), #60a5fa);
-    border-radius: 3px;
-    transition: width 0.3s ease;
-  }
-  .progress-bar-fill.done {
-    background: linear-gradient(90deg, var(--green), #4ade80);
-  }
-  .progress-bar-fill.error {
-    background: linear-gradient(90deg, var(--red), #f87171);
-  }
-
-  .stats {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    margin-bottom: 16px;
-  }
-  .stat {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px 14px;
-  }
-  .stat .stat-label {
-    font-size: 0.65rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-dim);
-    margin-bottom: 4px;
-  }
-  .stat .stat-value {
-    font-size: 1.1rem;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
-  .stat .stat-value.accent { color: var(--accent); }
-  .stat .stat-value.green { color: var(--green); }
-
-  /* ---- status badge ---- */
-  .status-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 14px;
-  }
-  .badge {
-    display: inline-block;
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 3px 10px;
-    border-radius: 20px;
-    border: 1px solid;
-  }
-  .badge.active       { color: var(--accent);  border-color: var(--accent);  background: #3b82f615; }
-  .badge.committing   { color: var(--orange);  border-color: var(--orange);  background: #f59e0b15; }
-  .badge.committed    { color: var(--green);   border-color: var(--green);   background: #22c55e15; }
-  .badge.failed,
-  .badge.aborted      { color: var(--red);     border-color: var(--red);     background: #ef444415; }
-  .badge.waiting_resume,
-  .badge.paused_by_server { color: var(--orange); border-color: var(--orange); background: #f59e0b15; }
-
-  .session-id {
-    font-size: 0.65rem;
-    color: var(--text-dim);
-    font-family: monospace;
-  }
-
-  /* ---- error panel ---- */
-  #errors {
-    width: 100%;
-    max-width: 640px;
-    margin-top: 16px;
-    display: none;
-  }
-  #errors.visible { display: block; }
-  #errors .errors-header {
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--red);
-    margin-bottom: 8px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  #errors .errors-header .error-count {
-    background: var(--red);
-    color: #fff;
-    font-size: 0.6rem;
-    padding: 1px 6px;
-    border-radius: 10px;
-  }
-  .error-card {
-    background: var(--surface);
-    border: 1px solid #ef444440;
-    border-left: 3px solid var(--red);
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin-bottom: 8px;
-    font-size: 0.7rem;
-    line-height: 1.5;
-  }
-  .error-card.warning {
-    border-left-color: var(--orange);
-    border-color: #f59e0b40;
-  }
-  .error-card .error-code {
-    font-size: 0.6rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--red);
-    margin-bottom: 4px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .error-card.warning .error-code { color: var(--orange); }
-  .error-card .error-code .error-layer {
-    font-weight: 400;
-    color: var(--text-dim);
-    font-size: 0.55rem;
-  }
-  .error-card .error-msg {
-    color: var(--text);
-    margin-bottom: 6px;
-    word-break: break-word;
-  }
-  .error-card .error-action {
-    color: var(--accent);
-    font-size: 0.65rem;
-    padding: 6px 10px;
-    background: #3b82f610;
-    border-radius: 6px;
-    margin-bottom: 4px;
-  }
-  .error-card .error-detail {
-    font-size: 0.6rem;
-    color: var(--text-dim);
-    background: #0b0e14;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-    margin-bottom: 6px;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .error-stack-details {
-    margin-bottom: 6px;
-  }
-  .error-stack-details summary {
-    font-size: 0.6rem;
-    color: var(--text-dim);
-    cursor: pointer;
-    user-select: none;
-    padding: 2px 0;
-  }
-  .error-stack-details summary:hover { color: var(--text); }
-  .error-stack {
-    font-size: 0.55rem;
-    line-height: 1.5;
-    color: var(--text-dim);
-    background: #0b0e14;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-    margin-top: 4px;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-    max-height: 200px;
-    overflow-y: auto;
-  }
-  .error-stack.cause {
-    border-left: 2px solid var(--orange);
-  }
-  .error-card .error-time {
-    color: var(--text-dim);
-    font-size: 0.55rem;
-    text-align: right;
-  }
-
-  /* ---- log ---- */
-  #log {
-    width: 100%;
-    max-width: 640px;
-    margin-top: 16px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 14px;
-    max-height: 240px;
-    overflow-y: auto;
-    font-size: 0.7rem;
-    line-height: 1.6;
-    display: none;
-  }
-  #log.visible { display: block; }
-  #log .entry { white-space: pre-wrap; word-break: break-all; }
-  #log .entry.info { color: var(--text-dim); }
-  #log .entry.ok { color: var(--green); }
-  #log .entry.warn { color: var(--orange); }
-  #log .entry.err { color: var(--red); }
-
-  /* ---- buttons ---- */
-  .actions {
-    display: flex;
-    gap: 10px;
-    margin-top: 14px;
-  }
-  button {
-    font-family: inherit;
-    font-size: 0.75rem;
-    font-weight: 600;
-    padding: 8px 18px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  button:hover { border-color: var(--accent); color: var(--accent); }
-  button.primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-  button.primary:hover { background: #2563eb; }
-  button.danger:hover { border-color: var(--red); color: var(--red); }
-  button:disabled { opacity: 0.35; pointer-events: none; }
-
-  /* ---- conflict modal ---- */
-  #conflict-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: #0008;
-    backdrop-filter: blur(4px);
-    z-index: 100;
-    align-items: center;
-    justify-content: center;
-  }
-  #conflict-overlay.visible { display: flex; }
-  .modal {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 28px 32px;
-    max-width: 420px;
-    width: 90%;
-    text-align: center;
-  }
-  .modal h2 {
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--orange);
-    margin-bottom: 10px;
-  }
-  .modal p {
-    font-size: 0.8rem;
-    color: var(--text-dim);
-    margin-bottom: 20px;
-    line-height: 1.5;
-  }
-  .modal .modal-actions {
-    display: flex;
-    gap: 10px;
-    justify-content: center;
-  }
-</style>
-</head>
-<body>
-
-<h1><span>MFUP/2</span> Upload Demo</h1>
-<p class="subtitle">Resumable multi-file upload protocol &mdash; drop files or folders</p>
-
-<div id="dropzone">
-  <div class="icon">&#8593;</div>
-  <div class="label">Drag &amp; drop files / folders here, or <b id="browse-btn">browse files</b> / <b id="browse-folder-btn">folder</b></div>
-  <input type="file" id="file-input" multiple />
-  <input type="file" id="folder-input" webkitdirectory />
-</div>
-
-<div id="progress">
-  <div class="status-row">
-    <span class="badge active" id="state-badge">ACTIVE</span>
-    <span class="session-id" id="session-id-label"></span>
-  </div>
-
-  <div class="progress-bar-track">
-    <div class="progress-bar-fill" id="bar"></div>
-  </div>
-
-  <div class="stats">
-    <div class="stat">
-      <div class="stat-label">Transferred</div>
-      <div class="stat-value accent" id="stat-bytes">0 B</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Files Accepted</div>
-      <div class="stat-value green" id="stat-files">0</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Scanned</div>
-      <div class="stat-value" id="stat-scanned">0</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Skipped</div>
-      <div class="stat-value" id="stat-skipped">0</div>
-    </div>
-  </div>
-
-  <div class="actions">
-    <button id="btn-abort" class="danger" disabled>Abort</button>
-    <button id="btn-reset">Reset</button>
-  </div>
-</div>
-
-<div id="errors">
-  <div class="errors-header">Errors <span class="error-count" id="error-count">0</span></div>
-  <div id="error-list"></div>
-</div>
-
-<div id="log"></div>
-
-<div id="conflict-overlay">
-  <div class="modal">
-    <h2>File Conflict</h2>
-    <p>Files already exist in the target directory. Overwrite existing files?</p>
-    <div class="modal-actions">
-      <button id="modal-overwrite" class="primary">Overwrite</button>
-      <button id="modal-cancel" class="danger">Cancel</button>
-    </div>
-  </div>
-</div>
-
-<script type="module" src="/src/demo.ts"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MFUP/3 — file uploads</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <a class="wordmark" href="/">mfup<span>/3</span></a
+        ><span class="badge">Native file uploads</span>
+      </header>
+      <section class="intro">
+        <p class="eyebrow">FILES · FOLDERS · RESUME</p>
+        <h1>A large upload.<br />A simple path.</h1>
+        <p class="description">
+          Drop files or a folder. Uploads start while folders are still being
+          scanned and can resume after a pause.
+        </p>
+      </section>
+      <section
+        id="dropzone"
+        class="dropzone"
+        tabindex="0"
+        aria-label="File upload area"
+      >
+        <div class="upload-mark" aria-hidden="true">↑</div>
+        <h2>Drop files and folders here</h2>
+        <p>or select them on your device</p>
+        <div class="actions">
+          <label class="button primary"
+            >Choose files<input id="files" type="file" multiple /></label
+          ><label class="button"
+            >Choose folder<input
+              id="folder"
+              type="file"
+              webkitdirectory
+              multiple
+          /></label>
+        </div>
+      </section>
+      <section class="transfer" aria-live="polite">
+        <div class="transfer-top">
+          <h2 id="status">Ready to upload</h2>
+          <span id="count">0 files</span>
+        </div>
+        <progress id="progress" max="1" value="0"></progress>
+        <div class="transfer-bottom">
+          <span id="bytes">Nothing sent yet</span
+          ><span id="lanes">0 of 6 requests</span>
+        </div>
+        <div class="actions">
+          <button id="pause" disabled>Pause</button
+          ><button id="resume" disabled>Resume</button
+          ><button id="cancel" disabled>Cancel</button>
+        </div>
+        <p id="error" role="alert"></p>
+      </section>
+      <section id="questions" aria-label="Upload questions"></section>
+      <p id="restore" hidden>
+        An unfinished upload is saved. Select the same files or folder to
+        resume. <button id="forget">Start again</button>
+      </p>
+      <footer>
+        <span>MFUP/3 · file uploads</span
+        ><span>Six concurrent requests with native browser uploads.</span>
+      </footer>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
 </html>

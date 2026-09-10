@@ -1,59 +1,40 @@
 # @mfup/client
 
-Browser SDK for MFUP/2 — resumable multi-file upload of whole directory
-trees (tens of thousands of files) with interactive conflict handling.
-
-```bash
-npm install @mfup/client
-```
-
-## Usage
+Native browser FormData uploads, up to six concurrent baskets, incremental
+directory discovery, interactive questions and resumable file ranges.
 
 ```ts
-import { MfupSession, sourceFromDataTransfer } from "@mfup/client";
-
+import { MfupSession, sourceFromInput } from "@mfup/client";
 const session = new MfupSession({
-  serverUrl: "https://host/api/uploads",   // wherever mfup-fastapi is mounted
-  targetDir: "incoming",
-  meta: { album: 42 },                     // handed to the server's hooks
+  serverUrl: location.origin,
+  trackUploadProgress: true,
 });
-
-session.on("progress", (p) => render(p.fraction));
-session.on("ask", (ask) => {
-  // Server asks mid-transfer (target conflict) — upload keeps running.
-  showDialog(ask.name).then((ok) => ask.respond(ok ? "merge_overwrite" : "cancel"));
-});
-
-await session.connect();
-dropzone.ondrop = async (e) => {
-  e.preventDefault();
-  const src = sourceFromDataTransfer(e.dataTransfer!);  // sync, in the handler
-  if (!src) return;
-  await session.upload(src);          // resolves on COMMIT_OK
-  if (await session.settleAsks() !== "cancel") {
-    await session.publish();          // atomic renames into targetDir
-  }
-};
+session.subscribe(() => console.log(session.getSnapshot()));
+await session.upload(sourceFromInput(input));
+session.dispose();
 ```
 
-## What it handles for you
+An upload has one optional overwrite approval: render `snapshot.overwriteRequired`
+and call `session.setOverwrite(true)` or `session.cancel()`. Approval persists
+for the entire session, including future conflicts and resume. There are no
+per-file decisions or skip action. `overwrite: true` can provide initial consent.
 
-- **Ingestion**: `getAsFileSystemHandle` (Chrome), `webkitGetAsEntry`
-  (Firefox/Safari), `<input webkitdirectory>`, plain file lists — one
-  `upload()` for all of them.
-- **Transport**: streaming upload (`duplex:"half"`) where supported, atomic
-  batched POSTs elsewhere; live probe with cached verdict; CRC-32C per chunk.
-- **Resilience**: automatic reconnect + resume with epoch fencing; retry of
-  failed POSTs without duplication; metadata re-send so the server's commit
-  invariant always converges; per-file NACK budgets.
-- **Interactivity**: `ask` events with `respond()` — the user answers
-  overwrite/cancel questions *while* the transfer continues.
-- **State**: typed events (`file:start/ack/reject`, `committed`, `abort`, …)
-  plus a coalesced immutable snapshot store (`subscribe`/`getSnapshot`) —
-  plug it straight into `useSyncExternalStore` (that is exactly what
-  [`@mfup/react`](https://www.npmjs.com/package/@mfup/react) does).
+Save `session.exportTicket()` after connect; reselect source files after reload.
+Use `autoPublish: false` for explicit publication. Cancellation remains
+`cancelling` until confirmed by the server; a late cancel can return `published`.
+File content stays in native File/Blob objects.
 
-Server side: [`mfup-fastapi`](https://pypi.org/project/mfup-fastapi/) /
-[`mfup-core`](https://pypi.org/project/mfup-core/) on PyPI.
+Render one error per upload from `snapshot.errorInfo` (code/status/phase/retryable).
+Storage failures use storage_full (507) or storage_unavailable (503) and do not
+automatically resend the body. Network failures first check the receipt.
+Control HTTP has a 30-second deadline (`requestTimeoutMs`); long data POSTs do not.
 
-Docs: <https://github.com/n0isy/mfup> (`docs/EXTENDING.md`, `docs/FULL.md`).
+`trackUploadProgress: true` uses native XHR upload events for in-flight progress.
+`sentBytes` estimates confirmed payload plus active uploads; `confirmedBytes`
+only includes server receipts. Upload event updates are coalesced at 50 ms.
+The default transport and an injected `fetch` keep using fetch. On interruption,
+unconfirmed estimates can move backwards; resume always uses durable receipts.
+
+[Extension API](https://github.com/n0isy/mfup/blob/main/docs/EXTENDING.md) · [HTTP protocol](https://github.com/n0isy/mfup/blob/main/docs/PROTOCOL.md)
+
+[Russian](README_ru.md)

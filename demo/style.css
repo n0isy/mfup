@@ -1,0 +1,219 @@
+:root {
+  font-family: Manrope, system-ui, sans-serif;
+  color: #263c3a;
+  background: #f5f6f1;
+  font-synthesis: none;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+main {
+  max-width: 980px;
+  margin: auto;
+  padding: 32px 42px;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wordmark {
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: -2px;
+  text-decoration: none;
+  color: inherit;
+}
+.wordmark span {
+  color: #559076;
+}
+.badge {
+  font-size: 12px;
+  padding: 8px 13px;
+  border: 1px solid #d9e1d8;
+  border-radius: 30px;
+}
+.intro {
+  margin: 66px 0 32px;
+}
+.eyebrow {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  color: #718a7d;
+}
+h1 {
+  font-size: clamp(38px, 6vw, 62px);
+  line-height: 1.1;
+  letter-spacing: -2.5px;
+  margin: 18px 0 22px;
+  font-weight: 700;
+}
+.description {
+  max-width: 520px;
+  font-size: 15px;
+  line-height: 1.8;
+  color: #708078;
+}
+.dropzone {
+  padding: 32px;
+  border: 1px dashed #b4cbb7;
+  border-radius: 18px;
+  background: #edf2e9;
+  text-align: center;
+}
+.dropzone.over {
+  background: #dfead8;
+  border-color: #387555;
+}
+.upload-mark {
+  font-size: 30px;
+  border-radius: 14px;
+  background: #dce8d5;
+  width: 54px;
+  height: 54px;
+  line-height: 54px;
+  margin: 0 auto 16px;
+  color: #3d7756;
+}
+h2 {
+  font-size: 17px;
+  margin: 0;
+}
+.dropzone p {
+  color: #7a887e;
+  font-size: 13px;
+  margin: 10px;
+}
+.actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 22px;
+  flex-wrap: wrap;
+}
+button,
+.button {
+  font:
+    600 12px Manrope,
+    system-ui;
+  display: inline-block;
+  background: white;
+  color: #365241;
+  border: 1px solid #d7e0d3;
+  padding: 11px 19px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.primary {
+  background: #365b48;
+  border-color: #365b48;
+  color: white;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+}
+.button:focus-within,
+button:focus-visible {
+  outline: 3px solid #95b8a2;
+  outline-offset: 2px;
+}
+.transfer {
+  padding: 26px 0;
+}
+.transfer-top,
+.transfer-bottom {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.transfer-top span,
+.transfer-bottom {
+  font-size: 12px;
+  color: #708078;
+}
+.transfer h2 {
+  font-size: 14px;
+}
+progress {
+  appearance: none;
+  width: 100%;
+  height: 7px;
+  border: none;
+  border-radius: 10px;
+  margin: 18px 0 12px;
+  overflow: hidden;
+  background: #e0e6dc;
+}
+progress::-webkit-progress-bar {
+  background: #e0e6dc;
+}
+progress::-webkit-progress-value {
+  background: #679477;
+}
+progress::-moz-progress-bar {
+  background: #679477;
+}
+.transfer .actions {
+  justify-content: flex-start;
+  margin-top: 18px;
+}
+#error {
+  font-size: 13px;
+  color: #9e473a;
+}
+.question {
+  background: #fff6df;
+  border: 1px solid #ebd8a7;
+  padding: 20px;
+  border-radius: 12px;
+  margin: 12px 0;
+  overflow-wrap: anywhere;
+}
+.question .actions {
+  justify-content: flex-start;
+  margin-top: 12px;
+}
+#restore {
+  font-size: 13px;
+  line-height: 1.8;
+}
+footer {
+  border-top: 1px solid #e0e5da;
+  padding-top: 22px;
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  color: #879486;
+  font-size: 10px;
+  margin: 24px 0;
+}
+@media (max-width: 600px) {
+  main {
+    padding: 24px;
+  }
+  .badge {
+    display: none;
+  }
+  .intro {
+    margin-top: 42px;
+  }
+  .dropzone {
+    padding: 25px 15px;
+  }
+  footer {
+    flex-direction: column;
+    gap: 8px;
+  }
+}

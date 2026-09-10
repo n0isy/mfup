@@ -1,90 +1,74 @@
-# The MAIN application of this repo: the consumer example
-# (examples/multiuser-scopes) running exactly the way an outside integrator
-# would run it — server deps from PyPI, client deps from npm, nothing built
-# from this repo's sources.
-#
-#   docker compose up -d      →  http://localhost:20061  (Python server)
-#                                http://localhost:20062  (Node server)
-#
-# Uploaded files land on the host in ./uploads/<user_id>/<scope>/… (Python)
-# and ./uploads-node/<user_id>/<scope>/… (Node). The two editions run the
-# SAME React client against the same protocol; only the backend differs.
-# The Node one uses the in-memory session store — no Redis dependency.
-#
-# The INTERNAL dev/test stack (protocol e2e harness, chaos tests, benchmark
-# baseline) lives separately: docker compose -f e2e/docker-compose.yaml up -d
-# → :20060.
-
 services:
-  redis:
-    image: redis:7-alpine
-    expose:
-      - "6379"
-
-  server:
+  node:
+    image: node:24-bookworm-slim
+    working_dir: /app
+    command: sh -c "npm ci --no-audit --no-fund && npm run build && node --watch examples/multiuser-scopes-node/server/server.mjs"
+    environment:
+      PORT: "3001"
+      DEMO_DATA_DIR: /app/data/example-node
+      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
+    volumes:
+      - .:/app
+      - mfup3_modules:/app/node_modules
+    expose: ["3001"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/mfup/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 30s
+  python:
     image: python:3.12-slim
     working_dir: /app
-    depends_on:
-      - redis
-    expose:
-      - "8090"
-    # Straight from the example's own README: venv-less container flavour.
-    command: >
-      sh -c "pip install --quiet -r requirements.txt &&
-             python -m uvicorn app:app --host 0.0.0.0 --port 8090 --log-level info"
+    command: sh -c "pip install -e ./server/mfup-core -e ./server/mfup-fastapi && python -m uvicorn app:create_example --factory --app-dir examples/multiuser-scopes/server --host 0.0.0.0 --port 8090 --reload --reload-dir examples/multiuser-scopes/server --reload-dir server"
     environment:
-      DEMO_DATA_DIR: /data/uploads
-      REDIS_URL: redis://redis:6379/0
+      DEMO_DATA_DIR: /app/data/example-python
+      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
     volumes:
-      - ./examples/multiuser-scopes/server:/app
-      - ./uploads:/data/uploads
-
+      - .:/app
+    expose: ["8090"]
   client:
-    image: node:20-alpine
+    image: node:24-bookworm-slim
     working_dir: /app
+    command: npm run dev -w @mfup/example-client
+    environment:
+      PORT: "3000"
+      EXAMPLE_BACKEND_URL: http://node:3001
+    volumes:
+      - .:/app
+      - mfup3_modules:/app/node_modules:ro
+    expose: ["3000"]
     depends_on:
-      - server
-    ports:
-      - "20061:20061"
-    # vite dev server (hot reload); its /api proxy targets the server service.
-    command: sh -c "npm install --no-audit --no-fund && npm run dev"
-    environment:
-      EXAMPLE_BACKEND_URL: http://server:8090
-    volumes:
-      - ./examples/multiuser-scopes/client:/app
-      # never extract npm packages into the bind-mounted host dir
-      - /app/node_modules
-
-  # ------------------------------------------------------------------
-  # The NODE edition: express + @mfup/server from npm, memory store
-  # (no Redis), same React client on :20062.
-  # ------------------------------------------------------------------
-  server-node:
-    image: node:24-alpine
+      node:
+        condition: service_healthy
+  client-python:
+    image: node:24-bookworm-slim
     working_dir: /app
-    expose:
-      - "8091"
-    command: sh -c "npm install --no-audit --no-fund --no-package-lock && node server.mjs"
+    command: npm run dev -w @mfup/example-client
     environment:
-      DEMO_DATA_DIR: /data/uploads
-      PORT: "8091"
+      PORT: "3000"
+      EXAMPLE_BASE: /python/
+      EXAMPLE_BACKEND_URL: http://python:8090
     volumes:
-      - ./examples/multiuser-scopes-node/server:/app
-      - ./uploads-node:/data/uploads
-      - /app/node_modules
-
-  client-node:
-    image: node:20-alpine
-    working_dir: /app
+      - .:/app
+      - mfup3_modules:/app/node_modules:ro
+    expose: ["3000"]
     depends_on:
-      - server-node
-    ports:
-      - "20062:20062"
-    # Same client directory as the Python edition — npm ci (read-only lock)
-    # so the two containers never fight over the bind-mounted lockfile.
-    command: sh -c "npm ci --no-audit --no-fund && npm run dev -- --port 20062"
-    environment:
-      EXAMPLE_BACKEND_URL: http://server-node:8091
+      node:
+        condition: service_healthy
+      python:
+        condition: service_started
+  caddy:
+    image: caddy:2-alpine
+    depends_on: [client, client-python]
+    ports: ["20060:80"]
     volumes:
-      - ./examples/multiuser-scopes/client:/app
-      - /app/node_modules
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+volumes:
+  mfup3_modules:

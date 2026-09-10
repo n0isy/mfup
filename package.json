@@ -1,14 +1,43 @@
 {
-  "name": "mfup-monorepo",
+  "name": "mfup3-monorepo",
   "private": true,
+  "version": "3.0.0",
+  "type": "module",
   "workspaces": [
     "packages/client",
     "packages/react",
-    "packages/server"
+    "packages/server",
+    "examples/multiuser-scopes/client",
+    "examples/multiuser-scopes-node/server"
   ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
-    "build": "npm run build -w @mfup/client && npm run build -w @mfup/react && npm run build -w @mfup/server",
-    "check": "npm run check -w @mfup/client && npm run check -w @mfup/react && npm run check -w @mfup/server",
-    "test:server": "npm test -w @mfup/server"
+    "build": "npm run build -w @mfup/client && npm run build -w @mfup/server && npm run build -w @mfup/react && node scripts/build-demo.mjs && npm run build -w @mfup/example-client",
+    "check": "tsc --noEmit -p packages/client && tsc --noEmit -p packages/server && tsc --noEmit -p packages/react && npm run check -w @mfup/example-client",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "test:examples": "playwright test -c playwright.examples.config.ts",
+    "dev": "node scripts/dev-examples.mjs",
+    "dev:playground": "tsx watch scripts/dev.ts",
+    "start": "node scripts/dev-examples.mjs",
+    "pack:check": "node scripts/pack-check.mjs",
+    "test:storage": "node scripts/test-storage.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0",
+    "@types/busboy": "^1.5.4",
+    "@types/node": "^22.15.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.7",
+    "@types/ws": "^8.5.14",
+    "esbuild": "^0.25.0",
+    "prettier": "^3.9.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
   }
 }

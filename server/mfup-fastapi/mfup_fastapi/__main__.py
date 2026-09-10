@@ -1,13 +1,18 @@
-"""Run the standalone MFUP/2 server: python -m mfup_fastapi"""
-
 import os
 
 import uvicorn
 
-if __name__ == "__main__":
+from . import MfupConfig, create_app
+
+
+def main():
+    app = create_app(MfupConfig.from_env())
     uvicorn.run(
-        "mfup_fastapi.app:app",
-        host=os.environ.get("MFUP_HOST", "0.0.0.0"),
-        port=int(os.environ.get("MFUP_PORT", "8070")),
-        log_level="info",
+        app,
+        host=os.environ.get("MFUP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("MFUP_PORT", "3001")),
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,36 +1,26 @@
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
 [project]
 name = "mfup-core"
-version = "0.2.0"
-description = "MFUP/2 resumable multi-file upload engine: protocol codec, session state machine, SQLite staging, Redis expiry index, publish/mapping. Framework-free core."
+version = "3.0.0"
+description = "MFUP/3 multipart session engine, durable receipts and interactive publication"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
 authors = [{ name = "n0isy" }]
-keywords = ["upload", "resumable", "multi-file", "protocol", "mfup"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Internet :: WWW/HTTP",
-    "Typing :: Typed",
-]
-dependencies = [
-    "redis>=5.0.0",
-    "crc32c>=2.7",
-]
+requires-python = ">=3.10"
+[tool.hatch.build.targets.wheel]
+packages = ["mfup_core"]
 
 [project.urls]
 Homepage = "https://github.com/n0isy/mfup"
 Repository = "https://github.com/n0isy/mfup"
 Issues = "https://github.com/n0isy/mfup/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["mfup_core"]
+[tool.hatch.build.targets.sdist]
+include = ["/mfup_core", "/pyproject.toml", "/README.md", "/README_ru.md", "/LICENSE"]
+
+[tool.hatch.build]
+ignore-vcs = true
+exclude = ["**/__pycache__/**", "**/*.py[cod]"]

@@ -1,61 +1,40 @@
 # mfup-fastapi
 
-FastAPI integration for the MFUP/2 resumable multi-file upload engine
-([`mfup-core`](https://pypi.org/project/mfup-core/)).
-
-## Embed into your app
-
 ```python
-from pathlib import Path
-from fastapi import FastAPI
-from mfup_fastapi import MfupConfig, MfupEngine
-from mfup_core import AuthRequest, AuthResult
+from mfup_fastapi import MfupConfig, create_app
 
-async def authorize(req: AuthRequest) -> AuthResult | None:
-    user = await my_auth(req.headers)          # cookies / Authorization
-    if user is None:
-        return None                            # → SESSION_ABORT(auth_failed)
-    return AuthResult(
-        base_dir=f"/srv/homes/{user.id}",      # per-user home
-        max_total_bytes=10 * 2**30,            # 10 GiB quota
-        context={"user_id": user.id},
+app = create_app(
+    MfupConfig(
+        base_dir="./state",
+        authorize=my_authorize,
+        prefix="/api",
+        client_publish=False,
+        on_committed=my_processor,
     )
-
-engine = MfupEngine(MfupConfig(
-    base_dir=Path("/srv/uploads"),
-    redis_url="redis://localhost:6379/0",
-    authorize=authorize,                       # a callable — or "pkg.mod:func"
-))
-
-app = FastAPI(lifespan=engine.lifespan)
-app.include_router(engine.router, prefix="/api/uploads")
+)
 ```
 
-Point the browser SDK (`@mfup/client` on npm) at the same prefix:
-`new MfupSession({ serverUrl: "https://host/api/uploads" })`.
+The application supplies identity, scopes and authorize. It may return an
+absolute per-session baseDir, targetDir, quotas and context. The core remains
+independent of application scope names. Ordinary multipart carries files;
+WebSocket carries questions and snapshots.
 
-## Run standalone
+For embedding, `MfupEngine(config).router` and `.lifespan` (or startup/shutdown)
+manage routing and cleanup. Use one lifecycle per Engine and one process per
+metadata directory. `create_app` applies config.prefix and owns the lifecycle.
 
-```bash
-pip install mfup-fastapi
-MFUP_BASE_DIR=/srv/uploads REDIS_URL=redis://localhost:6379/0 \
-  python -m mfup_fastapi
-```
+map_file runs at publication planning time and returns a relative path or None.
+on_committed receives CommitEvent and can return a boolean to override server
+auto_publish (default False). client_publish=False reserves publication for
+the backend. Engine exposes get_session, list_staged, open_staged,
+prepare_publish, publish and retry_committed. Callback failure preserves the
+accepted files and returns a successful commit with processing='failed'.
 
-All `MfupConfig` fields map 1:1 to `MFUP_*` environment variables
-(`MfupConfig.from_env()`); hooks are dotted paths there
-(`MFUP_AUTHORIZE=myapp.uploads:authorize`).
+Standalone: `MFUP_AUTHORIZE=myapp.hooks:authorize python -m mfup_fastapi`.
+MfupConfig.from_env supports the same MFUP_* configuration as the Node package;
+Python hooks can be callables or module:attribute strings.
+See docs/EXTENDING.md and the multiuser-scopes example in the repository.
 
-## Hooks
+[Extension API](https://github.com/n0isy/mfup/blob/main/docs/EXTENDING.md) · [HTTP protocol](https://github.com/n0isy/mfup/blob/main/docs/PROTOCOL.md)
 
-| Hook | When | Controls |
-|---|---|---|
-| `authorize` | HELLO, before anything is created | allow/deny, per-user `base_dir`, target mapping, byte/file quotas, `context` |
-| `map_file` | publish, per file | final layout (by type/scope/anything) |
-| `on_committed` | after COMMIT_OK | notification; return `"publish"` to publish server-side (scan/moderation/billing flows). Or call `engine.publish(session_id)` yourself later. |
-
-Requires Redis (expiry index) and a POSIX filesystem. One worker per engine
-instance; resume across workers is handled via lazy recovery from the Redis
-index. Full contract: `docs/EXTENDING.md` in the repository.
-
-Docs and source: <https://github.com/n0isy/mfup>
+[Russian](README_ru.md)

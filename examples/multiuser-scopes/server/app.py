@@ -1,118 +1,114 @@
-"""MFUP/2 consumer example — multiuser + scopes.
+"""Public-package consumer: anonymous identity -> authorized scope -> server-owned layout."""
 
-Written strictly against the public packages (pip install mfup-fastapi) and
-the root README's integration guide, the way an outside consumer would.
-
-The pattern it demonstrates:
-  - users are AUTO-CREATED: first /api/whoami visit mints an id cookie;
-  - every user has three file zones ("scopes"): workspace / scratch / uploads;
-  - the authorize hook turns (cookie, HELLO.meta.scope) into a per-user home
-    and a server-owned target dir, so files land at
-
-        <DATA_DIR>/<user_id>/<scope>/...
-
-    no matter what the client asked for;
-  - the MFUP router is mounted under a prefix (/api/mfup) inside a normal
-    FastAPI app that also has its own routes (/api/whoami, /api/files).
-"""
-
-from __future__ import annotations
-
+import asyncio
+import contextlib
+import hashlib
 import os
+import re
 import secrets
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Mapping, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-from mfup_core import AuthRequest, AuthResult
+from fastapi.responses import FileResponse, JSONResponse
+from mfup_core import AuthRequest, AuthResult, ProtocolError, published_directory, relative_path
 from mfup_fastapi import MfupConfig, MfupEngine
 
-DATA_DIR = Path(os.environ.get("DEMO_DATA_DIR", "./data")).resolve()
 SCOPES = ("workspace", "scratch", "uploads")
-COOKIE_NAME = "demo_uid"
+COOKIE = "mfup3_python_user"
 
 
-def _uid_from_headers(headers: Mapping[str, str]) -> Optional[str]:
-    """Extract and sanity-check the demo user id from the Cookie header.
-    Works for both plain HTTP requests and the WebSocket handshake."""
+def identity(headers):
     jar = SimpleCookie()
-    jar.load(headers.get("cookie", ""))
-    morsel = jar.get(COOKIE_NAME)
-    uid = morsel.value if morsel else None
-    if uid and uid.isalnum() and 8 <= len(uid) <= 64:
-        return uid
-    return None
-
-
-# ---------------------------------------------------------------------------
-# The MFUP authorize hook — the whole multiuser/scope policy lives here.
-# ---------------------------------------------------------------------------
-
-async def authorize(req: AuthRequest) -> AuthResult | None:
-    uid = _uid_from_headers(req.headers)
-    if uid is None:
-        return None  # no cookie → deny; the SPA calls /api/whoami first
-
-    scope = req.meta.get("scope") if isinstance(req.meta, dict) else None
-    if scope not in SCOPES:
-        return None  # unknown zone → deny
-
-    return AuthResult(
-        base_dir=str(DATA_DIR / uid),   # per-user home (staging lives inside)
-        target_dir=scope,               # SERVER owns the layout: <uid>/<scope>/
-        max_total_bytes=512 * 2**20,    # 512 MiB per session
-        max_files=20_000,
-        context={"uid": uid, "scope": scope},
+    with contextlib.suppress(Exception):
+        jar.load(headers.get("cookie", ""))
+    token = jar[COOKIE].value if COOKIE in jar else ""
+    return (
+        hashlib.sha256(token.encode()).hexdigest()[:32]
+        if re.fullmatch(r"[a-f0-9]{64}", token)
+        else None
     )
 
 
-engine = MfupEngine(MfupConfig(
-    base_dir=DATA_DIR,
-    redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
-    authorize=authorize,
-))
+def create_example(base_dir=None, *, scope_roots=None, **options):
+    base = Path(base_dir or os.environ.get("DEMO_DATA_DIR", "./data/example-python")).resolve()
 
-app = FastAPI(title="MFUP example — multiuser scopes", lifespan=engine.lifespan)
-app.include_router(engine.router, prefix="/api/mfup")
+    roots = {scope: Path((scope_roots or {}).get(scope, base)).resolve() for scope in SCOPES}
 
-
-# ---------------------------------------------------------------------------
-# The consumer app's own routes
-# ---------------------------------------------------------------------------
-
-@app.get("/api/whoami")
-async def whoami(request: Request):
-    """Auto-create the demo user: mint an id cookie on first visit."""
-    uid = _uid_from_headers(request.headers)
-    fresh = uid is None
-    if fresh:
-        uid = secrets.token_hex(8)
-        (DATA_DIR / uid).mkdir(parents=True, exist_ok=True)
-    resp = JSONResponse({"user_id": uid, "scopes": list(SCOPES)})
-    if fresh:
-        resp.set_cookie(
-            COOKIE_NAME, uid,
-            max_age=30 * 24 * 3600, httponly=True, samesite="lax",
+    async def authorize(request: AuthRequest) -> AuthResult | None:
+        uid = identity(request["headers"])
+        meta = request["meta"]
+        scope = meta.get("scope") if isinstance(meta, dict) else None
+        if not uid or scope not in SCOPES:
+            return None
+        return dict(
+            baseDir=str(roots[scope]),
+            targetDir=f"{uid}/{scope}",
+            maxTotalBytes=512 * 2**20,
+            maxFiles=20000,
+            context=dict(uid=uid, scope=scope),
         )
-    return resp
 
+    mfup = MfupEngine(MfupConfig(base_dir=base, authorize=authorize, prefix="/api", **options))
 
-@app.get("/api/files/{scope}")
-async def list_files(scope: str, request: Request):
-    """Top-level listing of one zone — a demo viewer, not a file manager."""
-    uid = _uid_from_headers(request.headers)
-    if uid is None or scope not in SCOPES:
-        return JSONResponse({"error": "unknown user or scope"}, status_code=403)
-    root = DATA_DIR / uid / scope
-    entries = []
-    if root.exists():
-        for p in sorted(root.iterdir(), key=lambda x: (not x.is_dir(), x.name)):
-            entries.append({
-                "name": p.name,
-                "dir": p.is_dir(),
-                "size": None if p.is_dir() else p.stat().st_size,
-            })
-    return {"scope": scope, "entries": entries}
+    app = FastAPI(title="MFUP/3 multiuser scopes", lifespan=mfup.lifespan)
+    app.include_router(mfup.router, prefix=mfup.config.prefix)
+    app.state.mfup = mfup
+
+    @app.get("/api/whoami")
+    async def whoami(request: Request):
+        uid = identity(request.headers)
+        token = None
+        if not uid:
+            token = secrets.token_hex(32)
+            uid = hashlib.sha256(token.encode()).hexdigest()[:32]
+        response = JSONResponse(
+            dict(user_id=uid, scopes=SCOPES, backend="python"),
+            headers={"cache-control": "no-store"},
+        )
+        if token:
+            response.set_cookie(
+                COOKIE,
+                token,
+                max_age=2592000,
+                httponly=True,
+                samesite="lax",
+                secure=os.environ.get("COOKIE_SECURE") == "1",
+            )
+        return response
+
+    @app.get("/api/files/{scope}")
+    @app.get("/api/file/{scope}")
+    async def files(scope: str, request: Request, path: str = ""):
+        uid = identity(request.headers)
+        if not uid or scope not in SCOPES:
+            return JSONResponse(dict(error="unknown_user_or_scope"), status_code=403)
+        try:
+            rel = relative_path(path) if path else ""
+            target = published_directory(roots[scope], f"{uid}/{scope}") / rel
+            if request.url.path.startswith("/api/file/"):
+                if not rel or not target.is_file():
+                    return JSONResponse(dict(error="not_found"), status_code=404)
+                return FileResponse(
+                    target,
+                    filename=target.name,
+                    media_type="application/octet-stream",
+                    headers={"cache-control": "no-store"},
+                )
+
+            def listing():
+                if not target.exists():
+                    return []
+                return [
+                    dict(name=p.name, dir=p.is_dir(), size=None if p.is_dir() else p.stat().st_size)
+                    for p in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+                ]
+
+            return JSONResponse(
+                dict(scope=scope, path=rel, entries=await asyncio.to_thread(listing)),
+                headers={"cache-control": "no-store"},
+            )
+        except ProtocolError as error:
+            return JSONResponse(dict(error=error.code), status_code=error.status)
+
+    return app

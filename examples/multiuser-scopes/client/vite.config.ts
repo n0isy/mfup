@@ -1,27 +1,20 @@
 import { defineConfig } from "vite";
-
-// The consumer backend (examples/multiuser-scopes/server) — one prefix
-// carries both the app's own /api routes and the mounted MFUP router
-// (/api/mfup/...). ws:true forwards the control-WebSocket upgrade.
-const BACKEND = process.env.EXAMPLE_BACKEND_URL ?? "http://localhost:8090";
-
+const base = process.env.EXAMPLE_BASE ?? "/";
+const backend = process.env.EXAMPLE_BACKEND_URL ?? "http://127.0.0.1:3001";
 export default defineConfig({
+  base,
+  cacheDir: `../../../.tmp/vite-${base.replace(/[^a-z0-9]/gi, "_")}-${process.env.PORT ?? "3000"}`,
   server: {
-    host: "0.0.0.0",
-    port: 20061,
+    host: process.env.HOST ?? "0.0.0.0",
+    port: Number(process.env.PORT ?? 3000),
     strictPort: true,
     allowedHosts: true,
     proxy: {
-      "/api": { target: BACKEND, changeOrigin: true, ws: true },
-    },
-  },
-  preview: {
-    host: "0.0.0.0",
-    port: 20061,
-    strictPort: true,
-    allowedHosts: true,
-    proxy: {
-      "/api": { target: BACKEND, changeOrigin: true, ws: true },
+      [base + "api"]: {
+        target: backend,
+        ws: true,
+        rewrite: (pathname) => pathname.slice(base.length - 1),
+      },
     },
   },
 });
