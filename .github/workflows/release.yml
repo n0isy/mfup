@@ -3,10 +3,16 @@ on:
   push:
     tags: ["v3.*"]
   workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: "Publish the verified artifacts of an existing release run"
+        type: string
+        required: false
 permissions:
   contents: read
 jobs:
   checks:
+    if: ${{ !inputs.artifact_run_id }}
     uses: ./.github/workflows/ci.yml
   build:
     needs: checks
@@ -42,14 +48,36 @@ jobs:
         with:
           name: python
           path: dist-py/
-  npm:
+  source:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: ${{ always() && (needs.build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.artifact_run_id != '')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      publish: ${{ steps.inspect.outputs.publish }}
+      run_id: ${{ steps.inspect.outputs.run_id }}
+      version: ${{ steps.inspect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - id: inspect
+        run: python scripts/release-source.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+  npm:
+    needs: source
+    if: needs.source.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
       id-token: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -60,10 +88,12 @@ jobs:
         with:
           name: npm
           path: dist-npm
+          run-id: ${{ needs.source.outputs.run_id }}
+          github-token: ${{ github.token }}
       - run: npm install -g npm@11 --no-audit --no-fund
       - name: Publish built artifacts
         run: |
-          for artifact in dist-npm/*.tgz; do
+          for artifact in ./dist-npm/*.tgz; do
             name=$(tar -xOf "$artifact" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).name')
             version=$(tar -xOf "$artifact" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).version')
             if npm view "$name@$version" version >/dev/null 2>&1; then
@@ -73,25 +103,28 @@ jobs:
             fi
           done
   pypi:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: source
+    if: needs.source.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: release
     permissions:
       id-token: write
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: python
           path: dist-py
+          run-id: ${{ needs.source.outputs.run_id }}
+          github-token: ${{ github.token }}
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-py/
           skip-existing: true
 
   verify:
-    needs: [npm, pypi]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [npm, pypi, source]
+    if: needs.source.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -101,7 +134,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python scripts/verify-registry.py "${GITHUB_REF_NAME#v}"
+      - run: python scripts/verify-registry.py "${{ needs.source.outputs.version }}"
       - name: Install public npm packages and run their consumer
         run: |
           mkdir -p /tmp/mfup-registry-check

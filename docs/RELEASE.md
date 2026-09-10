@@ -34,7 +34,7 @@ Npm tarballs contain compiled JavaScript, TypeScript declarations, package metad
 
 [release.yml](../.github/workflows/release.yml) runs on v3.* tags or manual dispatch. It first runs the complete reusable CI matrix. The build job checks versions, builds and validates archives, then retains the npm/Python artifacts.
 
-Only tag runs publish. Npm and PyPI jobs use the GitHub release environment and OIDC with id-token:write. The existing trusted-publisher identity is repository n0isy/mfup, workflow release.yml, environment release. No registry passwords are stored in the repository. Npm uses Node 24 and npm 11; stable artifacts publish to latest with provenance. Existing versions are skipped on reruns. PyPI uses pypa/gh-action-pypi-publish and skips existing files.
+Tag runs publish. Manual dispatch with artifact_run_id resumes publication of an existing release run. The source job requires a successful build and checks, unexpired npm/Python artifacts, and a release tag that still points to the artifact commit. An ordinary manual dispatch builds a preview. Npm and PyPI jobs use the GitHub release environment and OIDC with id-token:write. The existing trusted-publisher identity is repository n0isy/mfup, workflow release.yml, environment release. No registry passwords are stored in the repository. Npm uses Node 24 and npm 11; stable artifacts publish to latest with provenance. Existing versions are skipped on reruns. PyPI uses pypa/gh-action-pypi-publish and skips existing files.
 
 The verification job queries both public registries, checks all versions and npm latest tags, installs the registry packages and executes the same independent consumer examples. Package publication is confirmed by this job, not by a successful build alone.
 

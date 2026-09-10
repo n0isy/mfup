@@ -34,7 +34,7 @@ Npm tarballs содержат скомпилированный JavaScript, об�
 
 [Release.yml](../../.github/workflows/release.yml) запускается тегами v3.* или вручную. Сначала выполняется полная переиспользуемая CI-матрица. Build job проверяет версии, собирает и валидирует архивы, сохраняет npm/Python artifacts.
 
-Публикуют только tag-запуски. Npm/PyPI jobs используют окружение GitHub release и OIDC с id-token:write. Идентификатор существующего trusted publisher: репозиторий n0isy/mfup, workflow release.yml, environment release. Пароли реестров в репозитории не хранятся. Npm использует Node 24 и npm 11; стабильные пакеты публикуются в latest с provenance. Существующие версии при повторе пропускаются. PyPI использует pypa/gh-action-pypi-publish с пропуском существующих файлов.
+Публикуют tag-запуски. Ручной запуск с artifact_run_id повторяет публикацию существующего релизного запуска. Source job требует успешную сборку и проверки, доступные npm/Python artifacts и тег, указывающий на коммит их исходников. Обычный ручной запуск собирает предварительные архивы. Npm/PyPI jobs используют окружение GitHub release и OIDC с id-token:write. Идентификатор существующего trusted publisher: репозиторий n0isy/mfup, workflow release.yml, environment release. Пароли реестров в репозитории не хранятся. Npm использует Node 24 и npm 11; стабильные пакеты публикуются в latest с provenance. Существующие версии при повторе пропускаются. PyPI использует pypa/gh-action-pypi-publish с пропуском существующих файлов.
 
 Verification job обращается к публичным реестрам, проверяет все версии и npm latest, устанавливает пакеты из реестров и запускает независимые consumer-примеры. Публикация подтверждается этим job, а не только успешной сборкой.
 
